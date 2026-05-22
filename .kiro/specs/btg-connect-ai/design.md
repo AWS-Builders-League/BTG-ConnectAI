@@ -1,30 +1,33 @@
-# Design Document: BTG ConnectAI
+# Documento de Diseño: BTG ConnectAI (MVP)
 
-## Overview
+## Visión General
 
-BTG ConnectAI is an AWS-native, serverless Agentic AI system that provides conversational banking services to BTG Pactual clients through WhatsApp. The system interprets natural language requests in Spanish, maintains conversational context, orchestrates multi-step financial workflows, and generates operational requests — all while maintaining full traceability and compliance with Colombian financial regulations.
+BTG ConnectAI MVP es un sistema serverless de banca conversacional sobre AWS que entrega capacidades de Agentic AI a clientes de BTG Pactual a través de WhatsApp. El núcleo del sistema es un **Amazon Bedrock Agent** que interpreta español natural, mantiene memoria de sesión, decide qué tools invocar y formula respuestas — todo managed por AWS. Tres funciones Lambda actúan como Action_Groups (financial-query, submit-operation, generate-secure-link) y una Lambda adicional sirve como WhatsApp_Gateway. La auditoría se entrega vía un pipeline managed (CloudWatch Logs → Firehose → S3) sin código custom.
 
-### Key Design Decisions
+Este diseño es deliberadamente **mínimo viable** sin sacrificar extensibilidad. Las decisiones clave reducen la superficie de implementación de ~14 Lambdas y 7 tablas a ~4 Lambdas y 2 tablas, apoyándose en servicios managed que ya entregan las capacidades que antes se construían a mano (orquestación, memoria, NLU, fallback, traceability).
 
-1. **AWS End User Messaging Social for WhatsApp**: Native AWS integration with WhatsApp Business API, avoiding third-party middleware and simplifying IAM-based security.
-2. **Amazon Bedrock (Claude) for NLU**: Managed foundation model service eliminates model hosting complexity while providing high-quality Spanish language understanding and agentic reasoning.
-3. **DynamoDB for Session/Context Storage**: Single-digit millisecond latency, TTL-based automatic session expiration, and serverless scaling align with conversational workload patterns.
-4. **Step Functions for Workflow Orchestration**: Visual workflow definition, built-in retry/error handling, and execution history provide the auditability required for financial operations.
-5. **HMAC-SHA256 Signed URLs**: Stateless, cryptographically secure link generation without database round-trips, enabling horizontal scaling of the secure link service.
-6. **Event-Driven Architecture**: SNS/SQS decoupling between components enables independent scaling, failure isolation, and message durability.
+### Decisiones Clave de Diseño
 
-### Research Findings
+1. **Amazon Bedrock Agents como núcleo**: Un solo recurso managed reemplaza NLU Engine, Context Manager, Tool Orchestrator y Fallback Engine. Bedrock Agents trae nativamente: loop ReAct, session memory, tool calling estructurado, traces, integración con Knowledge Bases (futura) y Guardrails. Esta es la decisión más impactante del diseño.
+2. **Action Groups en vez de orquestación custom**: Las 3 Lambdas de tool (financial-query, submit-operation, generate-secure-link) se exponen como Action Groups del Bedrock Agent. El Agent invoca, espera, decide próximo paso. Sin Step Functions, sin lógica de orquestación propia.
+3. **Deduplicación inline vía DynamoDB conditional write**: En el WhatsApp_Gateway, un `PutItem` con `ConditionExpression: attribute_not_exists(whatsapp_message_id)` y TTL de 5 minutos descarta duplicados. Sin SQS FIFO, sin Lambda dedicada de deduplicación.
+4. **Idempotencia inline en submit-operation**: Atributo `idempotency_key` en la tabla `Operations` con escritura condicional. Sin servicio separado.
+5. **Auditoría vía pipeline managed**: AWS Lambda Powertools emite logs estructurados → CloudWatch Logs → subscription filter a Kinesis Data Firehose → S3 con particionamiento por fecha (formato Parquet, KMS encryption). Athena disponible on-demand sin infraestructura always-on. Sin Lambda dedicada de Traceability Service.
+6. **HMAC-SHA256 con KMS para Secure Links**: Stateless, sin lookups en BD para validación. Las llaves rotan vía AWS Secrets Manager managed rotation.
+7. **Sin provisioned concurrency en MVP**: A volumen estimado (cientos de msg/min en pico), pay-per-use con cold starts ocasionales (~150-300ms en Lambda Node.js bien empaquetada) es aceptable. Se agrega cuando haya señal de impacto (ver Fase 2 en requirements.md).
+8. **DynamoDB on-demand con single-table design**: Dos tablas — `Conversations` (sesiones + deduplicación + audit hot 90 días, todo en single-table) y `SecureLinks` (links generados con TTL 10 min). Sin pre-provisioning de capacidad.
 
-- AWS End User Messaging Social provides native WhatsApp integration via SNS notifications triggering Lambda functions, supporting text, interactive buttons, and list messages ([AWS Blog](https://aws.amazon.com/blogs/messaging-and-targeting/whatsapp-aws-end-user-messaging-social/)).
-- Amazon Bedrock Session Management APIs (Preview) offer out-of-the-box session state management, but DynamoDB provides more control for custom context windowing and TTL-based expiration ([AWS Blog](https://aws.amazon.com/blogs/machine-learning/amazon-bedrock-launches-session-management-apis-for-generative-ai-applications-preview/)).
-- DynamoDB data models for generative AI chatbots support efficient chronological message ordering within sessions using composite keys ([AWS Blog](https://aws.amazon.com/ko/blogs/database/amazon-dynamodb-data-models-for-generative-ai-chatbots)).
-- HMAC-SHA256 signed URLs with expiration timestamps provide stateless, horizontally scalable secure link generation without database lookups ([Best practices reference](https://www.hooklistener.com/learn/webhook-security-fundamentals)).
+### Decisiones que NO se cierran (extensibilidad futura)
 
-Content was rephrased for compliance with licensing restrictions.
+- IAM least-privilege y KMS desde el día 1 — la base de seguridad ya está en su lugar para Fase 2.
+- Logging estructurado con Powertools — agregar dashboards, alarmas o consumers nuevos (SIEM, Splunk) no requiere reescribir código de aplicación.
+- Action Groups como abstracción — agregar más tools (knowledge base lookup, ticketing, etc.) es solo agregar Lambdas, sin tocar el Conversational_Agent.
+- DynamoDB single-table — agregar GSIs cuando aparezcan patrones de consulta nuevos no requiere migración.
+- Bedrock Agent como recurso versionable — se pueden tener múltiples aliases (`prod`, `staging`, `experimental`) y rollouts graduales con CloudWatch metrics como gate.
 
-## Architecture
+## Arquitectura
 
-### High-Level Architecture
+### Arquitectura de Alto Nivel
 
 ```mermaid
 graph TB
@@ -32,154 +35,103 @@ graph TB
         WA[WhatsApp Client]
     end
 
-    subgraph "Ingress Layer"
+    subgraph "Ingress"
         WABA[AWS End User Messaging Social]
-        SNS_IN[Amazon SNS - Inbound]
+        SNS[Amazon SNS - Inbound]
     end
 
-    subgraph "Processing Layer"
-        GW[WhatsApp Gateway Lambda]
-        DEDUP[Message Deduplication Service]
-        SQS_FIFO[Amazon SQS FIFO - Message Queue]
-        FPR[Fast Path Router]
-        AGENT[Conversational Agent Lambda]
-        NLU[NLU Engine - Bedrock Claude]
-        FALLBACK[Fallback Response Engine]
-        CTX[Context Manager]
-        ORCH[Tool Orchestrator - Step Functions]
+    subgraph "Application Layer"
+        GW[WhatsApp Gateway Lambda<br/>TypeScript]
+        AGENT[Amazon Bedrock Agent<br/>Conversational_Agent<br/>Claude Haiku/Sonnet]
+        GUARD[Bedrock Guardrails]
     end
 
-    subgraph "Service Layer"
-        FQS[Financial Query Service Lambda]
-        ORS[Operation Request Service Lambda]
-        SLG[Secure Link Generator Lambda]
-        BANK_INT[Bank Core API Integration]
+    subgraph "Action Groups - Tools"
+        FQ[financial-query Lambda<br/>Python]
+        SO[submit-operation Lambda<br/>Python]
+        SL[generate-secure-link Lambda<br/>Python]
     end
 
     subgraph "Data Layer"
-        DDB_SESSION[DynamoDB - Sessions]
-        DDB_CONTEXT[DynamoDB - Context Store]
-        DDB_AUDIT[DynamoDB - Audit Trail]
-        DDB_IDEMP[DynamoDB - Idempotency Keys]
-        DDB_DEDUP[DynamoDB - Deduplication Records]
-        DDB_CACHE[DynamoDB - API Response Cache]
-        S3_AUDIT[S3 - Long-term Audit Archive]
+        DDB_CONV[DynamoDB - Conversations<br/>sessions + dedup + audit hot]
+        DDB_LINK[DynamoDB - SecureLinks]
     end
 
-    subgraph "Integration Layer"
-        CORE[Bank Core Systems API]
+    subgraph "External"
+        CORE[Bank Core API]
         TXN[Transactional API]
-        IDP[Identity Provider]
+        IDP[Bank Identity Provider]
     end
 
-    subgraph "Observability"
+    subgraph "Audit & Observability"
         CW_LOGS[CloudWatch Logs]
         CW_METRICS[CloudWatch Metrics]
-        CW_COLD[CloudWatch - Cold Start Monitoring]
         XRAY[AWS X-Ray]
+        FH[Kinesis Data Firehose]
+        S3[S3 - Audit Archive<br/>7 años, lifecycle a Glacier]
+        ATHENA[Amazon Athena<br/>on-demand]
         DASH[CloudWatch Dashboard]
     end
 
-    WA -->|Message| WABA
-    WABA -->|Notification| SNS_IN
-    SNS_IN -->|Trigger| GW
-    GW -->|Deduplicate| DEDUP
-    DEDUP -->|Enqueue| SQS_FIFO
-    SQS_FIFO -->|Trigger| FPR
-    FPR -->|Simple Query| FQS
-    FPR -->|Complex Query| AGENT
-    AGENT -->|Invoke| NLU
-    AGENT -->|Fallback| FALLBACK
-    AGENT -->|Read/Write| CTX
-    CTX -->|Store| DDB_SESSION
-    CTX -->|Store| DDB_CONTEXT
-    AGENT -->|Execute Workflow| ORCH
-    ORCH -->|Invoke| FQS
-    ORCH -->|Invoke| ORS
-    ORCH -->|Invoke| SLG
-    FQS -->|Query| BANK_INT
-    ORS -->|Submit| BANK_INT
-    BANK_INT -->|Call| CORE
-    BANK_INT -->|Call| TXN
-    BANK_INT -->|Cache| DDB_CACHE
-    ORS -->|Store Key| DDB_IDEMP
-    SLG -->|Validate| IDP
-    DEDUP -->|Store| DDB_DEDUP
-    AGENT -->|Response| GW
-    GW -->|Send| WABA
-    WABA -->|Deliver| WA
-    AGENT -->|Log| DDB_AUDIT
-    DDB_AUDIT -->|Archive| S3_AUDIT
-    AGENT -->|Emit| CW_LOGS
-    AGENT -->|Publish| CW_METRICS
-    AGENT -->|Trace| XRAY
-    GW -->|Cold Start Metrics| CW_COLD
-```
-
-### Deployment Architecture
-
-```mermaid
-graph TB
-    subgraph "AWS Region - Multi-AZ"
-        subgraph "AZ-1"
-            L1[Lambda Functions]
-            DDB1[DynamoDB Replica]
-        end
-        subgraph "AZ-2"
-            L2[Lambda Functions]
-            DDB2[DynamoDB Replica]
-        end
-        subgraph "AZ-3"
-            L3[Lambda Functions]
-            DDB3[DynamoDB Replica]
-        end
-    end
-    
-    subgraph "Global"
+    subgraph "Security"
         KMS[AWS KMS]
-        WAF[AWS WAF]
-        SM[Secrets Manager]
+        SM[AWS Secrets Manager<br/>HMAC keys + bank creds]
     end
+
+    WA -->|Message| WABA
+    WABA -->|Notification| SNS
+    SNS -->|Trigger| GW
+    GW -->|Dedup check| DDB_CONV
+    GW -->|InvokeAgent| AGENT
+    AGENT -->|Filter input/output| GUARD
+    AGENT -->|Invoke Action| FQ
+    AGENT -->|Invoke Action| SO
+    AGENT -->|Invoke Action| SL
+    FQ -->|GET| CORE
+    SO -->|POST| TXN
+    SO -->|Idempotency check| DDB_CONV
+    SL -->|HMAC sign| KMS
+    SL -->|Store metadata| DDB_LINK
+    SL -.->|Portal redirect| IDP
+    AGENT -->|Response| GW
+    GW -->|Reply| WABA
+    WABA -->|Deliver| WA
+    GW -->|Logs| CW_LOGS
+    AGENT -->|Traces + Logs| CW_LOGS
+    FQ -->|Logs| CW_LOGS
+    SO -->|Logs| CW_LOGS
+    SL -->|Logs| CW_LOGS
+    CW_LOGS -->|Subscription filter| FH
+    FH -->|Parquet + KMS| S3
+    S3 -.->|Ad-hoc queries| ATHENA
+    GW -->|Custom metrics| CW_METRICS
+    AGENT -->|Custom metrics| CW_METRICS
+    GW -->|Traces| XRAY
+    CW_METRICS -->|Visualize| DASH
 ```
 
-### Provisioned Concurrency Configuration
+### Patrones Arquitectónicos Clave
 
-To mitigate Lambda cold starts and ensure consistent response times (Requirement 18):
+- **Single-Agent Architecture**: Un solo Bedrock Agent maneja todas las interacciones. Más simple de operar, monitorear y razonar sobre comportamiento. Si en el futuro se necesita especialización (ej: agente separado para inversiones vs operaciones), Bedrock soporta multi-agent collaboration.
+- **Action Groups con OpenAPI Schema**: Cada Action Group se define con un schema OpenAPI 3.0 que Bedrock usa para generar tool calls válidos. Esto da type safety entre el Agent y las Lambdas sin código glue.
+- **Stateless Secure Links**: La validación del link no requiere lookup en BD — la firma HMAC-SHA256 sobre payload (operation_context + expiry) es auto-contenida. La tabla `SecureLinks` solo se usa para marcar status (`used`, `expired`) post-validación.
+- **Single-Table Design en Conversations**: Una tabla DDB con composite key `(PK, SK)` maneja sesiones, dedup y audit hot. Reduce overhead de admin y aprovecha bien las queries por sesión.
+- **Audit Pipeline Pasivo**: La aplicación no llama a un servicio de auditoría. Solo emite logs estructurados; el pipeline managed (CloudWatch → Firehose → S3) los archiva. Cero código custom para compliance.
+- **Idempotencia por Conditional Write**: `submit-operation` hace `PutItem` con `ConditionExpression: attribute_not_exists(idempotency_key)`. Si existe, retorna el resultado guardado; si no, ejecuta la operación y persiste el resultado en el mismo item.
 
-| Lambda Function | Min Provisioned Concurrency | Peak Provisioned Concurrency | Schedule |
-|----------------|----------------------------|------------------------------|----------|
-| WhatsApp Gateway | 5 | 20 | Always-on (24/7) |
-| Conversational Agent | 5 | 30 | Always-on (24/7) |
-| Financial Query Service | 3 | 15 | Business hours + pre-peak scaling |
-| Operation Request Service | 2 | 10 | Business hours |
-
-**Pre-Scaling Strategy**: The system uses CloudWatch scheduled events combined with historical traffic pattern analysis to pre-scale provisioned concurrency 15 minutes before anticipated peak periods (month-end closings, payroll dates). During low-traffic periods (midnight to 6 AM local time), minimum provisioned instances are maintained to ensure sub-second cold start response.
-
-**Cold Start Monitoring**: A dedicated CloudWatch metric (`ColdStartRate`) tracks the ratio of cold starts to total invocations per 15-minute window. An alarm triggers when this rate exceeds 5%, notifying the operations team to review provisioned concurrency settings.
-
-### Key Architectural Patterns
-
-- **Event-Driven Ingress**: WhatsApp → SNS → Lambda → SQS FIFO → Agent Lambda. The SQS FIFO buffer absorbs traffic spikes, provides exactly-once delivery guarantees, and enables message deduplication at the queue level.
-- **Fast Path Bypass**: Simple, well-known queries (balance checks, last N transactions) are identified by the Fast Path Router using lightweight pattern matching and routed directly to the Financial Query Service, bypassing the full NLU + orchestration chain for sub-2-second responses.
-- **Agentic Loop**: The Conversational Agent Lambda uses a ReAct (Reason + Act) pattern with Bedrock Claude, iteratively reasoning about user intent and invoking tools until the request is fulfilled.
-- **Fallback Degradation**: When Bedrock is unavailable (detected via 10-second health checks), the Fallback Response Engine activates within 30 seconds, providing template-based responses for common queries while informing clients of limited mode.
-- **Saga Pattern for Operations**: Multi-step financial operations use Step Functions with compensating transactions for rollback on failure. Idempotency keys ensure exactly-once processing even under at-least-once delivery semantics.
-- **CQRS for Audit**: Write path goes to DynamoDB (hot storage), with DynamoDB Streams archiving to S3 (cold storage) for long-term retention.
-- **Resilient External Integration**: Bank Core API calls use circuit breakers (open after 5 consecutive failures, recovery after 30s), exponential backoff with jitter for rate limits, and response caching (5-minute TTL) for non-transactional data.
-
-## Components and Interfaces
+## Componentes e Interfaces
 
 ### 1. WhatsApp Gateway
 
-**Responsibility**: Receives inbound WhatsApp messages, validates format, normalizes payload, and delivers outbound responses.
+**Responsabilidad**: Recibir mensajes entrantes vía SNS desde AWS End User Messaging Social, descartar duplicados, invocar al Bedrock Agent y entregar la respuesta de vuelta a WhatsApp.
 
-**Technology**: AWS Lambda (Node.js/TypeScript), triggered by SNS from AWS End User Messaging Social.
+**Tecnología**: AWS Lambda (Node.js 20, TypeScript). Sin provisioned concurrency en MVP.
 
-**Interfaces**:
+**Interfaces (TypeScript)**:
 ```typescript
-// Inbound message from WhatsApp
+// SNS notification payload (normalized from AWS End User Messaging Social)
 interface InboundMessage {
-  messageId: string;
+  whatsappMessageId: string;
   phoneNumber: string;
   timestamp: string;
   type: 'text' | 'interactive_reply';
@@ -190,7 +142,7 @@ interface InboundMessage {
   };
 }
 
-// Outbound response to WhatsApp
+// Response back to WhatsApp Business API
 interface OutboundMessage {
   phoneNumber: string;
   type: 'text' | 'interactive_buttons' | 'interactive_list';
@@ -201,1030 +153,459 @@ interface OutboundMessage {
   };
 }
 
-// Gateway → Agent (via SQS)
-interface AgentRequest {
-  requestId: string;
-  correlationId: string;
-  clientPhoneNumber: string;
-  message: InboundMessage;
-  receivedAt: string;
+// Invocation payload to Bedrock Agent
+interface AgentInvocation {
+  sessionId: string;       // Stable per phoneNumber until 30-min TTL
+  correlationId: string;   // UUID per inbound message
+  inputText: string;
+  sessionAttributes?: Record<string, string>;
 }
 ```
 
-### 2. Conversational Agent
+**Pseudocódigo del handler**:
+```
+1. Parse SNS notification → InboundMessage
+2. Compute sessionId = hash(phoneNumber)
+3. PutItem to Conversations table with ConditionExpression:
+   PK = WHATSAPP_MSG#{whatsappMessageId}
+   SK = WHATSAPP_MSG#{whatsappMessageId}
+   ttl = now + 5min
+   Condition: attribute_not_exists(PK)
+   IF ConditionalCheckFailedException → return (duplicate, ignore)
+4. InvokeAgent(BedrockAgentRuntime, sessionId, correlationId, inputText)
+5. Serialize response → OutboundMessage
+6. Send via AWS End User Messaging Social SendMessage API
+7. Emit structured log with correlationId
+```
 
-**Responsibility**: Core orchestration component. Interprets user intent via NLU, manages conversation flow, decides which tools to invoke, and formulates responses.
+### 2. Conversational Agent (Amazon Bedrock Agent)
 
-**Technology**: AWS Lambda (Python), Amazon Bedrock (Claude 3.5 Sonnet).
+**Responsabilidad**: Núcleo agentic. Interpreta español natural, mantiene memoria de sesión, decide qué Action Groups invocar, encadena pasos vía loop ReAct nativo, aplica Guardrails y formula la respuesta final.
 
-**Interfaces**:
-```typescript
-// Agent processing result
-interface AgentResponse {
-  requestId: string;
-  correlationId: string;
-  sessionId: string;
-  response: OutboundMessage;
-  toolInvocations: ToolInvocation[];
-  nluResult: NLUResult;
-  processingTimeMs: number;
-}
+**Tecnología**: Amazon Bedrock Agent con foundation model Claude Haiku 3.5 (por velocidad/costo) en MVP. Puede escalarse a Sonnet 3.5 para reasoning complejo configurando un model routing en el Agent.
 
-// Tool invocation record
-interface ToolInvocation {
-  toolName: string;
-  input: Record<string, unknown>;
-  output: Record<string, unknown>;
-  durationMs: number;
-  status: 'success' | 'failure';
-  errorMessage?: string;
+**Configuración clave**:
+- **Idle session timeout**: 30 minutos (cumple R3.3)
+- **Max tokens per response**: 2048
+- **Max hops per turn**: 5 (default razonable, configurable)
+- **Guardrails attached**: Política de banca-only, content filtering, fraud detection, PII redaction
+- **Knowledge Base**: No en MVP (puerta abierta para Fase 2 con docs internos del banco)
+- **Memory**: Bedrock Agent session memory nativa (no requiere tabla DDB para conversación activa)
+
+**Prompt template (system instructions)**:
+```
+Eres el asistente conversacional de BTG Pactual operando vía WhatsApp.
+Solo respondes sobre temas bancarios y financieros relacionados con productos
+y servicios de BTG Pactual. Manejas español colombiano formal pero cercano.
+
+Para CADA respuesta que involucre datos financieros, agrega al final:
+"Esta información es de carácter referencial. Los registros oficiales están
+disponibles en los portales del banco."
+
+Si el cliente pide algo fuera del dominio bancario, declina cortésmente y
+sugiere los servicios disponibles.
+
+Para operaciones (transferencias, pagos):
+1. Recolecta los parámetros (origen, destino, monto, moneda, descripción)
+2. Presenta un resumen y pide confirmación explícita
+3. Solo invoca submit-operation tras confirmación
+4. Si la operación requiere autenticación formal, invoca generate-secure-link
+
+Si una operación crítica falla, informa el motivo y ofrece reintentar o abortar.
+Si el contexto es ambiguo, pregunta antes de actuar.
+```
+
+### 3. Action Group: financial-query
+
+**Responsabilidad**: Recuperar movimientos, saldos, análisis de gasto y estado de productos desde la Bank_Core_API.
+
+**Tecnología**: AWS Lambda (Python 3.12). Llama directamente a la Bank_Core_API con el AWS SDK (HTTPX o boto3 según protocolo) — los retries con exponential backoff del SDK son suficientes para MVP. Autenticación vía OAuth2 client credentials con token cacheado en Lambda extension (refresh automático antes de expiry).
+
+**OpenAPI Schema (resumido)**:
+```yaml
+openapi: 3.0.0
+info:
+  title: financial-query
+  version: 1.0.0
+paths:
+  /get-account-movements:
+    post:
+      operationId: getAccountMovements
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clientId: { type: string }
+                accountId: { type: string }
+                startDate: { type: string, format: date }   # optional, default = now-30d
+                endDate: { type: string, format: date }     # optional, default = now
+                limit: { type: integer, default: 10 }
+                offset: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: List of transactions with running balance and summary
+  /get-balance:
+    post:
+      operationId: getBalance
+      ...
+  /get-spending-analysis:
+    post:
+      operationId: getSpendingAnalysis
+      ...
+  /get-product-status:
+    post:
+      operationId: getProductStatus
+      ...
+  /list-active-products:
+    post:
+      operationId: listActiveProducts
+      ...
+```
+
+### 4. Action Group: submit-operation
+
+**Responsabilidad**: Generar y enviar Operational_Requests (transferencias, pagos) al sistema transaccional del banco, garantizando idempotencia inline.
+
+**Tecnología**: AWS Lambda (Python 3.12), con conditional write en DynamoDB `Conversations` para idempotencia.
+
+**Flujo de idempotencia**:
+```python
+def submit_operation(client_id, operation_params):
+    idempotency_key = compute_idempotency_key(client_id, operation_params)
+    try:
+        # Reservar la key con escritura condicional
+        ddb.put_item(
+            Item={
+                'PK': f'OP#{client_id}',
+                'SK': f'IDEMP#{idempotency_key}',
+                'status': 'pending',
+                'params': operation_params,
+                'ttl': int(time.time()) + 86400  # 24 horas
+            },
+            ConditionExpression='attribute_not_exists(PK)'
+        )
+    except ConditionalCheckFailedException:
+        # Ya existe — retornar resultado guardado
+        existing = ddb.get_item(...)
+        return existing['result']
+
+    # Validar saldo antes de enviar
+    balance = financial_query.get_balance(client_id, operation_params['source_account'])
+    if balance.available < operation_params['amount']:
+        result = {'status': 'failed', 'reason': 'insufficient_balance'}
+    else:
+        # Llamar a la Bank_Core_API transaccional con la idempotency_key
+        result = bank_core.submit_transaction(operation_params, idempotency_key)
+
+    # Persistir resultado
+    ddb.update_item(... set status, result, confirmation_number)
+    return result
+```
+
+**OpenAPI Schema (resumido)**:
+```yaml
+paths:
+  /submit-operational-request:
+    post:
+      operationId: submitOperationalRequest
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceAccount, destinationAccount, amount, currency]
+              properties:
+                sourceAccount: { type: string }
+                destinationAccount: { type: string }
+                amount: { type: number }
+                currency: { type: string }
+                description: { type: string }
+                operationType: { type: string, enum: [transfer, payment, operational_order] }
+      responses:
+        '200':
+          description: Operation result with confirmationNumber and estimatedProcessingTime
+```
+
+### 5. Action Group: generate-secure-link
+
+**Responsabilidad**: Generar URLs únicas firmadas con HMAC-SHA256 que redirigen al portal del banco para autenticación o validación crítica.
+
+**Tecnología**: AWS Lambda (Python 3.12). HMAC computado dentro del Lambda con la llave recuperada de AWS Secrets Manager (cacheada in-memory por la duración de la ejecución; rotación managed por Secrets Manager con rotación automática cada 90 días).
+
+**Estructura del link**:
+```
+https://portal.btgpactual.com.co/connect-ai/validate
+  ?ctx={base64url(operation_context_json)}
+  &exp={unix_timestamp_expiry}
+  &sig={hex(HMAC-SHA256(secret, ctx + exp))}
+```
+
+**Tabla `SecureLinks` en DDB** (mínima, solo para tracking de status):
+```
+PK = LINK#{linkId}
+SK = LINK#{linkId}
+sessionId, clientId, operationType, status (active|used|expired), createdAt, ttl (10 min)
+```
+
+La validación del link en el portal del banco es stateless — solo requiere recalcular el HMAC con el secret compartido y verificar `expiry > now`. La tabla `SecureLinks` se actualiza a `status=used` post-validación (idempotente vía conditional update).
+
+### 6. Audit Pipeline (managed, sin código custom)
+
+**Responsabilidad**: Capturar todos los eventos del sistema (interacciones, invocaciones de Action Groups, Operational_Requests, alertas de seguridad) y archivarlos para retención de 7 años con capacidad de query ad-hoc.
+
+**Componentes** (todos managed, configurados vía CDK):
+
+1. **Lambda Powertools** en cada función emite logs estructurados JSON con `correlation_id`, `session_id`, `client_id` (hasheado), `event_type`, `payload`.
+2. **CloudWatch Logs** centraliza por log group por Lambda.
+3. **Subscription Filter** en cada log group → enruta a un **Kinesis Data Firehose** delivery stream.
+4. **Firehose** transforma a Parquet (vía Glue Schema Registry) y escribe a S3 con particionamiento por fecha (`s3://btg-connect-ai-audit/year=YYYY/month=MM/day=DD/`).
+5. **S3 Lifecycle Policy**: Standard 30 días → Glacier Instant Retrieval 1 año → Glacier Deep Archive hasta 7 años.
+6. **KMS encryption** en logs, Firehose y S3 (CMK rotativa anual).
+7. **Glue Data Catalog** con tablas particionadas referenciando el bucket S3.
+8. **Athena workgroup** configurado on-demand (sin infraestructura always-on; los compliance officers pueden ejecutar queries cuando necesiten).
+
+**Esquema canónico de evento de auditoría** (todo log estructurado lo respeta):
+```json
+{
+  "correlation_id": "uuid",
+  "session_id": "uuid",
+  "client_id_hash": "sha256-hex",
+  "timestamp": "ISO-8601",
+  "event_type": "interaction|action_group_invocation|operational_request|security_alert",
+  "component": "whatsapp-gateway|bedrock-agent|financial-query|submit-operation|generate-secure-link",
+  "payload": {
+    "...": "event-specific"
+  },
+  "duration_ms": 123,
+  "status": "success|failure",
+  "masked_fields": ["account_number_last4", "amount_omitted"]
 }
 ```
 
-### 3. NLU Engine
+## Modelos de Datos
 
-**Responsibility**: Interprets natural language Spanish messages, identifies intents, extracts entities, and provides confidence scores.
+### Tabla `Conversations` (single-table design)
 
-**Technology**: Amazon Bedrock (Claude 3.5 Sonnet) with structured output prompting.
+Almacena 3 tipos de items diferenciados por el patrón del SK: deduplicación de mensajes entrantes, registros de idempotencia de operaciones, y resumen hot de sesión para queries operativas (la memoria conversacional activa la mantiene Bedrock Agent).
 
-**Interfaces**:
-```typescript
-interface NLUResult {
-  intents: Intent[];
-  entities: Entity[];
-  language: string;
-  rawConfidence: number;
-}
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| PK | String | Partition Key — ver patrones abajo |
+| SK | String | Sort Key — ver patrones abajo |
+| ttl | Number | Unix timestamp para expiración nativa de DDB |
+| GSI1PK | String | (opcional) Llave alternativa para consultas por cliente |
+| GSI1SK | String | (opcional) Llave alternativa por fecha |
 
-interface Intent {
-  name: string;
-  confidence: number;
-  category: 'query' | 'operation' | 'information' | 'greeting' | 'unknown';
-}
+**Patrones de items**:
 
-interface Entity {
-  type: 'account_number' | 'amount' | 'date' | 'currency' | 'product_name' | 'period';
-  value: string;
-  normalizedValue: string;
-  startPosition: number;
-  endPosition: number;
-}
-```
+| Tipo de item | PK | SK | TTL | Atributos adicionales |
+|--------------|----|----|-----|----------------------|
+| Dedup msg | `WHATSAPP_MSG#{whatsappMessageId}` | `WHATSAPP_MSG#{whatsappMessageId}` | 5 min | `phoneNumber`, `receivedAt` |
+| Idempotency operación | `OP#{clientId}` | `IDEMP#{idempotencyKey}` | 24 h | `params`, `status`, `result`, `confirmationNumber` |
+| Resumen sesión | `SESSION#{sessionId}` | `META` | 30 min | `clientId`, `phoneNumber`, `correlationId`, `turnCount` |
 
-### 4. Context Manager
+**GSI-1** (opcional, agregar si surge la necesidad): `GSI1PK = CLIENT#{clientId}`, `GSI1SK = OP#{createdAt}` para listar operaciones recientes por cliente.
 
-**Responsibility**: Maintains conversational memory, resolves references, manages session lifecycle.
+Encryption: AWS KMS CMK (rotación anual). Point-in-time recovery: habilitado.
 
-**Technology**: AWS Lambda (Python), Amazon DynamoDB.
+### Tabla `SecureLinks`
 
-**Interfaces**:
-```typescript
-interface Session {
-  sessionId: string;
-  clientId: string;
-  phoneNumber: string;
-  createdAt: string;
-  lastActivityAt: string;
-  ttl: number; // Unix timestamp for DynamoDB TTL (30 min inactivity)
-  turnCount: number;
-  status: 'active' | 'expired';
-}
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| PK | String | `LINK#{linkId}` |
+| SK | String | `LINK#{linkId}` |
+| sessionId | String | Sesión del Bedrock Agent que generó el link |
+| clientIdHash | String | Hash del clientId (no se almacena en claro) |
+| operationType | String | `transfer`, `payment`, `auth_validation`, etc. |
+| status | String | `active`, `used`, `expired` |
+| createdAt | String | ISO 8601 |
+| ttl | Number | 10 minutos desde `createdAt` |
 
-interface ConversationTurn {
-  sessionId: string;
-  turnNumber: number;
-  timestamp: string;
-  role: 'user' | 'assistant';
-  content: string;
-  intent?: string;
-  entities?: Entity[];
-}
+Encryption: AWS KMS CMK. TTL nativa de DDB elimina items expirados automáticamente.
 
-interface ContextWindow {
-  sessionId: string;
-  turns: ConversationTurn[];
-  resolvedEntities: Map<string, string>; // Pronoun/reference resolution cache
-}
-```
-
-### 5. Tool Orchestrator
-
-**Responsibility**: Decomposes complex requests into ordered tool invocations, manages execution flow, handles failures, enforces configurable invocation limits with internal step exclusion.
-
-**Technology**: AWS Step Functions (Express Workflows for sub-5s latency).
-
-**Interfaces**:
-```typescript
-interface WorkflowDefinition {
-  workflowId: string;
-  steps: WorkflowStep[];
-  maxSteps: number; // Configurable, default 10 (external steps only)
-}
-
-interface WorkflowStep {
-  stepId: string;
-  toolName: string;
-  stepClassification: 'external' | 'internal'; // Internal steps (validation, audit, context) don't count against limit
-  inputMapping: Record<string, string>; // Maps previous outputs to inputs
-  retryPolicy: { maxAttempts: number; backoffRate: number };
-  onFailure: 'abort' | 'skip' | 'compensate';
-}
-
-interface WorkflowExecution {
-  executionId: string;
-  sessionId: string;
-  status: 'running' | 'completed' | 'failed' | 'paused_for_auth';
-  completedSteps: number;
-  totalSteps: number;
-  externalStepCount: number; // Only external steps counted against limit
-  internalStepCount: number; // Internal steps tracked but not limited
-  results: Record<string, unknown>[];
-  limitWarningIssued: boolean; // True when 80% of limit reached
-}
-
-interface ToolInvocationLimitConfig {
-  maxExternalInvocations: number; // Default: 10, configurable via SSM Parameter Store
-  warningThresholdPercent: number; // Default: 80
-  internalStepTypes: string[]; // e.g., ['validation', 'audit_logging', 'context_resolution']
-}
-```
-
-### 6. Financial Query Service
-
-**Responsibility**: Retrieves account movements, balances, product status, and spending analysis from bank core systems.
-
-**Technology**: AWS Lambda (Python), integrates with bank core REST APIs.
-
-**Interfaces**:
-```typescript
-interface MovementQuery {
-  clientId: string;
-  accountId: string;
-  startDate: string;
-  endDate: string;
-  limit?: number;
-  offset?: number;
-}
-
-interface MovementResult {
-  transactions: Transaction[];
-  totalCount: number;
-  hasMore: boolean;
-  summary: {
-    totalIncome: number;
-    totalExpenses: number;
-    netChange: number;
-  };
-}
-
-interface Transaction {
-  transactionId: string;
-  date: string;
-  description: string;
-  amount: number;
-  currency: string;
-  runningBalance: number;
-  category?: string;
-}
-
-interface SpendingAnalysis {
-  period: { start: string; end: string };
-  categories: Array<{ name: string; amount: number; percentage: number; transactionCount: number }>;
-  totalSpending: number;
-  comparisonWithPrevious?: {
-    previousTotal: number;
-    changePercentage: number;
-    significantChanges: Array<{ category: string; changePercentage: number }>;
-  };
-}
-
-interface ProductStatus {
-  productId: string;
-  productType: 'savings' | 'checking' | 'investment' | 'credit' | 'cd';
-  name: string;
-  status: 'active' | 'inactive' | 'matured' | 'closed';
-  currentValue: number;
-  currency: string;
-  interestRate?: number;
-  maturityDate?: string;
-  lastUpdated: string;
-}
-```
-
-### 7. Operation Request Service
-
-**Responsibility**: Generates and submits operational requests (transfers, payments) to the bank's transactional system. Ensures exactly-once processing through idempotency key management.
-
-**Technology**: AWS Lambda (Python), integrates with bank transactional APIs, DynamoDB for idempotency key storage.
-
-**Interfaces**:
-```typescript
-interface OperationalRequest {
-  requestId: string;
-  idempotencyKey: string; // Unique key for exactly-once processing
-  clientId: string;
-  type: 'transfer' | 'payment' | 'operational_order';
-  parameters: {
-    sourceAccount: string;
-    destinationAccount: string;
-    amount: number;
-    currency: string;
-    description: string;
-  };
-  status: 'pending_confirmation' | 'submitted' | 'completed' | 'failed' | 'cancelled';
-  confirmationNumber?: string;
-  estimatedProcessingTime?: string;
-  createdAt: string;
-}
-
-interface IdempotencyRecord {
-  idempotencyKey: string; // PK
-  operationRequestId: string;
-  clientId: string;
-  operationResult: OperationResult;
-  createdAt: string;
-  ttl: number; // 24 hours from creation
-}
-
-interface OperationResult {
-  status: 'completed' | 'failed';
-  confirmationNumber?: string;
-  errorMessage?: string;
-  processedAt: string;
-}
-
-interface IdempotencyCheck {
-  idempotencyKey: string;
-  isDuplicate: boolean;
-  originalResult?: OperationResult;
-}
-
-interface BalanceValidation {
-  accountId: string;
-  requestedAmount: number;
-  availableBalance: number;
-  isValid: boolean;
-  reason?: string;
-}
-```
-
-### 8. Secure Link Generator
-
-**Responsibility**: Creates time-limited, cryptographically signed URLs for authentication redirects.
-
-**Technology**: AWS Lambda (Python), AWS KMS for key management, AWS Secrets Manager for key rotation.
-
-**Interfaces**:
-```typescript
-interface SecureLinkRequest {
-  sessionId: string;
-  clientId: string;
-  operationType: string;
-  operationParameters: Record<string, unknown>;
-  portalEndpoint: string;
-}
-
-interface SecureLink {
-  linkId: string;
-  url: string;
-  expiresAt: string; // 10 minutes from creation
-  signature: string; // HMAC-SHA256
-  status: 'active' | 'used' | 'expired';
-}
-```
-
-### 9. Traceability Service
-
-**Responsibility**: Records all AI decisions, tool invocations, and operational actions for governance and compliance.
-
-**Technology**: DynamoDB (hot storage, 90 days), DynamoDB Streams → Lambda → S3 (cold storage, 7 years), Amazon Athena for querying archived records.
-
-**Interfaces**:
-```typescript
-interface AuditRecord {
-  correlationId: string;
-  sessionId: string;
-  clientId: string;
-  timestamp: string;
-  eventType: 'interaction' | 'tool_invocation' | 'operational_request' | 'security_alert';
-  payload: {
-    messageContent?: string;
-    intent?: string;
-    confidence?: number;
-    toolName?: string;
-    toolInput?: Record<string, unknown>;
-    toolOutput?: Record<string, unknown>;
-    duration?: number;
-    status?: string;
-  };
-  ttl: number; // 90 days for DynamoDB, then archived to S3
-}
-
-interface AuditQuery {
-  clientId?: string;
-  sessionId?: string;
-  dateRange: { start: string; end: string };
-  eventType?: string;
-  limit?: number;
-}
-```
-
-### 10. Fallback Response Engine
-
-**Responsibility**: Provides template-based responses for common queries when Amazon Bedrock (NLU Engine) is unavailable, ensuring basic service continuity during degradation.
-
-**Technology**: AWS Lambda (Python), DynamoDB for template storage, CloudWatch for health check scheduling.
-
-**Interfaces**:
-```typescript
-interface FallbackTemplate {
-  templateId: string;
-  queryPattern: string; // Regex or keyword pattern
-  queryType: 'balance' | 'last_transactions' | 'product_status' | 'greeting' | 'general';
-  responseTemplate: string; // Template with {{variable}} placeholders
-  requiredDataSources: string[]; // Which services to call for data
-  priority: number; // For pattern matching precedence
-}
-
-interface FallbackResponse {
-  templateId: string;
-  renderedResponse: string;
-  limitedModeDisclaimer: string; // Always included during fallback
-  originalQuery: string;
-  matchConfidence: number;
-}
-
-interface HealthCheckResult {
-  service: 'bedrock';
-  status: 'healthy' | 'unhealthy' | 'degraded';
-  lastCheckAt: string;
-  consecutiveFailures: number;
-  responseTimeMs?: number;
-}
-
-interface FallbackState {
-  isActive: boolean;
-  activatedAt?: string;
-  deactivatedAt?: string;
-  reason: string;
-  healthCheckIntervalMs: 10_000; // 10 seconds
-  activationThresholdMs: 30_000; // 30 seconds max to activate
-  recoveryThresholdMs: 30_000; // 30 seconds max to deactivate
-}
-```
-
-### 11. Fast Path Router
-
-**Responsibility**: Identifies simple, well-known queries using lightweight pattern matching and routes them directly to the Financial Query Service, bypassing the full NLU + orchestration chain for faster response times.
-
-**Technology**: AWS Lambda (Python), SSM Parameter Store for configurable patterns.
-
-**Interfaces**:
-```typescript
-interface FastPathPattern {
-  patternId: string;
-  regex: string; // Lightweight regex for keyword matching
-  keywords: string[]; // Keyword list for quick matching
-  queryType: 'balance_check' | 'last_n_transactions' | 'product_status_simple';
-  targetService: 'financial_query_service';
-  parameterExtraction: Record<string, string>; // How to extract params from message
-  isActive: boolean;
-}
-
-interface FastPathRoutingDecision {
-  messageId: string;
-  matchedPattern?: FastPathPattern;
-  confidence: number; // Must be >= 0.9 to use fast path
-  route: 'fast_path' | 'standard_orchestration';
-  routingTimeMs: number;
-  nluInvoked: false; // Fast path NEVER invokes NLU
-}
-
-interface FastPathConfig {
-  patterns: FastPathPattern[];
-  confidenceThreshold: number; // Default: 0.9
-  maxResponseTimeMs: number; // Target: 2000ms end-to-end
-  lastUpdated: string;
-}
-```
-
-### 12. Bank Core API Integration
-
-**Responsibility**: Provides resilient integration with bank core systems, handling authentication, rate limits, circuit breaking, API versioning, and response caching.
-
-**Technology**: AWS Lambda (Python), AWS Secrets Manager for mTLS certificates and OAuth2 credentials, DynamoDB for response caching.
-
-**Interfaces**:
-```typescript
-interface BankCoreApiConfig {
-  baseUrl: string;
-  authMethod: 'mTLS' | 'oauth2_client_credentials';
-  mTlsCertArn?: string; // Secrets Manager ARN for mTLS certificate
-  oauth2Config?: {
-    tokenEndpoint: string;
-    clientId: string;
-    clientSecretArn: string; // Secrets Manager ARN
-    scopes: string[];
-    tokenRotationIntervalMs: number;
-  };
-  currentApiVersion: string;
-  supportedApiVersions: string[]; // For concurrent version support (30-day transition)
-  rateLimitConfig: {
-    maxRetries: 3;
-    baseBackoffMs: 1000;
-    maxBackoffMs: 30_000;
-    jitterEnabled: true;
-  };
-  circuitBreakerConfig: {
-    failureThreshold: 5; // Consecutive failures to open
-    recoveryTimeoutMs: 30_000; // Time before half-open attempt
-    halfOpenMaxAttempts: 1;
-  };
-  cacheConfig: {
-    enabled: true;
-    ttlMs: 300_000; // 5 minutes
-    cacheableEndpoints: string[]; // e.g., ['/products/catalog', '/exchange-rates']
-  };
-}
-
-interface BankCoreApiRequest {
-  endpoint: string;
-  method: 'GET' | 'POST' | 'PUT';
-  headers: Record<string, string>;
-  body?: Record<string, unknown>;
-  apiVersion: string;
-  idempotencyKey?: string;
-}
-
-interface BankCoreApiResponse {
-  statusCode: number;
-  body: Record<string, unknown>;
-  headers: Record<string, string>;
-  fromCache: boolean;
-  cachedAt?: string;
-  apiVersion: string;
-}
-
-interface CircuitBreakerState {
-  service: string;
-  state: 'closed' | 'open' | 'half_open';
-  consecutiveFailures: number;
-  lastFailureAt?: string;
-  openedAt?: string;
-  nextAttemptAt?: string;
-}
-
-interface RateLimitBackoff {
-  attemptNumber: number; // 1-3
-  waitTimeMs: number; // Exponential with jitter
-  jitterMs: number;
-  totalElapsedMs: number;
-}
-```
-
-### 13. Message Deduplication Service
-
-**Responsibility**: Detects and discards duplicate inbound WhatsApp messages before they reach the Conversational Agent, ensuring exactly-once message processing.
-
-**Technology**: AWS Lambda (Python), SQS FIFO queues with content-based deduplication, DynamoDB for deduplication record storage.
-
-**Interfaces**:
-```typescript
-interface DeduplicationRecord {
-  deduplicationKey: string; // PK: WhatsApp message ID + content hash
-  whatsappMessageId: string;
-  contentHash: string; // SHA-256 of message content
-  originalResponse?: string; // Cached response for duplicate requests
-  receivedAt: string;
-  processedAt?: string;
-  ttl: number; // 5 minutes from receipt (covers SQS FIFO dedup window)
-}
-
-interface DeduplicationCheck {
-  messageId: string;
-  contentHash: string;
-  isDuplicate: boolean;
-  originalResponse?: string;
-  duplicateCount: number; // How many times this message has been seen
-}
-
-interface DeduplicationConfig {
-  windowMs: 300_000; // 5-minute deduplication window
-  hashAlgorithm: 'sha256';
-  keyComposition: 'whatsapp_message_id + content_hash';
-  fifoQueueConfig: {
-    messageGroupId: string; // Client phone number for ordering
-    deduplicationScope: 'messageGroup';
-  };
-}
-```
-
-## Data Models
-
-### DynamoDB Table Design
-
-#### Sessions Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `CLIENT#{clientId}` |
-| SK | String | Sort Key | `SESSION#{sessionId}` |
-| phoneNumber | String | - | Client phone number |
-| createdAt | String | - | ISO 8601 timestamp |
-| lastActivityAt | String | - | ISO 8601 timestamp |
-| turnCount | Number | - | Current turn count (max 50) |
-| status | String | - | `active` or `expired` |
-| ttl | Number | - | Unix timestamp (30 min from last activity) |
-
-**GSI-1**: `phoneNumber` (PK) → enables lookup by phone number for incoming messages.
-
-#### Context Store Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `SESSION#{sessionId}` |
-| SK | String | Sort Key | `TURN#{turnNumber:04d}` |
-| timestamp | String | - | ISO 8601 timestamp |
-| role | String | - | `user` or `assistant` |
-| content | String | - | Message content |
-| intent | String | - | Identified intent |
-| entities | List | - | Extracted entities |
-| ttl | Number | - | Same as session TTL |
-
-#### Audit Trail Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `SESSION#{sessionId}` |
-| SK | String | Sort Key | `EVENT#{timestamp}#{eventId}` |
-| correlationId | String | - | Links all records in a session |
-| clientId | String | - | Bank client identifier |
-| eventType | String | - | Type of audit event |
-| payload | Map | - | Event-specific data |
-| ttl | Number | - | 90 days (hot storage) |
-
-**GSI-1**: `clientId` (PK), `timestamp` (SK) → enables client-centric audit queries.
-**GSI-2**: `eventType` (PK), `timestamp` (SK) → enables type-filtered queries.
-
-#### Secure Links Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `LINK#{linkId}` |
-| SK | String | Sort Key | `LINK#{linkId}` |
-| sessionId | String | - | Associated session |
-| clientId | String | - | Bank client identifier |
-| operationType | String | - | Type of operation |
-| signature | String | - | HMAC-SHA256 signature |
-| expiresAt | String | - | Expiration timestamp |
-| status | String | - | `active`, `used`, `expired` |
-| ttl | Number | - | 10 minutes from creation |
-
-#### Idempotency Keys Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `IDEMP#{idempotencyKey}` |
-| operationRequestId | String | - | Associated operation request |
-| clientId | String | - | Bank client identifier |
-| operationResult | Map | - | Result of the original operation |
-| createdAt | String | - | ISO 8601 timestamp |
-| ttl | Number | - | 24 hours from creation |
-
-**GSI-1**: `clientId` (PK), `createdAt` (SK) → enables lookup of recent operations by client.
-
-#### Deduplication Records Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `DEDUP#{whatsappMessageId}#{contentHash}` |
-| whatsappMessageId | String | - | Original WhatsApp message ID |
-| contentHash | String | - | SHA-256 hash of message content |
-| originalResponse | String | - | Cached response for duplicates |
-| receivedAt | String | - | ISO 8601 timestamp |
-| processedAt | String | - | ISO 8601 timestamp |
-| duplicateCount | Number | - | Number of duplicate detections |
-| ttl | Number | - | 5 minutes from receipt |
-
-#### API Response Cache Table
-
-| Attribute | Type | Key | Description |
-|-----------|------|-----|-------------|
-| PK | String | Partition Key | `CACHE#{endpoint}#{paramHash}` |
-| responseBody | Map | - | Cached API response |
-| apiVersion | String | - | API version of cached response |
-| cachedAt | String | - | ISO 8601 timestamp |
-| ttl | Number | - | 5 minutes from cache time |
-
-### Data Flow Diagram
+### Flujo de Datos End-to-End
 
 ```mermaid
 sequenceDiagram
     participant C as Bank Client
     participant WA as WhatsApp
     participant GW as Gateway Lambda
-    participant Q as SQS Queue
-    participant A as Agent Lambda
-    participant B as Bedrock Claude
-    participant CM as Context Manager
-    participant TO as Tool Orchestrator
-    participant FS as Financial Service
-    participant T as Traceability
+    participant DDB as Conversations DDB
+    participant AG as Bedrock Agent
+    participant GU as Guardrails
+    participant FQ as financial-query
+    participant CORE as Bank Core API
+    participant CW as CloudWatch Logs
+    participant FH as Firehose
+    participant S3 as S3 Audit
 
-    C->>WA: Send message
+    C->>WA: "Cuál es mi saldo?"
     WA->>GW: SNS notification
-    GW->>Q: Enqueue AgentRequest
-    Q->>A: Trigger processing
-    A->>CM: Load session context
-    CM-->>A: ContextWindow (last N turns)
-    A->>B: Prompt with context + message
-    B-->>A: Intent + entities + reasoning
-    A->>TO: Execute tool(s)
-    TO->>FS: Query account data
-    FS-->>TO: Financial data
-    TO-->>A: Tool results
-    A->>B: Format response with results
-    B-->>A: Natural language response
-    A->>CM: Store new turns
-    A->>T: Record audit events
-    A->>GW: Send response
-    GW->>WA: Deliver to client
+    GW->>DDB: PutItem dedup (conditional)
+    DDB-->>GW: OK (not duplicate)
+    GW->>AG: InvokeAgent(sessionId, "Cuál es mi saldo?")
+    AG->>GU: Filter input
+    GU-->>AG: OK (banking topic)
+    AG->>FQ: getBalance(clientId, default account)
+    FQ->>CORE: GET /balance
+    CORE-->>FQ: { available, total }
+    FQ-->>AG: Balance result
+    AG->>GU: Filter output
+    GU-->>AG: OK (no PII leak)
+    AG-->>GW: "Tu saldo disponible es $X.XX. Esta información..."
+    GW->>WA: Send reply
     WA->>C: Display response
+    GW->>CW: Log (correlation_id, event=interaction)
+    AG->>CW: Trace + Log
+    FQ->>CW: Log (event=action_group_invocation)
+    CW->>FH: Subscription filter
+    FH->>S3: Parquet (partitioned by date)
 ```
 
-## Correctness Properties
+## Properties de Correctitud (MVP)
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+*Una property es una garantía formal que el sistema debe mantener en todas las ejecuciones válidas. En el MVP nos enfocamos en las properties **críticas** — seguridad, integridad financiera y compliance — donde una violación tiene consecuencias graves. El resto se cubre con unit tests focales (ver sección de testing).*
 
-### Property 1: Outbound Message Serialization Validity
+### Property 1: Validez de la Firma del Secure Link
 
-*For any* valid `OutboundMessage` (text, interactive buttons, or interactive list), serializing it to the WhatsApp Business API payload format SHALL produce a structurally valid payload that conforms to the WhatsApp message schema for that type.
+*Para cualquier* `operation_context` válido, el Secure Link generado SHALL contener una firma HMAC-SHA256 calculada sobre `(operation_context || expiry)` usando la llave secreta de Secrets Manager. La verificación SHALL aceptar el link si y solo si la firma recalculada coincide y `expiry > now`.
 
-**Validates: Requirements 1.3**
+**Valida: Requisitos 8.1, 8.4**
 
-### Property 2: Retry Backoff Timing Correctness
+### Property 2: Rechazo de Secure Links Manipulados o Expirados
 
-*For any* sequence of delivery failures, the retry mechanism SHALL produce wait intervals following exponential backoff (each interval ≥ previous × backoff multiplier), and the total cumulative retry duration SHALL NOT exceed 5 minutes.
+*Para cualquier* Secure Link, la validación SHALL rechazarlo si: (a) `expiry ≤ now`, O (b) cualquier byte del `operation_context` o del `expiry` ha sido alterado tras la firma. Solo los links válidos, no expirados y sin modificar SHALL pasar.
 
-**Validates: Requirements 1.5**
+**Valida: Requisitos 8.3, 8.5**
 
-### Property 3: Confidence-Based Intent Routing
+### Property 3: Validación de Saldo
 
-*For any* NLU result with a confidence score in [0, 1], the Conversational Agent's routing decision SHALL match the correct threshold band: proceed when confidence > 0.85, ask clarification when confidence ∈ [0.5, 0.85), and respond with not-understood when confidence < 0.5.
+*Para cualquier* par `(requested_amount, available_balance)`, la validación pre-envío en `submit-operation` SHALL aprobar si y solo si `requested_amount ≤ available_balance`, y SHALL rechazar con razón explícita en caso contrario.
 
-**Validates: Requirements 2.2, 2.3, 2.4**
+**Valida: Requisito 7.3**
 
-### Property 4: NLU Output Structural Validity
+### Property 4: Idempotencia Exactly-Once en Operaciones
 
-*For any* valid text input message, the NLU Engine SHALL return a result containing at least one intent with a confidence score in the range [0, 1] and a valid category classification.
+*Para cualquier* solicitud operativa con una `idempotency_key`, si la misma key se envía N veces (N ≥ 1) dentro de 24 horas, la operación SHALL ejecutarse contra la Bank_Core_API exactamente una vez, y todas las invocaciones subsiguientes SHALL retornar el resultado original sin re-ejecutar.
 
-**Validates: Requirements 2.1**
+**Valida: Requisito 7.4**
 
-### Property 5: Context Window Bounded Storage
+### Property 5: Deduplicación de Mensajes Entrantes
 
-*For any* session with N conversation turns added (where N may exceed 50), the Context Manager SHALL store at most 50 turns, retaining the most recent turns and evicting the oldest when the limit is reached.
+*Para cualquier* mensaje entrante con `whatsapp_message_id` previamente recibido dentro de los últimos 5 minutos, el WhatsApp_Gateway SHALL descartarlo sin invocar al Conversational_Agent.
 
-**Validates: Requirements 3.3**
+**Valida: Requisito 1.5**
 
-### Property 6: Session Lifecycle Correctness
+### Property 6: Disclaimer Financiero en Respuestas con Datos
 
-*For any* session, if the time elapsed since last activity exceeds 30 minutes, the session SHALL be marked as expired; and when a new session begins for the same client, the client identity SHALL be preserved while all conversational context from the previous session SHALL be cleared.
+*Para cualquier* respuesta generada por el Conversational_Agent que contenga datos financieros (saldos, montos, valores de productos), la respuesta SHALL incluir el disclaimer indicando que la información es referencial y que los registros oficiales están en los portales del banco.
 
-**Validates: Requirements 3.4, 3.5**
+**Valida: Requisito 11.6**
 
-### Property 7: Transaction Formatting Completeness
+### Property 7: Enmascaramiento de Data Sensible en Logs
 
-*For any* valid `Transaction` object, the formatted conversational output SHALL contain the transaction date, description, amount (with currency), and running balance.
+*Para cualquier* número de cuenta que aparezca en logs o traces, la representación SHALL mostrar solo los últimos 4 dígitos con el resto enmascarado. Saldos y montos exactos SHALL omitirse del log (solo se loggea presencia, no valor).
 
-**Validates: Requirements 4.3**
+**Valida: Requisito 14.4**
 
-### Property 8: Pagination Threshold Enforcement
+### Property 8: Expiración del Session Token
 
-*For any* query result set containing more than 10 transactions, the response SHALL include a summary and pagination/filtering options; for result sets with 10 or fewer transactions, full results SHALL be presented directly.
+*Para cualquier* session token emitido tras verificación de identidad, su `expires_at` SHALL ser como máximo 30 minutos después del momento de emisión.
 
-**Validates: Requirements 4.4**
+**Valida: Requisito 14.5**
 
-### Property 9: Spending Distribution Mathematical Correctness
+### Property 9: Correlation ID Único por Sesión
 
-*For any* set of categorized transactions in a period, the spending distribution SHALL satisfy: (a) the sum of all category amounts equals the total spending amount, and (b) all category percentages sum to 100% (within floating-point tolerance).
+*Para cualquier* par de sesiones distintas, sus `correlation_id` SHALL ser diferentes; y para cualquier sesión, todos los logs y eventos de audit emitidos dentro de ella SHALL compartir el mismo `correlation_id`.
 
-**Validates: Requirements 5.1**
+**Valida: Requisito 10.6**
 
-### Property 10: Top-N Category Selection Correctness
+### Property 10: Completitud del Audit Record
 
-*For any* spending distribution with K categories (K ≥ 5), the top 5 categories SHALL be the 5 categories with the highest spending amounts, presented in descending order by amount, each with accurate percentage of total spending.
+*Para cualquier* evento emitido al Audit_Pipeline, el log estructurado SHALL contener `correlation_id`, `session_id`, `timestamp`, `event_type`, `component`, `duration_ms` y `status`. Eventos de operational_request SHALL adicionalmente contener parámetros de la solicitud (con campos sensibles enmascarados) y estado de finalización.
 
-**Validates: Requirements 5.3**
+**Valida: Requisitos 10.1, 10.2, 10.3**
 
-### Property 11: Trend Comparison Threshold Detection
+## Manejo de Errores
 
-*For any* two spending periods with category-level data, the system SHALL flag as "significant change" only those categories where the absolute percentage change exceeds 20%, and SHALL NOT flag categories with changes ≤ 20%.
+### Categorías y Estrategias
 
-**Validates: Requirements 5.4**
+| Categoría | Ejemplos | Estrategia | Comunicación al Usuario |
+|-----------|----------|-----------|-------------------------|
+| **Transient infrastructure** | Lambda timeout, DDB throttling, network blip | Retries automáticos del AWS SDK con exponential backoff (default 3 intentos) | Sin notificación salvo que todos los retries fallen |
+| **Bedrock unavailable** | Bedrock no responde o retorna error 5xx | Lambda Gateway retorna mensaje fallback gentil | "Nuestro asistente está temporalmente no disponible. Por favor intenta en unos minutos." |
+| **Bank Core unavailable** | Core retorna 5xx persistente | Action Group retorna error estructurado; Bedrock Agent informa al cliente | "El servicio bancario no está disponible temporalmente. Por favor intenta más tarde." |
+| **Validation error** | Saldo insuficiente, cuenta inválida, link expirado | Rechazo inmediato, sin retry | Mensaje específico con acción sugerida |
+| **Guardrail violation** | Contenido off-topic o inseguro | Bedrock bloquea respuesta y emite mensaje neutro | Mensaje genérico de redirección a banca |
+| **Fraud detection** | Patrón sospechoso (Guardrails o lógica del Agent) | Terminar sesión, alerta de seguridad | Mensaje neutro sin detalles |
+| **Operation failure** | Bank Core rechaza la operación | Loggear razón, informar al cliente, ofrecer alternativas | Razón sanitizada + alternativa sugerida |
 
-### Property 12: Product Status Formatting Completeness
+### Dead Letter Queues
 
-*For any* valid `ProductStatus` object, the formatted output SHALL contain the product's current value, status, and interest rate; and for products with a maturity date, the maturity date SHALL also be included.
+Solo se configura DLQ donde es estrictamente necesario para no perder eventos:
+- **WhatsApp_Gateway**: DLQ sobre el async invoke a Bedrock (mensajes que no se pudieron procesar) → alarma de CloudWatch
+- **Audit pipeline**: Firehose con backup S3 bucket para records que no pasen transformación → alarma crítica (riesgo de compliance gap)
 
-**Validates: Requirements 6.4**
+### Degradación Graceful
 
-### Property 13: Data Staleness Detection
+| Componente caído | Capacidades disponibles | Capacidades degradadas |
+|------------------|--------------------------|-------------------------|
+| Bedrock Agent | Ninguna funcional | Gateway responde con mensaje de indisponibilidad |
+| financial-query | Operaciones, secure links | Consultas de cuenta/saldo/productos |
+| submit-operation | Consultas, secure links | Generación de operacionales |
+| generate-secure-link | Conversaciones, consultas | Operaciones que requieren autenticación |
+| Bank Core API | Ninguna funcional sin core | Gateway/Agent informa indisponibilidad temporal |
+| Audit pipeline | Toda la funcionalidad visible al usuario sigue trabajando (los logs se buffer en CloudWatch hasta recuperación de Firehose) | Solo se afecta el archivado a S3 — compliance issue si se prolonga (alarma crítica) |
 
-*For any* product status response where `lastUpdated` is more than 5 minutes before the current time, the response SHALL include a staleness indicator with the last update timestamp; for data fresher than 5 minutes, no staleness warning SHALL appear.
+## Estrategia de Testing (MVP)
 
-**Validates: Requirements 6.5**
-
-### Property 14: Operation Summary Completeness
-
-*For any* complete set of operational request parameters (source account, destination account, amount, currency, description), the confirmation summary SHALL contain all parameter values presented to the user.
-
-**Validates: Requirements 7.2**
-
-### Property 15: Balance Validation Correctness
-
-*For any* pair of (requested amount, available balance), the validation SHALL pass if and only if the requested amount is less than or equal to the available balance, and SHALL fail with an appropriate reason otherwise.
-
-**Validates: Requirements 7.4**
-
-### Property 16: Secure Link Generation Structural Correctness
-
-*For any* secure link request, the generated link SHALL contain: (a) a unique link identifier, (b) a valid HMAC-SHA256 signature computed over the link parameters, and (c) an expiration timestamp exactly 10 minutes from creation time.
-
-**Validates: Requirements 8.1, 8.3**
-
-### Property 17: Secure Link Context Round-Trip
-
-*For any* operation context (type, parameters, session reference), encoding the context into a secure link and then decoding it from the link SHALL produce an operation context equivalent to the original.
-
-**Validates: Requirements 8.2**
-
-### Property 18: Secure Link Validation Rejects Invalid Links
-
-*For any* secure link, validation SHALL reject the link if: (a) the current time exceeds the expiration timestamp, OR (b) any parameter in the URL has been modified after signing (signature mismatch). Valid, non-expired, untampered links SHALL pass validation.
-
-**Validates: Requirements 8.4, 8.5**
-
-### Property 19: Workflow Sequential Output Chaining
-
-*For any* multi-step workflow with N steps, the Tool Orchestrator SHALL pass the output of step i as input to step i+1 according to the defined input mapping, preserving data integrity across the chain.
-
-**Validates: Requirements 9.2**
-
-### Property 20: Workflow Execution Status Reporting
-
-*For any* multi-step workflow execution, after completing step K (successfully or with failure), the system SHALL emit a status report identifying the completed step and current progress; if step K fails, the report SHALL identify the failure point and offer retry/abort options.
-
-**Validates: Requirements 9.3, 9.4**
-
-### Property 21: Workflow Maximum Invocation Limit
-
-*For any* workflow definition regardless of the number of defined steps, the Tool Orchestrator SHALL execute at most the configured maximum number of tool invocations (default 10) and SHALL terminate execution after reaching this limit.
-
-**Validates: Requirements 9.5**
-
-### Property 22: Audit Record Completeness
-
-*For any* event recorded by the Traceability Service: (a) interaction events SHALL contain timestamp, message content, intent, and confidence score; (b) tool invocation events SHALL contain tool name, input, output, duration, and status; (c) operational request events SHALL contain request parameters, client identity, approval status, and completion status.
-
-**Validates: Requirements 10.1, 10.2, 10.3**
-
-### Property 23: Audit Query Filter Correctness
-
-*For any* set of audit records and any combination of filter criteria (client ID, date range, operation type, session ID), the query result SHALL contain exactly those records that match ALL specified filter criteria and SHALL exclude all records that fail any criterion.
-
-**Validates: Requirements 10.5**
-
-### Property 24: Session Correlation ID Uniqueness
-
-*For any* two distinct sessions, their correlation identifiers SHALL be different; and for any single session, all audit records generated within that session SHALL share the same correlation identifier.
-
-**Validates: Requirements 10.6**
-
-### Property 25: Financial Response Disclaimer Inclusion
-
-*For any* response that contains financial data (balances, transaction amounts, product values), the response SHALL include a disclaimer stating that information is for reference purposes and official records are available through bank portals.
-
-**Validates: Requirements 11.6**
-
-### Property 26: Structured Log Completeness
-
-*For any* request processed by the system, the emitted structured log entry SHALL contain the request identifier, latency measurement, status code, and component name.
-
-**Validates: Requirements 13.1**
-
-### Property 27: Alarm Threshold Correctness
-
-*For any* time series of metrics over a 5-minute window: (a) if the error rate exceeds 5%, an alarm SHALL be triggered; (b) if the average response latency exceeds 5 seconds, an alarm SHALL be triggered; (c) if neither threshold is exceeded, no alarm SHALL fire.
-
-**Validates: Requirements 13.4, 13.5**
-
-### Property 28: Sensitive Data Masking
-
-*For any* account number appearing in log or trace output, the masked representation SHALL show only the last 4 digits with all preceding digits replaced by mask characters; and for any balance or sensitive financial value, the data SHALL be masked or omitted from logs entirely.
-
-**Validates: Requirements 14.4**
-
-### Property 29: Session Token Expiration Correctness
-
-*For any* session token issued upon identity verification, the token's expiration timestamp SHALL be at most 30 minutes from the issuance time.
-
-**Validates: Requirements 14.5**
-
-### Property 30: Fallback Activation and Recovery Timing
-
-*For any* NLU Engine health check failure sequence, if the health check (performed every 10 seconds) detects unavailability, the Fallback Response Engine SHALL activate within 30 seconds of failure detection; and when the NLU Engine becomes available again, the system SHALL deactivate fallback mode and resume full agentic processing within 30 seconds of recovery detection.
-
-**Validates: Requirements 15.1, 15.4, 15.6**
-
-### Property 31: Fast Path Routing Correctness
-
-*For any* inbound message, if the Fast Path Router matches a well-known simple query pattern with confidence ≥ 0.9, the message SHALL be routed directly to the Financial Query Service without invoking the NLU Engine; if the pattern match confidence is below 0.9, the message SHALL be routed through the standard orchestration chain with NLU invocation.
-
-**Validates: Requirements 16.1, 16.2, 16.4**
-
-### Property 32: Idempotency Exactly-Once Processing
-
-*For any* confirmed operational request with a generated idempotency key, if the same operation is submitted N times (N ≥ 1) with the same idempotency key within 24 hours, the operation SHALL be executed exactly once and all subsequent submissions SHALL return the result of the original execution without re-processing.
-
-**Validates: Requirements 17.1, 17.2, 17.4**
-
-### Property 33: Cold Start Rate Alarm Threshold
-
-*For any* time series of Lambda invocations over a 15-minute window, if the ratio of cold start invocations to total invocations exceeds 5%, an alarm SHALL be triggered; if the ratio is at or below 5%, no cold start alarm SHALL fire.
-
-**Validates: Requirements 18.4**
-
-### Property 34: Configurable Tool Invocation Limit with Internal Step Exclusion
-
-*For any* workflow execution with a mix of internal steps (validation, audit logging, context resolution) and external steps (user-facing tool invocations), the Tool Orchestrator SHALL count only external steps against the configured maximum invocation limit, and SHALL terminate execution only when the external step count reaches the configured limit regardless of how many internal steps have been executed.
-
-**Validates: Requirements 19.1, 19.3**
-
-### Property 35: Bank Core API Rate Limit Backoff and Circuit Breaker Correctness
-
-*For any* sequence of Bank Core API responses: (a) when an HTTP 429 rate limit response is received, retry intervals SHALL follow exponential backoff with jitter, with each interval ≥ previous interval × backoff multiplier, for a maximum of 3 retries; (b) when 5 consecutive failures occur, the circuit breaker SHALL open and reject subsequent calls immediately; (c) after 30 seconds in open state, the circuit breaker SHALL transition to half-open and allow one test request.
-
-**Validates: Requirements 20.2, 20.5**
-
-### Property 36: Message Duplicate Detection
-
-*For any* inbound WhatsApp message, the Message Deduplication Service SHALL compute a deduplication key from the WhatsApp message ID combined with a content hash; if a message with the same deduplication key is received within a 5-minute window, it SHALL be classified as a duplicate and the original processing response SHALL be returned without re-processing the message.
-
-**Validates: Requirements 21.1, 21.2, 21.4**
-
-## Error Handling
-
-### Error Categories and Strategies
-
-| Category | Examples | Strategy | User Communication |
-|----------|----------|----------|-------------------|
-| **Transient Infrastructure** | Lambda timeout, DynamoDB throttling, network blip | Automatic retry with exponential backoff (max 3 attempts) | No user notification unless all retries fail |
-| **External Service Unavailable** | Bank core API down, transactional system timeout | Circuit breaker pattern (open after 5 failures in 60s) | "El servicio no está disponible temporalmente. Por favor intente más tarde." |
-| **Validation Error** | Insufficient balance, invalid account, expired link | Immediate rejection, no retry | Specific error message with suggested action |
-| **NLU Ambiguity** | Low confidence, multiple possible intents | Clarification flow | Clarifying question with suggested options |
-| **Workflow Failure** | Step N of M fails | Compensating transaction for completed steps, abort remaining | Progress report + failure explanation + retry/abort options |
-| **Security Violation** | Tampered link, expired token, fraud detection | Immediate termination, security alert | Generic security message, no details exposed |
-| **Rate Limiting** | Client exceeds message rate | Throttle with 429 response | "Ha enviado muchos mensajes. Por favor espere un momento." |
-
-### Circuit Breaker Configuration
-
-```typescript
-interface CircuitBreakerConfig {
-  failureThreshold: 5;        // Failures before opening
-  successThreshold: 3;        // Successes before closing
-  timeout: 60_000;            // Time in open state before half-open (ms)
-  monitoredServices: ['bank-core-api', 'transactional-api', 'identity-provider'];
-}
-
-// Bank Core API specific circuit breaker (Requirement 20)
-interface BankCoreCircuitBreaker {
-  failureThreshold: 5;        // 5 consecutive failures to open
-  recoveryTimeout: 30_000;    // 30 seconds before half-open attempt
-  halfOpenMaxAttempts: 1;     // Single test request in half-open state
-  rateLimitRetryConfig: {
-    maxRetries: 3;            // Max retries on HTTP 429
-    baseBackoffMs: 1_000;     // Initial backoff
-    maxBackoffMs: 30_000;     // Maximum backoff cap
-    jitterEnabled: true;      // Random jitter to prevent thundering herd
-  };
-}
-```
-
-### Dead Letter Queue Strategy
-
-Failed messages that exhaust all retries are routed to component-specific DLQ (SQS Dead Letter Queues):
-- **Gateway DLQ**: Undeliverable outbound messages → alarm + manual review
-- **Agent DLQ**: Unprocessable inbound messages → alarm + investigation
-- **Audit DLQ**: Failed audit writes → critical alarm (compliance risk)
-
-### Graceful Degradation Matrix
-
-| Failed Component | Available Capabilities | Disabled Capabilities |
-|-----------------|----------------------|----------------------|
-| Financial Query Service | Conversations, operations, secure links | Account queries, spending analysis |
-| Operation Request Service | Conversations, queries, secure links | Transfer/payment generation |
-| Secure Link Generator | Conversations, queries | Operations requiring auth |
-| NLU Engine (Bedrock) | Fallback template responses for balance, transactions, product status (limited mode) | Complex reasoning, multi-intent parsing, agentic workflows, spending analysis |
-| Context Manager | Stateless responses (no memory) | Context-aware conversations |
-| Traceability Service | All user-facing features (async logging) | Audit compliance (critical alert) |
-| Bank Core API | Cached responses (up to 5 min stale), conversations | Real-time account data, transactions, operations |
-| Fast Path Router | Standard orchestration (all requests go through NLU) | Sub-2s simple query responses |
-| Message Deduplication Service | Message processing continues (risk of duplicates) | Exactly-once message guarantee |
-
-## Testing Strategy
-
-### Testing Pyramid
+### Pirámide Reducida
 
 ```
-         ┌─────────────┐
-         │   E2E Tests  │  ← WhatsApp → System → Bank Core (staging)
-         │   (5-10)     │
-         ├─────────────┤
-         │ Integration  │  ← Component interactions, API contracts
-         │  (30-50)     │
-         ├─────────────┤
-         │  Property    │  ← Universal properties (100+ iterations each)
-         │  (30-36)     │
-         ├─────────────┤
-         │    Unit      │  ← Specific examples, edge cases, error paths
-         │  (100-200)   │
-         └─────────────┘
+         ┌─────────────────────┐
+         │  Property tests     │  ← 10 properties críticas (security, finance, compliance)
+         │  (10)               │
+         ├─────────────────────┤
+         │  Unit tests focales │  ← Happy paths + errores conocidos por componente
+         │  (~40-60)           │
+         └─────────────────────┘
 ```
 
-### Property-Based Testing Configuration
+Sin tests E2E ni integration formales en MVP. La validación end-to-end se hace manualmente en staging contra una réplica de la Bank_Core_API.
 
-**Library**: [Hypothesis](https://hypothesis.readthedocs.io/) (Python) for Lambda functions.
+### Property-Based Testing
 
-**Configuration**:
-- Minimum 100 iterations per property test
-- Max examples: 200 for critical properties (secure link, balance validation, idempotency, deduplication)
-- Deadline: 5000ms per example (accommodates complex generators)
-- Database: Store failing examples for regression
+**Librería**: [Hypothesis](https://hypothesis.readthedocs.io/) (Python) para las Lambdas de Action Group.
 
-**Tag Format**: Each property test is tagged with:
+**Configuración**:
+- Mínimo 100 iteraciones por property
+- 200 iteraciones para las críticas: Property 1, 2, 3, 4 (firma, validación de link, balance, idempotencia)
+- Deadline: 5000ms por ejemplo
+- Database: Persistir contraejemplos para regresión
+
+**Tag format**:
 ```python
-# Feature: btg-connect-ai, Property {N}: {property_text}
+# Feature: btg-connect-ai-mvp, Property {N}: {property_text}
 ```
 
-**Property Test Grouping**:
+### Foco de Unit Tests
 
-| Group | Properties | Focus |
-|-------|-----------|-------|
-| Message Formatting | 1, 7, 8, 12, 14 | Serialization and presentation correctness |
-| Routing & Thresholds | 3, 4, 11, 13, 27, 31, 33 | Decision logic based on numeric thresholds |
-| Session & Context | 5, 6, 24, 29 | State management lifecycle |
-| Financial Logic | 9, 10, 15 | Mathematical correctness of financial computations |
-| Secure Links | 16, 17, 18 | Cryptographic link generation and validation |
-| Workflow Orchestration | 19, 20, 21, 34 | Multi-step execution correctness |
-| Audit & Observability | 22, 23, 25, 26 | Record completeness and query correctness |
-| Security | 2, 28 | Retry safety and data protection |
-| Resilience & Fallback | 30, 35 | Degradation, health checks, circuit breakers |
-| Idempotency & Deduplication | 32, 36 | Exactly-once processing guarantees |
+Por componente:
+- **WhatsApp_Gateway**: parseo de SNS, deduplicación inline, fallback message cuando Bedrock falla, formato de OutboundMessage por tipo.
+- **financial-query**: aplicación de rangos por defecto (30 días, mes calendario), formato de salida, manejo de errores del core, enmascaramiento.
+- **submit-operation**: cálculo de idempotency key, conditional write success/failure, validación de saldo, retornar resultado existente para duplicados.
+- **generate-secure-link**: estructura del link, firma con KMS, expiración a 10 min, status transitions (active → used).
+- **Bedrock Agent**: tests de prompt sobre frases reales colombianas, off-topic rejection, multi-intent handling, disclaimer injection. Estos se ejecutan con Bedrock real en una cuenta de dev (no se mockean).
 
-### Unit Testing Focus
+### Validación Manual en Staging
 
-Unit tests complement property tests by covering:
-- Specific NLU examples with known Spanish colloquial expressions (2.5, 2.6, 2.7)
-- Fraud detection patterns (11.4, 11.5)
-- Off-topic rejection examples (11.1, 11.2, 11.3)
-- Default parameter application (4.2, 5.2)
-- Graceful degradation scenarios (12.4)
-- Error message formatting (4.5, 7.6)
-- Fallback template library completeness (15.5 — verify ≥ 20 templates)
-- Fast path pattern configuration loading (16.5)
-- Idempotency key inclusion in confirmations (17.5)
-- Provisioned concurrency configuration validation (18.1, 18.2, 18.3)
-- Tool invocation limit configuration loading (19.2)
-- API version header inclusion (20.3)
-- Bank Core API unavailability notification after 60s (20.6)
-- SQS FIFO queue deduplication configuration (21.3)
-- Deduplication record TTL validation (21.5)
-
-### Integration Testing Focus
-
-- WhatsApp Gateway ↔ AWS End User Messaging Social (message delivery)
-- Agent Lambda ↔ Amazon Bedrock (NLU invocation)
-- Financial Query Service ↔ Bank Core API (data retrieval with circuit breaker)
-- Operation Request Service ↔ Transactional API (request submission with idempotency)
-- Traceability Service ↔ DynamoDB + S3 (audit persistence)
-- Secure Link Generator ↔ KMS (key operations)
-- Fast Path Router ↔ Financial Query Service (direct routing latency validation, 16.3)
-- Fallback Response Engine ↔ Bedrock health check (activation/deactivation timing)
-- Message Deduplication Service ↔ SQS FIFO (exactly-once delivery)
-- Bank Core API Integration ↔ Bank Core Systems (mTLS/OAuth2 auth, rate limiting, versioning)
-- Lambda cold start pre-scaling ↔ CloudWatch scheduled events (18.5)
-- Tool invocation analytics ↔ CloudWatch Logs (19.5, 19.6)
-
-### End-to-End Testing
-
-- Full conversation flow: greeting → query → response (happy path)
-- Multi-step workflow: transfer request → parameter collection → confirmation → secure link → completion
-- Session expiration and re-engagement flow
-- Concurrent user simulation (load testing with Locust or Artillery)
-- Fast path flow: simple balance query → fast path routing → sub-2s response
-- Fallback mode flow: Bedrock unavailable → fallback activation → template response → Bedrock recovery → full mode resume
-- Idempotency flow: operation confirmation → duplicate submission → same result returned
-- Deduplication flow: duplicate WhatsApp message → single processing → cached response returned
-- Bank Core API resilience flow: rate limit → backoff → retry → success (or circuit open → graceful degradation)
-- Cold start validation: invoke after idle period → verify response time within bounds
-
+Pre go-live:
+- Conversación completa: saludo → consulta saldo → respuesta con disclaimer.
+- Operación multi-step: solicitud transfer → recolección params → confirmación → secure link → completion.
+- Expiración de sesión (esperar 30 min de inactividad) y verificar que la siguiente interacción inicie sesión fresca.
+- Inyección de duplicados desde WhatsApp (mismo `whatsapp_message_id`) → verificar que se descarta.
+- Apagar manualmente la Bank_Core_API mock → verificar mensaje degradado al cliente.
+- Mensaje off-topic ("recomiéndame qué acción comprar") → verificar redirección de Guardrails.
+- Mensaje con patrón sospechoso → verificar terminación de sesión y alerta en CloudWatch.
