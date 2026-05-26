@@ -12,15 +12,22 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 - **Servicios bancarios**: Transferencias BRE-B (mock), consulta de saldos, generación de extractos PDF
 
 **Arquitectura técnica:**
-- Serverless (Lambda, DynamoDB, S3, SNS) — sin VPC
-- TypeScript (Node.js 20.x) con AWS CDK para IaC
-- Amazon Bedrock Agent con Claude Haiku 3.5
+
+- Serverless (Lambda, DynamoDB, S3) — Lambdas adjuntadas a subnets privadas de la VPC IA-Builder (us-east-1) con salida a internet via NAT Gateway
+- Node.js 24.x (TypeScript) para Lambdas de negocio — Python 3.12 para la Lambda del Conversational_Agent (Strands Agent SDK)
+- AWS CDK (TypeScript) para IaC
+- Twilio (WhatsApp Sandbox) como canal de mensajería
+- Amazon API Gateway (HTTP API) expuesto públicamente para recibir webhooks de Twilio
+- **Async Webhook Pattern**: `Webhook_Receiver` Lambda síncrono responde 200 a Twilio en <1s y publica a SQS FIFO (`inbound-messages-queue.fifo`); `Message_Processor` Lambda async procesa los mensajes triggered por SQS. SQS FIFO da dedup automático por `MessageSid` (elimina tabla Dedup custom) y orden por `phoneNumber`
+- Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) para IA conversacional
 - Bedrock Guardrails para filtrado de contenido
-- AWS End User Messaging Social para WhatsApp
+- **AWS Step Functions** para orquestar transacciones distribuidas (transfer BRE-B con autorización OTP via patrón `waitForTaskToken`)
+- **Amazon SQS** para notificaciones asíncronas event-driven (email-notification-queue, sms-notification-queue) — productores fire-and-forget, consumidores procesan en batch con reintentos automáticos y DLQ
+- AWS Pinpoint para envío de OTP transaccional vía SMS
+- Amazon SES para envío de notificaciones por email
 - CloudWatch + Lambda Powertools para observabilidad
-- Secrets Manager para configuración sensible
+- Secrets Manager para configuración sensible (Twilio credentials, API keys)
 - Cifrado con AWS managed keys (sin CMKs custom)
-- Optimización de free tier donde sea posible (Bedrock pay-per-use aceptado)
 - Mercado colombiano — idioma español
 
 **Enfoque MVP:**
@@ -32,19 +39,28 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 ## Glossary
 
-- **Conversational_Agent**: Amazon Bedrock Agent que interpreta mensajes en español (texto o audio transcrito), mantiene memoria de sesión, decide qué acciones invocar y formula respuestas. Núcleo de IA conversacional managed por AWS.
-- **WhatsApp_Gateway**: Función Lambda (TypeScript) que recibe mensajes entrantes (texto y audio) vía AWS End User Messaging Social, gestiona el flujo de consentimiento, ejecuta deduplicación e invoca al Conversational_Agent.
-- **Action_Group**: Lambdas que el Conversational_Agent puede invocar para ejecutar acciones bancarias. Incluye: `transfer-breb`, `balance-query`, `statement-generator`.
+- **Conversational_Agent**: Lambda Python 3.12 que implementa el agente conversacional usando Strands Agent SDK sobre Amazon Bedrock Agent Core (Claude Haiku 3.5). Interpreta mensajes en español, mantiene memoria de sesión, decide qué herramientas invocar y formula respuestas.
+- **Webhook_Receiver**: Lambda Node.js 24.x (TypeScript) síncrona detrás de API Gateway. Su única responsabilidad es responder 200 a Twilio en <1s: valida la firma X-Twilio-Signature, parsea el payload, y publica el mensaje a `InboundMessagesQueue` (SQS FIFO). Sin acceso a DynamoDB, Bedrock, Transcribe ni Twilio REST API.
+- **Message_Processor**: Lambda Node.js 24.x (TypeScript) asíncrona, disparada por SQS Event Source Mapping sobre `InboundMessagesQueue`. Hace todo el trabajo pesado del flujo de un mensaje: consent check, transcripción de audio, auth check, OTP callback, invocación al Conversational_Agent, y envío de respuesta vía Twilio REST API.
+- **InboundMessagesQueue**: SQS FIFO (`inbound-messages-queue.fifo`) con `MessageGroupId = phoneNumber` (garantiza orden por cliente) y `MessageDeduplicationId = MessageSid` (dedup automática de reintentos de Twilio en ventana de 5 min). DLQ asociado: `inbound-messages-dlq`. Reemplaza la tabla `Dedup` custom del diseño anterior.
+- **Twilio_Webhook_API**: Amazon API Gateway (HTTP API) público expuesto a Twilio. Recibe los webhooks POST de mensajes entrantes de WhatsApp y los entrega al Webhook_Receiver.
+- **Action_Group**: Lambdas Node.js 24.x que el Conversational_Agent puede invocar para ejecutar acciones bancarias. Incluye: `transfer-breb`, `balance-query`, `statement-generator`.
+- **OTP_Service**: Lambda Node.js 24.x invocada por Step Functions con el patrón `waitForTaskToken`. Genera un código OTP de 6 dígitos, lo persiste en DynamoDB junto con el token de Step Functions, y lo envía via AWS Pinpoint (SMS). La Lambda retorna inmediatamente; el state machine queda pausado esperando que Message_Processor invoque `SendTaskSuccess` con el código validado.
+- **Email_Service**: Lambda Node.js 24.x **disparada por SQS** (Event Source Mapping con `email-notification-queue`, batch size 10). Consume eventos `transfer_confirmation` y `statement_delivery` y los envía via Amazon SES. Fallos van automáticamente a DLQ después de 3 reintentos.
+- **SMS_Service**: Lambda Node.js 24.x disparada por SQS (`sms-notification-queue`). Consume eventos de notificación SMS post-operación (no confundir con OTP_Service, que es síncrono dentro del workflow).
+- **TransferBrebStateMachine**: AWS Step Functions Standard Workflow que orquesta el ciclo completo de transferencia BRE-B: ValidateTransfer → GenerateOTP (waitForTaskToken) → ValidateOTP → ExecuteTransfer → PublishNotifications (Parallel: SQS email + SQS SMS) → NotifyUserSuccess. Maneja nativamente timeouts, reintentos y compensación.
+- **EmailNotificationQueue**: Cola SQS de notificaciones por email. Productores (Step Functions, statement-generator) publican eventos; Email_Service los procesa en batch. DLQ `email-dlq` después de 3 fallos.
+- **SmsNotificationQueue**: Cola SQS análoga para SMS de confirmación post-operación.
 - **Bank_Client**: Cliente de BTG Pactual que interactúa con el sistema vía WhatsApp.
 - **Consent_Store**: Tabla DynamoDB que almacena el estado de aceptación de Términos y Condiciones por número telefónico.
 - **Auth_Session**: Sesión autenticada almacenada en DynamoDB con TTL de 30 minutos, vinculada al número telefónico del Bank_Client.
 - **Auth_Service**: Sistema mock de autenticación (Lambda + DynamoDB) con usuarios de prueba hardcodeados que simula el flujo de login vía enlace web.
-- **Login_Page**: Página web simple (S3 estático o Lambda-backed) con formulario de login para autenticación del Bank_Client.
-- **Session**: Interacción conversacional gestionada por Bedrock Agents con memoria de sesión nativa, separada de la Auth_Session.
+- **Login_Page**: Página web simple (S3 estático) con formulario de login para autenticación del Bank_Client.
+- **Session**: Interacción conversacional gestionada por el Conversational_Agent (Strands) con memoria de sesión, separada de la Auth_Session.
 - **Bedrock_Guardrails**: Feature managed de Amazon Bedrock que aplica content filtering y topic restrictions sobre las respuestas del Conversational_Agent.
 - **Mock_Core**: Datos sintéticos hardcodeados que simulan respuestas del core bancario para saldos, transferencias y extractos.
-- **Transcription_Service**: Servicio de transcripción de audio a texto (Amazon Transcribe o capacidades nativas de Bedrock) utilizado para procesar notas de voz.
-- **Statement_Bucket**: Bucket S3 donde se almacenan temporalmente los PDFs de extractos bancarios antes de ser enviados como documento adjunto vía WhatsApp.
+- **Transcription_Service**: Amazon Transcribe, utilizado para procesar notas de voz OGG/Opus enviadas por el Bank_Client vía WhatsApp.
+- **Statement_Bucket**: Bucket S3 donde se almacenan temporalmente los PDFs de extractos bancarios antes de ser enviados como documento adjunto vía Twilio.
 - **BRE_B_Transfer**: Transferencia de dinero entre cuentas mediante el sistema BRE-B (mock en MVP).
 
 ## Requirements
@@ -55,12 +71,12 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 #### Criterios de Aceptación
 
-1. WHEN un Bank_Client envía un mensaje por primera vez y no tiene consentimiento registrado en el Consent_Store, THE WhatsApp_Gateway SHALL enviar un mensaje interactivo de WhatsApp con un botón para aceptar o rechazar los Términos y Condiciones antes de procesar cualquier otra solicitud
-2. WHEN un Bank_Client presiona el botón de aceptar Términos y Condiciones, THE WhatsApp_Gateway SHALL registrar el consentimiento en el Consent_Store asociado al número telefónico del Bank_Client con un timestamp de aceptación
-3. WHEN un Bank_Client presiona el botón de rechazar Términos y Condiciones, THE WhatsApp_Gateway SHALL responder con un mensaje informando que la aceptación es obligatoria para utilizar el servicio y que no se procesarán solicitudes hasta que acepte
-4. WHEN un Bank_Client que ya tiene consentimiento registrado en el Consent_Store envía un mensaje, THE WhatsApp_Gateway SHALL omitir el flujo de Términos y Condiciones y procesar el mensaje directamente
+1. WHEN un Bank_Client envía un mensaje por primera vez y no tiene consentimiento registrado en el Consent_Store, THE Message_Processor SHALL enviar un mensaje interactivo de WhatsApp con un botón para aceptar o rechazar los Términos y Condiciones antes de procesar cualquier otra solicitud
+2. WHEN un Bank_Client presiona el botón de aceptar Términos y Condiciones, THE Message_Processor SHALL registrar el consentimiento en el Consent_Store asociado al número telefónico del Bank_Client con un timestamp de aceptación
+3. WHEN un Bank_Client presiona el botón de rechazar Términos y Condiciones, THE Message_Processor SHALL responder con un mensaje informando que la aceptación es obligatoria para utilizar el servicio y que no se procesarán solicitudes hasta que acepte
+4. WHEN un Bank_Client que ya tiene consentimiento registrado en el Consent_Store envía un mensaje, THE Message_Processor SHALL omitir el flujo de Términos y Condiciones y procesar el mensaje directamente
 5. THE Consent_Store SHALL almacenar para cada registro: número telefónico del Bank_Client (partition key), estado del consentimiento (aceptado/rechazado), timestamp de la decisión y versión de los Términos y Condiciones aceptados
-6. IF el Consent_Store no está disponible para verificar el estado de consentimiento, THEN THE WhatsApp_Gateway SHALL responder al Bank_Client con un mensaje de indisponibilidad temporal del servicio
+6. IF el Consent_Store no está disponible para verificar el estado de consentimiento, THEN THE Message_Processor SHALL responder al Bank_Client con un mensaje de indisponibilidad temporal del servicio
 
 ### Requisito 2: Entrada Multimodal (Texto y Audio)
 
@@ -68,12 +84,12 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 #### Criterios de Aceptación
 
-1. WHEN un Bank_Client envía un mensaje de texto vía WhatsApp, THE WhatsApp_Gateway SHALL procesarlo directamente como entrada para el Conversational_Agent
-2. WHEN un Bank_Client envía una nota de voz (mensaje de audio) vía WhatsApp, THE WhatsApp_Gateway SHALL enviar el audio al Transcription_Service para obtener la transcripción en texto y luego procesar el texto resultante como entrada para el Conversational_Agent
+1. WHEN un Bank_Client envía un mensaje de texto vía WhatsApp, THE Message_Processor SHALL procesarlo directamente como entrada para el Conversational_Agent
+2. WHEN un Bank_Client envía una nota de voz (mensaje de audio) vía WhatsApp, THE Message_Processor SHALL enviar el audio al Transcription_Service para obtener la transcripción en texto y luego procesar el texto resultante como entrada para el Conversational_Agent
 3. THE Transcription_Service SHALL transcribir el audio a texto en español con una latencia máxima de 10 segundos para notas de voz de hasta 60 segundos de duración
-4. IF la transcripción del audio falla o produce un resultado vacío, THEN THE WhatsApp_Gateway SHALL responder al Bank_Client indicando que no se pudo procesar la nota de voz y solicitando que reenvíe el mensaje como texto o intente de nuevo
-5. WHEN un Bank_Client envía un mensaje en formato no soportado (imagen, video, sticker, documento, ubicación), THEN THE WhatsApp_Gateway SHALL responder con un mensaje indicando que solo se aceptan mensajes de texto y notas de voz
-6. THE WhatsApp_Gateway SHALL soportar notas de voz en los formatos de audio que WhatsApp envía nativamente (OGG/Opus) sin requerir conversión previa por parte del Bank_Client
+4. IF la transcripción del audio falla o produce un resultado vacío, THEN THE Message_Processor SHALL responder al Bank_Client indicando que no se pudo procesar la nota de voz y solicitando que reenvíe el mensaje como texto o intente de nuevo
+5. WHEN un Bank_Client envía un mensaje en formato no soportado (imagen, video, sticker, documento, ubicación), THEN THE Message_Processor SHALL responder con un mensaje indicando que solo se aceptan mensajes de texto y notas de voz
+6. THE Message_Processor SHALL soportar notas de voz en los formatos de audio que WhatsApp envía nativamente (OGG/Opus) sin requerir conversión previa por parte del Bank_Client
 
 ### Requisito 3: Integración del Canal WhatsApp
 
@@ -81,12 +97,16 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 #### Criterios de Aceptación
 
-1. WHEN un Bank_Client envía un mensaje vía WhatsApp, THE WhatsApp_Gateway SHALL recibirlo vía AWS End User Messaging Social y SNS, e invocar al Conversational_Agent dentro de 5 segundos (excluyendo tiempo de transcripción para audio)
-2. WHEN el Conversational_Agent produce una respuesta, THE WhatsApp_Gateway SHALL entregarla al Bank_Client vía AWS End User Messaging Social dentro de 3 segundos
-3. THE WhatsApp_Gateway SHALL soportar mensajes interactivos de WhatsApp (botones) para el flujo de consentimiento y el flujo de autenticación
-4. WHEN el WhatsApp_Gateway recibe un mensaje con el mismo identificador de mensaje dentro de una ventana de 5 minutos, THE WhatsApp_Gateway SHALL descartarlo como duplicado usando una escritura condicional en DynamoDB con un TTL de 10 minutos en el registro de deduplicación
-5. IF el WhatsApp_Gateway no recibe respuesta del Conversational_Agent dentro de 15 segundos, THEN THE WhatsApp_Gateway SHALL responder al Bank_Client con un mensaje indicando indisponibilidad temporal del servicio
-6. IF la respuesta del Conversational_Agent excede 4096 caracteres, THEN THE WhatsApp_Gateway SHALL dividirla en múltiples mensajes secuenciales de máximo 4096 caracteres cada uno y enviarlos en orden
+1. WHEN un Bank_Client envía un mensaje vía WhatsApp, Twilio SHALL enviar un webhook POST a la Twilio_Webhook_API (API Gateway), que disparará al Webhook_Receiver Lambda síncrono
+2. THE Webhook_Receiver SHALL validar la cabecera `X-Twilio-Signature` usando el `TWILIO_AUTH_TOKEN` (Secrets Manager). Si la firma es inválida, SHALL responder `403 Forbidden` sin encolar el mensaje
+3. THE Webhook_Receiver SHALL publicar el payload a `InboundMessagesQueue` (SQS FIFO) con `MessageGroupId = phoneNumber` y `MessageDeduplicationId = MessageSid`, y responder `200 OK` a Twilio dentro de **1 segundo** desde la recepción del webhook
+4. WHEN Twilio reintenta un webhook por timeout o error de red, SQS FIFO SHALL descartar automáticamente el mensaje duplicado por coincidencia de `MessageDeduplicationId` en ventana de 5 minutos. NO se requiere tabla Dedup custom
+5. WHEN un mensaje entra a `InboundMessagesQueue`, THE Message_Processor SHALL ser invocado vía SQS Event Source Mapping con `batchSize=1` y `reportBatchItemFailures=true`, y procesar el mensaje completo (consent + transcripción + auth + agent + envío de respuesta) dentro de su timeout de 120 segundos
+6. THE Message_Processor SHALL invocar el Conversational_Agent (Strands_Agent) sin presión de tiempo del lado de Twilio, ya que la respuesta a Twilio fue entregada por el Webhook_Receiver previamente
+7. THE Message_Processor SHALL entregar la respuesta del Conversational_Agent al Bank_Client mediante llamada a Twilio REST API (`twilio.messages.create`), no como respuesta HTTP al webhook original
+8. THE Message_Processor SHALL soportar mensajes interactivos de WhatsApp (botones de respuesta rápida de Twilio) para el flujo de consentimiento y el flujo de autenticación
+9. IF el Message_Processor falla al procesar un mensaje, SQS SHALL reintentar hasta `maxReceiveCount=3` con visibility timeout de 130 segundos, y luego mover el mensaje al DLQ `inbound-messages-dlq`. THE system SHALL emitir alarma CloudWatch cuando `ApproximateNumberOfMessagesVisible > 0` en el DLQ
+10. IF la respuesta del Conversational_Agent excede 1600 caracteres (límite de mensaje único de Twilio WhatsApp), THEN THE Message_Processor SHALL dividirla en múltiples mensajes secuenciales y enviarlos en orden vía Twilio REST API
 
 ### Requisito 4: Mensaje Inicial y Servicios Disponibles
 
@@ -105,14 +125,14 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 #### Criterios de Aceptación
 
-1. WHEN un Bank_Client solicita ejecutar una acción bancaria (transferencia, consulta de saldo, generación de extracto) y no tiene una Auth_Session activa, THE WhatsApp_Gateway SHALL enviar un mensaje interactivo de WhatsApp con un botón o enlace para "Iniciar sesión" antes de procesar la solicitud
+1. WHEN un Bank_Client solicita ejecutar una acción bancaria (transferencia, consulta de saldo, generación de extracto) y no tiene una Auth_Session activa, THE Message_Processor SHALL enviar un mensaje interactivo de WhatsApp con un botón o enlace para "Iniciar sesión" antes de procesar la solicitud
 2. WHEN un Bank_Client accede a la Login_Page mediante el enlace proporcionado, THE Login_Page SHALL presentar un formulario de autenticación que solicite credenciales (usuario y contraseña de los usuarios de prueba hardcodeados)
 3. WHEN un Bank_Client envía credenciales válidas en la Login_Page, THE Auth_Service SHALL crear una Auth_Session en DynamoDB asociada al número telefónico del Bank_Client con un TTL de 30 minutos
-4. WHEN la Auth_Session se crea exitosamente, THE WhatsApp_Gateway SHALL enviar un mensaje al Bank_Client confirmando que la autenticación fue exitosa y proceder a ejecutar la acción solicitada originalmente
+4. WHEN la Auth_Session se crea exitosamente, THE Message_Processor SHALL enviar un mensaje al Bank_Client confirmando que la autenticación fue exitosa y proceder a ejecutar la acción solicitada originalmente
 5. IF un Bank_Client envía credenciales inválidas en la Login_Page, THEN THE Auth_Service SHALL rechazar la autenticación y la Login_Page SHALL mostrar un mensaje de error indicando credenciales incorrectas
-6. WHEN un Bank_Client tiene una Auth_Session activa (TTL no expirado), THE WhatsApp_Gateway SHALL permitir la ejecución de acciones bancarias sin solicitar re-autenticación
+6. WHEN un Bank_Client tiene una Auth_Session activa (TTL no expirado), THE Message_Processor SHALL permitir la ejecución de acciones bancarias sin solicitar re-autenticación
 7. THE Auth_Service SHALL mantener al menos 3 usuarios de prueba hardcodeados con credenciales predefinidas para el demo del hackathon
-8. IF la Auth_Session ha expirado (TTL superado), THEN THE WhatsApp_Gateway SHALL solicitar re-autenticación al Bank_Client antes de ejecutar cualquier acción bancaria
+8. IF la Auth_Session ha expirado (TTL superado), THEN THE Message_Processor SHALL solicitar re-autenticación al Bank_Client antes de ejecutar cualquier acción bancaria
 
 ### Requisito 6: Gestión de Sesiones
 
@@ -145,11 +165,17 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 #### Criterios de Aceptación
 
 1. WHEN un Bank_Client autenticado solicita una transferencia BRE-B, THE Conversational_Agent SHALL solicitar los datos necesarios: cuenta origen, cuenta destino, monto y concepto de la transferencia
-2. WHEN el Conversational_Agent tiene todos los datos de la transferencia, THE Conversational_Agent SHALL presentar un resumen de la operación al Bank_Client y solicitar confirmación explícita antes de ejecutarla
-3. WHEN el Bank_Client confirma la transferencia, THE Action_Group `transfer-breb` SHALL ejecutar la transferencia contra el Mock_Core y retornar un comprobante con: número de transacción, cuenta origen, cuenta destino, monto, fecha y hora de ejecución, y estado de la operación
-4. IF el Bank_Client cancela o no confirma la transferencia, THEN THE Conversational_Agent SHALL cancelar la operación e informar al Bank_Client que la transferencia no fue ejecutada
-5. IF el monto de la transferencia excede el saldo disponible en la cuenta origen del Mock_Core, THEN THE Action_Group `transfer-breb` SHALL rechazar la operación e informar al Bank_Client que no tiene fondos suficientes
-6. IF la cuenta destino no es válida en el Mock_Core, THEN THE Action_Group `transfer-breb` SHALL rechazar la operación e informar al Bank_Client que la cuenta destino no fue encontrada
+2. WHEN el Conversational_Agent tiene todos los datos de la transferencia, THE Conversational_Agent SHALL presentar un resumen de la operación al Bank_Client y solicitar confirmación explícita antes de iniciar el workflow
+3. WHEN el Bank_Client confirma la transferencia, THE Strands_Agent SHALL invocar la tool `initiate-transfer-breb`, la cual ejecutará `StartExecution` sobre el state machine `TransferBrebStateMachine` con los datos validados de la transferencia y el `correlationId` de la sesión
+4. THE TransferBrebStateMachine SHALL ejecutar la secuencia de estados: `ValidateTransfer` (verifica fondos y cuenta destino contra Mock_Core) → `GenerateOTP` (genera código y pausa el workflow con `waitForTaskToken`, HeartbeatSeconds=300) → `ValidateOTP` (Choice state) → `ExecuteTransfer` (actualiza Mock_Core) → `PublishNotifications` (Parallel: publica a `EmailNotificationQueue` y `SmsNotificationQueue`) → `NotifyUserSuccess` (envía comprobante via Twilio)
+5. WHEN el state machine entra al estado `GenerateOTP`, THE OTP_Service SHALL generar un código de 6 dígitos, persistir `{phoneNumber, code, taskToken, executionArn, attempts: 0, ttl: 5min}` en `OTP_Store`, enviar el SMS via Pinpoint y retornar inmediatamente. El state machine queda suspendido sin consumir compute hours
+6. WHEN el Bank_Client responde con el código OTP en WhatsApp, THE Message_Processor SHALL leer `OTP_Store`, validar el código y, si es válido, invocar `SendTaskSuccess(taskToken, {valid: true})` para resumir el workflow al estado `ValidateOTP`
+7. IF el Bank_Client ingresa un OTP incorrecto y `attempts < 3`, THEN THE Message_Processor SHALL incrementar el contador en DynamoDB y enviar mensaje de reintento via Twilio sin resumir el workflow
+8. IF se alcanzan 3 intentos fallidos, THEN THE Message_Processor SHALL invocar `SendTaskFailure(taskToken, OTPBlockedError)` y el state machine transicionará al estado `NotifyOTPBlocked`
+9. IF el OTP expira (HeartbeatSeconds=300 vencido sin callback), THEN THE state machine SHALL transicionar al estado `NotifyOTPExpired` y notificar al cliente via Twilio
+10. IF `ValidateTransfer` rechaza la operación (fondos insuficientes o cuenta destino inválida), THEN el state machine SHALL transicionar al estado `NotifyValidationFailed` y notificar al cliente, sin generar OTP ni consumir el workflow restante
+11. IF `ExecuteTransfer` falla por error inesperado, THEN el state machine SHALL transicionar al estado `NotifyTransferFailed`. AT this stage NO compensación de saldo es necesaria (el Mock_Core MVP solo se actualiza si la ejecución es exitosa); en producción el estado de compensación deberá revertir la operación
+12. THE Action_Group `transfer-breb` SHALL generar un comprobante con: `transactionId`, `sourceAccount` (enmascarado), `destinationAccount` (enmascarado), `amount`, `currency: "COP"`, `concept`, `executedAt`, `status: "COMPLETED"`
 
 ### Requisito 9: Generación de Extractos
 
@@ -160,7 +186,7 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 1. WHEN un Bank_Client autenticado solicita un extracto bancario, THE Conversational_Agent SHALL solicitar la fecha de corte deseada para el extracto
 2. IF la fecha de corte solicitada es una fecha futura, THEN THE Conversational_Agent SHALL informar al Bank_Client que la fecha de corte debe ser una fecha pasada y solicitar una nueva fecha
 3. WHEN la fecha de corte es válida (fecha pasada), THE Action_Group `statement-generator` SHALL generar el extracto en formato PDF y almacenarlo en el Statement_Bucket (S3)
-4. WHEN el extracto está generado y almacenado en el Statement_Bucket, THE WhatsApp_Gateway SHALL descargar el PDF desde S3 y enviarlo al Bank_Client como mensaje de documento adjunto vía WhatsApp (tipo de mensaje document de EUMS)
+4. WHEN el extracto está generado y almacenado en el Statement_Bucket, THE Message_Processor SHALL descargar el PDF desde S3 y enviarlo al Bank_Client como mensaje de documento adjunto vía WhatsApp (tipo de mensaje document de EUMS)
 5. THE Action_Group `statement-generator` SHALL generar el PDF del extracto incluyendo: nombre del Bank_Client, número de cuenta (enmascarado), período del extracto, listado de movimientos con fecha, descripción y monto, y saldo final
 6. IF no existen movimientos para la fecha de corte solicitada, THEN THE Action_Group `statement-generator` SHALL generar un extracto vacío indicando que no se encontraron movimientos para el período
 
@@ -207,7 +233,7 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 #### Criterios de Aceptación
 
 1. THE system SHALL emitir logs estructurados en formato JSON usando AWS Lambda Powertools, incluyendo `correlation_id`, `request_id`, latencia en milisegundos y status code, hacia Amazon CloudWatch Logs con un período de retención de 7 días
-2. WHEN un mensaje entrante es recibido por el WhatsApp_Gateway, THE system SHALL generar un `correlation_id` único en formato UUID v4 que se propague a todos los logs de todas las Lambdas involucradas en esa interacción
+2. WHEN un mensaje entrante es recibido por el Webhook_Receiver, THE system SHALL generar un `correlation_id` único en formato UUID v4 y propagarlo en el payload de SQS para que el Message_Processor y todas las Lambdas downstream lo usen en sus logs estructurados
 3. THE system SHALL proveer un CloudWatch Dashboard con métricas de invocaciones, errores y latencia p50/p90 para cada Lambda del sistema en períodos de 5 minutos
 4. WHEN la proporción de invocaciones con error de cualquier Lambda respecto al total de invocaciones supera el 10% en una ventana de 5 minutos, THE system SHALL disparar una alarma de CloudWatch que publique una notificación a un tópico SNS configurado
 
@@ -225,17 +251,70 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 6. IF una llamada entre componentes internos es rechazada por IAM (AccessDeniedException), THEN THE system SHALL registrar el evento en CloudWatch Logs incluyendo el `correlation_id`, el recurso denegado y el timestamp, sin exponer detalles del secreto o la política
 7. THE Statement_Bucket SHALL configurar una lifecycle policy de 1 día para eliminar automáticamente los PDFs de extractos después de su entrega, dado que el documento se envía directamente como adjunto al Bank_Client
 
-### Requisito 15: Infraestructura Serverless sin VPC
+### Requisito 15: Infraestructura Serverless con Aislamiento de Red en VPC
 
-**Historia de Usuario:** Como platform engineer, quiero que las Lambdas corran sin VPC, para que el sistema sea más simple, más rápido en cold start y no consuma costos en VPC Endpoints.
+**Historia de Usuario:** Como security architect, quiero que todas las Lambdas corran dentro de la VPC corporativa en subnets privadas, para demostrar un modelo de seguridad de red robusto donde ningún componente de cómputo queda expuesto directamente a internet.
+
+**Contexto de red de la cuenta:** La cuenta AWS sandbox tiene desplegado el stack `IA-Builder-sandbox-networking` (región us-east-1, CIDR 10.0.0.0/16) con dos subnets privadas disponibles (10.0.11.0/24 en us-east-1a y 10.0.12.0/24 en us-east-1b). El stack de IaC de red incluye un NAT Gateway en PublicSubnet1 para dar salida a internet a las subnets privadas, necesario para que las Lambdas alcancen servicios externos (Twilio) y servicios AWS (Bedrock, Transcribe, Pinpoint, SES).
 
 #### Criterios de Aceptación
 
-1. THE system SHALL ejecutar todas las funciones Lambda sin configuración de VPC (sin VpcConfig, sin Security Groups, sin Subnets asociadas), accediendo a todos los servicios AWS directamente vía endpoints públicos
-2. THE system SHALL usar IAM roles y policies como único mecanismo de control de acceso entre las Lambdas y los servicios AWS consumidos (DynamoDB, S3, Secrets Manager, SNS, CloudWatch Logs, Amazon Bedrock, Amazon Transcribe)
-3. THE system SHALL mantener cold start de Lambda por debajo de 500ms en el percentil 95 (p95), medido desde la métrica `Init Duration` reportada por CloudWatch Logs
-4. WHEN se despliega la infraestructura, THE system SHALL validar que ninguna función Lambda del stack tenga la propiedad VpcConfig definida en la plantilla de despliegue
-5. THE system SHALL desplegarse usando AWS CDK (TypeScript) con todas las Lambdas en runtime Node.js 20.x
+1. THE system SHALL configurar todas las funciones Lambda con `VpcConfig` adjuntándolas a las subnets privadas (`PrivateSubnet1Id`, `PrivateSubnet2Id`) de la VPC `IA-Builder-sandbox-networking`, importando los IDs vía CDK `Fn.importValue('IA-Builder-sandbox-networking-PrivateSubnetIds')`
+2. THE system SHALL crear un Security Group dedicado para las Lambdas de aplicación con: cero reglas de ingress de red (el tráfico de entrada llega por invocación AWS, no por red) y egress TCP 443 (HTTPS) a 0.0.0.0/0 para salida a servicios AWS y Twilio
+3. THE system SHALL usar IAM roles y policies como mecanismo de control de acceso entre las Lambdas y los servicios AWS consumidos (DynamoDB, S3, Secrets Manager, CloudWatch Logs, Amazon Bedrock, Amazon Transcribe, Pinpoint, SES)
+4. THE system SHALL desplegarse usando AWS CDK (TypeScript) con las Lambdas de negocio en runtime Node.js 24.x y la Lambda del Conversational_Agent en Python 3.12, en la región us-east-1
+5. THE system SHALL exponer un Amazon API Gateway (HTTP API) público con una ruta POST `/webhook/twilio` que reciba los webhooks de Twilio y active el Webhook_Receiver. La URL del endpoint SHALL configurarse como webhook en la cuenta Twilio Sandbox
+6. THE system SHALL almacenar las credenciales de Twilio (Account SID, Auth Token, número de origen) en AWS Secrets Manager y no hardcodearlas en el código
+7. WHEN se despliega la infraestructura, THE system SHALL importar el `VpcId` del stack de red vía `Fn.importValue('IA-Builder-sandbox-networking-VpcId')` para crear el Security Group de Lambdas en la VPC correcta
+8. THE system SHALL crear una cola SQS FIFO `inbound-messages-queue.fifo` con `ContentBasedDeduplication=false` (la dedup se hace explícitamente por `MessageDeduplicationId`), `VisibilityTimeout=130s`, `MessageRetentionPeriod=1d`, encryption SSE-SQS, DLQ `inbound-messages-dlq.fifo` y `maxReceiveCount=3`
+9. THE Webhook_Receiver Lambda SHALL configurarse con timeout máximo de 10 segundos (en la práctica resuelve en <1s) y memory 256MB. NO requiere acceso a DynamoDB, Bedrock, Transcribe, S3 ni Twilio REST API — solo SQS SendMessage y Secrets Manager GetSecretValue
+10. THE Message_Processor Lambda SHALL configurarse con SQS Event Source Mapping sobre `inbound-messages-queue.fifo` con `batchSize=1`, `reportBatchItemFailures=true`, timeout 120s y memory 512MB
+
+### Requisito 16: Autorización OTP con Patrón Task Token
+
+**Historia de Usuario:** Como Bank_Client, quiero confirmar operaciones de alto riesgo (transferencias) con un código de un solo uso enviado a mi celular, para que nadie más pueda ejecutar transacciones en mi nombre aunque acceda a mi sesión de WhatsApp. Como platform engineer, quiero que esta autorización no bloquee Lambdas mientras espera al usuario.
+
+#### Criterios de Aceptación
+
+1. WHEN el state machine `TransferBrebStateMachine` entra al estado `GenerateOTP`, THE Step Functions SHALL invocar el OTP_Service con `arn:aws:states:::lambda:invoke.waitForTaskToken` pasando `$$.Task.Token` en el payload
+2. THE OTP_Service SHALL generar un código numérico de 6 dígitos y persistir en `OTP_Store` el registro `{pk: phoneNumber, code, taskToken, executionArn, attempts: 0, transferContext, ttl: now+300s}`
+3. THE OTP_Service SHALL enviar el código al número telefónico registrado via AWS Pinpoint (canal SMS) con un mensaje que identifique la operación (monto y cuenta destino enmascarada) y retornará inmediatamente; el state machine queda PAUSADO esperando el callback
+4. WHEN el Bank_Client responde con el código OTP en WhatsApp, THE Message_Processor SHALL leer `OTP_Store` por `phoneNumber`, comparar el código, verificar TTL y `attempts < 3`
+5. IF el código es válido, THEN THE Message_Processor SHALL invocar `sfnClient.sendTaskSuccess({taskToken, output: {valid: true}})` y eliminar el registro de `OTP_Store`
+6. IF el código es incorrecto y `attempts < 3`, THEN THE Message_Processor SHALL incrementar `attempts` en DynamoDB, enviar mensaje de reintento al cliente via Twilio, y NO invocar `sendTaskSuccess`/`sendTaskFailure` (el workflow sigue esperando)
+7. IF `attempts >= 3`, THEN THE Message_Processor SHALL invocar `sfnClient.sendTaskFailure({taskToken, error: "OTPBlockedError"})` para que el state machine transicione al estado `NotifyOTPBlocked`
+8. IF el `HeartbeatSeconds` (300s) se cumple sin callback, THEN Step Functions SHALL emitir el error `States.Timeout` automáticamente y transicionar a `NotifyOTPExpired` sin requerir intervención manual
+9. THE OTP_Service SHALL registrar en CloudWatch Logs cada evento (generación, intento exitoso, intento fallido, expiración) incluyendo `correlationId` y `executionArn` del state machine
+
+### Requisito 17: Notificaciones Asíncronas Event-Driven
+
+**Historia de Usuario:** Como Bank_Client, quiero recibir confirmaciones de operaciones por correo electrónico (y opcionalmente SMS), para tener un registro formal fuera del chat de WhatsApp. Como platform engineer, quiero que estos envíos NUNCA bloqueen el flujo transaccional principal.
+
+#### Criterios de Aceptación
+
+1. THE system SHALL exponer dos colas SQS dedicadas: `email-notification-queue` y `sms-notification-queue`, cada una con DLQ asociado (`email-dlq`, `sms-dlq`), `maxReceiveCount: 3`, `visibilityTimeout: 60s`, `messageRetentionPeriod: 4 días`, encryption SSE-SQS
+2. WHEN el state machine `TransferBrebStateMachine` ejecuta el estado `PublishNotifications`, THE Step Functions SHALL publicar en paralelo a `email-notification-queue` (evento `transfer_confirmation` con receipt completo) y a `sms-notification-queue` (evento con monto y destino enmascarado) usando el integration directo `arn:aws:states:::sqs:sendMessage`
+3. WHEN el `statement-generator` Lambda termina la generación del PDF, THE Lambda SHALL publicar evento `statement_delivery` a `email-notification-queue` con `{s3Bucket, s3Key, fileName, clientEmail}` y retornar inmediatamente sin esperar respuesta del envío de email
+4. THE Email_Service Lambda SHALL configurarse con SQS Event Source Mapping sobre `email-notification-queue` con `batchSize: 10`, `maxBatchingWindow: 5s`, `reportBatchItemFailures: true`, de modo que mensajes que fallen sean reintentados individualmente sin bloquear el batch completo
+5. THE Email_Service SHALL usar Amazon SES como servicio de envío, con dominio remitente verificado y template HTML con identidad BTG Pactual
+6. IF un mensaje de SQS falla en `maxReceiveCount` intentos, THEN SQS SHALL moverlo automáticamente al DLQ correspondiente; THE system SHALL emitir alarma CloudWatch cuando `ApproximateNumberOfMessagesVisible` en cualquier DLQ supere 0
+7. THE Email_Service SHALL enmascarar datos sensibles en el cuerpo del email (números de cuenta: solo últimos 4 dígitos) siguiendo la misma política de data masking que aplica en los logs
+8. IF el envío de email o SMS falla, THEN bajo NINGUNA circunstancia el fallo SHALL propagarse al flujo principal de WhatsApp; el Bank_Client ya recibió la confirmación por el chat
+
+### Requisito 18: Orquestación de Transacciones Distribuidas con Step Functions
+
+**Historia de Usuario:** Como solution architect, quiero que las transacciones distribuidas con callbacks asíncronos (transferencia BRE-B con OTP) se modelen como state machines explícitas, para que el flujo sea auditable, observable, y maneje nativamente errores y timeouts sin código custom.
+
+#### Criterios de Aceptación
+
+1. THE system SHALL implementar `TransferBrebStateMachine` como AWS Step Functions Standard Workflow (no Express) — Standard soporta `waitForTaskToken` con timeouts largos y retiene historial de ejecución 90 días
+2. THE state machine SHALL definirse declarativamente en Amazon States Language (ASL) versionado en el repositorio (no construido programáticamente en runtime)
+3. THE state machine SHALL tener Retry policies configuradas en cada estado Task con `BackoffRate: 2.0`, `IntervalSeconds: 2`, `MaxAttempts: 2` para errores transitorios (`Lambda.ServiceException`, `Lambda.AWSLambdaException`, `Lambda.SdkClientException`)
+4. THE state machine SHALL tener Catch handlers para errores de dominio (`InsufficientFundsError`, `InvalidDestinationError`, `OTPBlockedError`, `States.Timeout`) que transicionan a estados de notificación específicos
+5. WHEN una ejecución del state machine completa exitosamente, THE system SHALL retener el historial de ejecución en CloudWatch Logs por 90 días con todos los estados visitados, inputs y outputs (con campos sensibles enmascarados)
+6. THE system SHALL emitir alarma CloudWatch cuando la métrica `ExecutionsFailed` del state machine supere 5 en una ventana de 5 minutos
+7. THE Strands_Agent SHALL invocar el state machine via `StartExecution` con un `name` único por ejecución (usando `correlationId`) para garantizar idempotencia
+8. THE state machine SHALL recibir `executionArn` propagado en logs estructurados para trazabilidad cross-component
 
 ---
 
@@ -247,7 +326,7 @@ Esta sección documenta el camino claro desde MVP Lite hacia producción.
 
 **Trigger:** Cuando se reemplace el Mock_Core con el API real del core bancario de BTG Pactual.
 
-**Path:** Agregar VPC con subnets privadas, VPC Endpoints para servicios AWS, conectividad privada al core bancario. Reemplazar datos mock con llamadas reales.
+**Path:** La VPC IA-Builder (10.0.0.0/16, us-east-1) ya existe en la cuenta sandbox con subnets privadas listas (10.0.11.0/24 y 10.0.12.0/24). El path requiere: agregar NAT Gateway (o VPC Endpoints para DynamoDB, S3, Bedrock, Transcribe) para dar salida a internet a las subnets privadas, adjuntar las Lambdas a esas subnets, agregar security groups de aplicación, y establecer conectividad privada al core bancario. Reemplazar datos mock con llamadas reales.
 
 ### EXT-2: Autenticación con Proveedor de Identidad Real
 

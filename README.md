@@ -1,221 +1,153 @@
 # BTG ConnectAI MVP Lite
 
-Asistente bancario conversacional por WhatsApp para BTG Pactual Colombia, impulsado por Amazon Bedrock Agent con Claude Haiku 3.5.
+Asistente bancario conversacional por WhatsApp para BTG Pactual Colombia. El cliente habla en lenguaje natural — texto o nota de voz — y el asistente entiende y ejecuta operaciones bancarias sin menús ni opciones numeradas.
 
-A diferencia de un chatbot tradicional basado en menús, BTG ConnectAI utiliza inteligencia artificial conversacional que entiende lenguaje natural (texto y notas de voz) para ejecutar servicios bancarios en español colombiano.
+## ¿Qué puede hacer el asistente?
 
-## Características
+- **Consultar saldos** — "¿Cuánto tengo en mi cuenta?" o "Muéstrame mis fondos"
+- **Transferir dinero** — "Quiero transferir 500 mil a la cuenta 1009876544" (con autorización OTP vía SMS)
+- **Generar extractos** — "Necesito mi extracto de noviembre" (llega como PDF adjunto en WhatsApp y por email)
+- **Entender notas de voz** — El cliente puede hablar en lugar de escribir; el sistema transcribe automáticamente
 
-- **Entrada multimodal** — Texto y notas de voz (audio OGG/Opus transcrito automáticamente)
-- **IA conversacional** — El usuario solicita servicios en lenguaje natural, sin menús
-- **Flujo de consentimiento** — Términos y condiciones obligatorios antes de usar el servicio
-- **Autenticación vía enlace web** — Login mediante enlace en WhatsApp con sesión temporal (30 min)
-- **Servicios bancarios:**
-  - 💰 Consulta de saldos (Fondos de Inversión y Cuenta Corriente)
-  - 💸 Transferencias BRE-B entre cuentas
-  - 📄 Generación de extractos bancarios (PDF adjunto en WhatsApp)
-- **Guardrails de IA** — Respuestas restringidas al dominio bancario con Bedrock Guardrails
+El asistente responde siempre en español colombiano natural, formatea montos en COP y declina cualquier consulta fuera del dominio bancario.
 
-## Arquitectura
+## Flujo de uso
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Canal WhatsApp                               │
-│  Bank_Client ↔ WhatsApp ↔ AWS End User Messaging Social            │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ SNS
-┌──────────────────────────────▼──────────────────────────────────────┐
-│                      WhatsApp_Gateway Lambda                         │
-│  Dedup → Consent → Audio Transcription → Auth Check → Agent Call    │
-└───┬──────────┬──────────┬──────────────────────────────┬────────────┘
-    │          │          │                              │
-    ▼          ▼          ▼                              ▼
-┌────────┐ ┌────────┐ ┌──────────┐          ┌─────────────────────┐
-│DynamoDB│ │DynamoDB│ │ Amazon   │          │  Amazon Bedrock     │
-│ Dedup  │ │Consent │ │Transcribe│          │  Agent + Guardrails │
-│  Auth  │ │ Store  │ │ (es-CO)  │          │  (Claude Haiku 3.5) │
-└────────┘ └────────┘ └──────────┘          └──────────┬──────────┘
-                                                       │
-                                    ┌──────────────────┼──────────────┐
-                                    ▼                  ▼              ▼
-                             ┌────────────┐  ┌──────────────┐  ┌───────────┐
-                             │balance-query│  │transfer-breb │  │statement- │
-                             │   Lambda   │  │   Lambda     │  │generator  │
-                             └────────────┘  └──────────────┘  └─────┬─────┘
-                                                                     │
-                                                                     ▼
-                                                              ┌─────────────┐
-                                                              │ S3 (PDFs)   │
-                                                              └─────────────┘
+1. El cliente envía su primer mensaje → recibe los Términos y Condiciones con botón de aceptar
+2. Acepta → recibe mensaje de bienvenida con los servicios disponibles
+3. Solicita un servicio → el sistema pide autenticación vía enlace en WhatsApp
+4. Se autentica en la página de login → sesión activa por 30 minutos
+5. Solicita una transferencia → recibe un OTP por SMS para autorizar la operación
+6. Ingresa el OTP → la transferencia se ejecuta y recibe confirmación por WhatsApp y email
+
+## Ambiente de despliegue
+
+El proyecto se despliega en la cuenta AWS sandbox en la región **us-east-1**, dentro de la VPC `IA-Builder-sandbox-networking` (CIDR 10.0.0.0/16). Todas las funciones Lambda corren en las **subnets privadas** (10.0.11.0/24 · us-east-1a y 10.0.12.0/24 · us-east-1b), sin exposición directa a internet. El tráfico saliente hacia servicios externos (Twilio, Bedrock, Transcribe) pasa por un **NAT Gateway** ubicado en la subnet pública. El único punto de entrada público es el **API Gateway** que recibe los webhooks de Twilio.
+
+## Patrón async — cómo escala el sistema
+
+El flujo de mensajes está diseñado para que **Twilio nunca espere** al backend más de un segundo:
+
+```text
+Twilio → API Gateway → Webhook_Receiver (responde 200 OK en <1s)
+                            ↓
+                       SQS FIFO inbound-messages-queue
+                       MessageGroupId = phoneNumber  (orden por cliente)
+                       MessageDeduplicationId = MessageSid  (dedup gratis)
+                            ↓
+                       Message_Processor (sin presión de tiempo)
+                            ├─ Transcribe audio si aplica
+                            ├─ Strands Agent (Bedrock)
+                            └─ Twilio REST API (respuesta al cliente)
 ```
 
-### Stack Tecnológico
+Beneficios reales: spikes de tráfico se absorben en la cola, los retries de Twilio se descartan automáticamente, audio que tarda 15s en transcribir no rompe nada, y mañana podemos agregar consumidores (analytics, auditoría) sin tocar el Receiver.
 
-| Componente | Tecnología |
-|-----------|-----------|
-| Runtime | TypeScript (Node.js 20.x) |
-| IaC | AWS CDK (TypeScript) |
-| AI Engine | Amazon Bedrock Agent + Claude Haiku 3.5 |
-| Canal WhatsApp | AWS End User Messaging Social |
-| Audio | Amazon Transcribe (español colombiano) |
-| Base de datos | DynamoDB (PAY_PER_REQUEST) |
-| Almacenamiento | S3 (extractos PDF, audio temporal) |
-| Observabilidad | Lambda Powertools + CloudWatch |
-| Seguridad | IAM roles + AWS managed keys |
+## Tecnología
 
-### Principios Arquitectónicos
+| Capa | Servicio |
+| ---- | ------- |
+| Canal de mensajería | Twilio (WhatsApp Sandbox) |
+| Punto de entrada | Amazon API Gateway (HTTP API público, expuesto a Twilio) |
+| Motor de IA | Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) |
+| Orquestación de transacciones | AWS Step Functions (transferencias BRE-B con OTP) |
+| Bus de eventos asíncronos | Amazon SQS (notificaciones de email y SMS con DLQ) |
+| Transcripción de voz | Amazon Transcribe (español colombiano) |
+| OTP transaccional | AWS Pinpoint (SMS) |
+| Notificaciones email | Amazon SES |
+| Funciones serverless | AWS Lambda — Node.js 24.x (negocio) · Python 3.12 (IA) |
+| Base de datos | DynamoDB (sesiones, consentimiento, deduplicación, OTP) |
+| Documentos PDF | S3 (generación y entrega de extractos) |
+| Observabilidad | CloudWatch + Lambda Powertools |
+| Infraestructura como código | AWS CDK (TypeScript) |
 
-- **Zero VPC** — Lambdas sin VPC, acceso directo a servicios AWS vía endpoints públicos
-- **Stateless Lambdas** — Estado conversacional en Bedrock Agent, auth/consent en DynamoDB
-- **Serverless completo** — Lambda, DynamoDB, S3, SNS — sin servidores que administrar
-- **Cifrado por defecto** — AWS managed keys en reposo, TLS 1.2+ en tránsito
-- **Mínimo privilegio** — IAM roles con permisos específicos por Lambda
+## Estructura del proyecto
 
-## Estructura del Proyecto
-
-```
-├── infra/                          # AWS CDK Infrastructure
-│   ├── bin/app.ts                  # CDK App entry point
-│   ├── lib/
-│   │   ├── stacks/                 # CDK Stacks
-│   │   ├── constructs/             # CDK Constructs (por componente)
-│   │   └── config/                 # Configuración de entorno
-│   └── cdk.json
+```text
+├── infra/                          # Infraestructura CDK
+│   ├── bin/app.ts
+│   └── lib/
+│       ├── stacks/
+│       ├── constructs/
+│       └── config/
 ├── src/
 │   ├── lambdas/
-│   │   ├── whatsapp-gateway/       # Punto de entrada del sistema
-│   │   ├── auth-service/           # Autenticación mock
-│   │   ├── balance-query/          # Action Group: consulta de saldos
-│   │   ├── transfer-breb/          # Action Group: transferencias
-│   │   └── statement-generator/    # Action Group: extractos PDF
-│   ├── shared/                     # Utilidades compartidas
-│   │   ├── logger.ts
-│   │   ├── masking.ts
-│   │   ├── formatting.ts
-│   │   ├── constants.ts
-│   │   └── types.ts
-│   ├── login-page/                 # Página de login (S3 static)
-│   └── tests/
-│       ├── unit/
-│       └── property/               # Property-based tests (fast-check)
-├── .kiro/specs/                    # Spec documents
-└── README.md
+│   │   ├── webhook-receiver/       # Sync, detrás de API Gateway — responde 200 a Twilio
+│   │   ├── message-processor/      # Async, SQS-triggered — hace el trabajo pesado
+│   │   ├── ai-agent/               # Strands Agent (Python 3.12) — motor conversacional
+│   │   ├── auth-service/           # Autenticación vía enlace web (mock para el demo)
+│   │   ├── otp-service/            # Generación de OTP (Pinpoint SMS) con task token
+│   │   ├── email-service/          # SQS-triggered — envío vía SES
+│   │   ├── sms-service/            # SQS-triggered — SMS de confirmación vía Pinpoint
+│   │   ├── balance-query/          # Tool: consulta de saldos
+│   │   ├── transfer-breb-initiator/   # Tool: dispara TransferBrebStateMachine
+│   │   ├── transfer-breb-validate/    # Task de Step Functions
+│   │   ├── transfer-breb-execute/     # Task de Step Functions
+│   │   ├── statement-generator/    # Tool: extracto PDF, publica a SQS email
+│   │   └── message-handler-notify/ # Lambda llamada por Step Functions para responder al cliente
+│   ├── shared/                     # Utilidades compartidas (Node.js)
+│   └── login-page/                 # Página de login (sitio estático en S3)
+└── .kiro/specs/                    # Documentos de especificación
 ```
 
-## Requisitos Previos
-
-- Node.js 20.x
-- AWS CLI configurado con credenciales
-- AWS CDK CLI (`npm install -g aws-cdk`)
-- Cuenta AWS con acceso a Amazon Bedrock (Claude Haiku 3.5)
-- WhatsApp Business Account configurado con AWS End User Messaging Social
-
-## Instalación
+## Instalación y despliegue
 
 ```bash
-# Clonar el repositorio
-git clone <repo-url>
-cd BTG-ConnectAI
-
 # Instalar dependencias
 npm install
 
-# Compilar TypeScript
+# Compilar
 npm run build
+
+# Desplegar (primera vez: npx cdk bootstrap primero)
+cd infra && npx cdk deploy
 ```
 
-## Despliegue
+Después del despliegue, configurar la URL del API Gateway (`POST /webhook/twilio`) como webhook en la consola de Twilio Sandbox.
+
+## Pruebas
 
 ```bash
-# Bootstrap CDK (primera vez)
-cd infra
-npx cdk bootstrap
-
-# Sintetizar template CloudFormation
-npx cdk synth
-
-# Desplegar
-npx cdk deploy
-```
-
-## Testing
-
-```bash
-# Unit tests + Property-based tests
+# Tests unitarios y de propiedades
 npx vitest --run
 
-# CDK snapshot tests
+# Tests de snapshot CDK
 cd infra && npx jest --run
 ```
 
-## Usuarios de Prueba
+## Usuarios de prueba
 
 | Usuario | Contraseña | Teléfono |
-|---------|-----------|----------|
+| ------- | ---------- | -------- |
 | carlos.rodriguez | Btg2024*Test | +573001234567 |
 | maria.lopez | Btg2024*Demo | +573009876543 |
 | juan.garcia | Btg2024*Hack | +573005551234 |
 
-## Flujo de Uso
+## Seguridad y privacidad
 
-1. **Primer mensaje** → El sistema envía Términos y Condiciones (botones aceptar/rechazar)
-2. **Acepta T&C** → Mensaje de bienvenida con servicios disponibles
-3. **Solicita servicio** → El sistema pide autenticación vía enlace web
-4. **Se autentica** → Sesión activa por 30 minutos
-5. **Usa servicios** → Consulta saldos, transfiere, genera extractos en lenguaje natural
+- Cifrado en reposo y en tránsito en todos los servicios
+- Datos sensibles enmascarados en logs (solo últimos 4 dígitos de cuentas y teléfonos)
+- Credenciales de Twilio y API keys en AWS Secrets Manager
+- Guardrails de IA que evitan respuestas fuera del dominio bancario
+- OTP con TTL de 5 minutos y bloqueo tras 3 intentos fallidos
+- Control de acceso de mínimo privilegio por componente (IAM)
 
-## Servicios Disponibles
+## Alcance del MVP
 
-### Consulta de Saldos
-> "¿Cuánto tengo en mi cuenta?" / "Muéstrame mis saldos" / "Cuánta plata tengo"
+Este es un demo para hackathon: los datos bancarios son simulados y la autenticación usa usuarios de prueba. No hay integración con el core bancario real.
 
-Retorna saldos de Fondos de Inversión y Cuenta Corriente en COP.
+### Camino a producción
 
-### Transferencias BRE-B
-> "Quiero transferir 500 mil a la cuenta 1009876544" / "Pásame plata a otra cuenta"
+| Extensión | Qué implica |
+| --------- | ----------- |
+| Core bancario real | Lambdas ya en subnets privadas + NAT Gateway ya desplegado. Agregar conectividad privada al core bancario (PrivateLink o VPN) |
+| Canal WhatsApp productivo | Migrar de Twilio Sandbox a número de WhatsApp Business aprobado (Twilio o AWS EUMS) |
+| Autenticación real | Integración con el proveedor de identidad corporativo (OAuth2/OIDC) |
+| Servicios adicionales | Pagos, apertura de productos, consulta de TRM |
+| Auditoría regulatoria | Pipeline de retención 7 años (Kinesis → S3) |
+| Cifrado gestionado | Llaves propias (CMK) con rotación anual |
+| Observabilidad avanzada | Trazabilidad distribuida con X-Ray |
 
-Solicita confirmación explícita antes de ejecutar. Genera comprobante.
+---
 
-### Extractos Bancarios
-> "Necesito mi extracto de noviembre" / "Genera mi estado de cuenta"
-
-Genera PDF y lo envía como documento adjunto directamente en WhatsApp.
-
-## Observabilidad
-
-- **Logs estructurados** — JSON via Lambda Powertools con correlation_id
-- **CloudWatch Dashboard** — Invocaciones, errores, latencia p50/p90 por Lambda
-- **Alarmas** — Error rate > 10% en ventana de 5 minutos → notificación SNS
-- **Retención** — 7 días en CloudWatch Logs
-
-## Seguridad
-
-- Cifrado en reposo con AWS managed keys (DynamoDB, S3)
-- Cifrado en tránsito con TLS 1.2+
-- IAM roles con mínimo privilegio por Lambda
-- Data sensible enmascarada en logs (últimos 4 dígitos)
-- Secretos en AWS Secrets Manager
-- Bedrock Guardrails para control de contenido
-
-## Enfoque MVP
-
-Este es un MVP para demo de hackathon:
-- Datos bancarios mock (hardcodeados en las Lambdas)
-- Autenticación mock con 3 usuarios de prueba
-- Sin integración con core bancario real
-- Sin VPC (acceso directo a servicios AWS)
-
-### Path a Producción
-
-| Extensión | Descripción |
-|-----------|-------------|
-| Core bancario real | VPC + conectividad privada al core |
-| Autenticación real | OAuth2/OIDC con proveedor de identidad corporativo |
-| Servicios adicionales | Pagos, apertura de productos, TRM |
-| Auditoría | Kinesis Firehose → S3 (retención 7 años) |
-| KMS custom | CMK con rotación anual |
-| Observabilidad avanzada | X-Ray tracing, métricas custom |
-
-## Licencia
-
-Proyecto interno BTG Pactual Colombia — Hackathon 2024.
+Proyecto interno BTG Pactual Colombia — Hackathon 2026.

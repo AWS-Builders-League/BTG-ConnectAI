@@ -7,81 +7,97 @@ BTG ConnectAI MVP Lite es un asistente bancario conversacional serverless que co
 ### Decisiones Arquitectónicas Clave
 
 | Decisión | Elección | Razón |
-|----------|----------|-------|
-| Runtime | TypeScript (Node.js 20.x) | Tipado fuerte, cold start rápido, Powertools nativo |
-| IaC | AWS CDK (TypeScript) | Mismo lenguaje que Lambdas, L2 constructs |
-| AI Engine | Amazon Bedrock Agent + Claude Haiku 3.5 | Managed agent con memoria de sesión nativa, bajo costo |
-| WhatsApp | AWS End User Messaging Social | Servicio managed, integración nativa con SNS, mensajes interactivos |
-| Audio | Amazon Transcribe | Soporte nativo OGG/Opus, español colombiano |
-| Deduplicación | DynamoDB conditional writes + TTL | Serverless, free tier, sin estado externo |
+| -------- | -------- | ----- |
+| Runtime (negocio) | TypeScript (Node.js 24.x) | Tipado fuerte, cold start rápido, Powertools nativo |
+| Runtime (IA) | Python 3.12 | Strands Agent SDK disponible y maduro en Python |
+| IaC | AWS CDK (TypeScript) | Mismo lenguaje que Lambdas de negocio, L2 constructs |
+| AI Engine | Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) | Framework open-source AWS sobre Bedrock; control de orquestación, herramientas y memoria de sesión |
+| Canal WhatsApp | Twilio (WhatsApp Sandbox) | Onboarding rápido sin aprobación Meta, webhooks REST simples |
+| Entrada HTTP | Amazon API Gateway (HTTP API) | Endpoint público expuesto a Twilio; bajo costo, sin servidor |
+| Patrón Webhook | Async via SQS FIFO (Webhook_Receiver → queue → Message_Processor) | Receiver responde 200 a Twilio en <1s independientemente del trabajo real; elimina timeouts y retries de Twilio; absorbe spikes; escalabilidad independiente |
+| Audio | Amazon Transcribe | Soporte nativo OGG/Opus, español colombiano (es-CO); sin presión de tiempo gracias al async |
+| Deduplicación | SQS FIFO `MessageDeduplicationId = MessageSid` | Dedup nativa en ventana de 5 min sin código custom; elimina la tabla Dedup |
+| Orden de mensajes | SQS FIFO `MessageGroupId = phoneNumber` | Garantiza que mensajes del mismo cliente se procesen en orden, sin afectar concurrencia entre clientes distintos |
 | Autenticación | Lambda + DynamoDB (mock vía enlace web) | Simula flujo real con mínima infraestructura |
-| Extractos | S3 + envío como documento adjunto WhatsApp | Entrega directa al Bank_Client vía EUMS |
+| OTP Transaccional | AWS Pinpoint (SMS) | Segundo factor para autorizar transferencias; canal SMS independiente de WhatsApp |
+| Email | Amazon SES | Notificaciones formales post-operación; non-blocking respecto al flujo de WhatsApp |
+| Extractos | S3 + envío como documento adjunto Twilio | Entrega directa al Bank_Client vía Twilio Media |
 | Observabilidad | Lambda Powertools + CloudWatch | Structured logging JSON, métricas nativas |
-| Seguridad | IAM roles + AWS managed keys | Zero cost, sufficient para MVP |
+| Seguridad | IAM roles + AWS managed keys + Secrets Manager | Zero cost, credenciales Twilio nunca en código |
 
 ### Flujo de Datos Principal (Happy Path Completo)
 
 ```mermaid
 sequenceDiagram
     participant BC as Bank_Client (WhatsApp)
-    participant EUMS as AWS End User Messaging Social
-    participant SNS as Amazon SNS
-    participant WG as WhatsApp_Gateway Lambda
-    participant DDB_D as DynamoDB (Dedup)
+    participant TW as Twilio
+    participant APIGW as API Gateway
+    participant WHR as Webhook_Receiver Lambda
+    participant SQS as SQS FIFO inbound-queue
+    participant MP as Message_Processor Lambda
     participant DDB_C as DynamoDB (Consent_Store)
     participant DDB_A as DynamoDB (Auth_Session)
     participant TS as Amazon Transcribe
-    participant BA as Bedrock Agent (Claude Haiku 3.5)
+    participant SA as Strands_Agent Lambda
     participant GR as Bedrock Guardrails
+    participant SFN as TransferBrebStateMachine
     participant AG_B as Action_Group: balance-query
-    participant AG_T as Action_Group: transfer-breb
-    participant AG_S as Action_Group: statement-generator
+    participant AG_TS as transfer-breb-initiator
+    participant AG_S as statement-generator
     participant S3 as Statement_Bucket (S3)
 
-    BC->>EUMS: Mensaje WhatsApp (texto o audio)
-    EUMS->>SNS: Notificación incoming message
-    SNS->>WG: Trigger Lambda
-    WG->>DDB_D: ConditionalPut (dedup check)
-    alt Mensaje duplicado
-        WG-->>WG: Descartar (return early)
-    end
-    WG->>DDB_C: GetItem (consent check)
+    BC->>TW: Mensaje WhatsApp (texto o audio)
+    TW->>APIGW: POST /webhook/twilio (form-urlencoded)
+    APIGW->>WHR: Invoke Lambda (sync)
+    WHR->>WHR: Validar X-Twilio-Signature
+    WHR->>SQS: SendMessage (MessageGroupId=phoneNumber,<br/>MessageDeduplicationId=MessageSid)
+    WHR-->>APIGW: 200 OK
+    APIGW-->>TW: 200 OK (latencia total < 1s)
+    Note over SQS: FIFO descarta MessageSids duplicados<br/>en ventana de 5 min
+
+    SQS->>MP: Event Source Mapping (batchSize=1)
+    MP->>DDB_C: GetItem (consent check)
     alt Sin consentimiento
-        WG->>EUMS: Enviar mensaje interactivo T&C (botones)
-        BC->>EUMS: Acepta T&C (button reply)
-        EUMS->>SNS: Button callback
-        SNS->>WG: Trigger Lambda
-        WG->>DDB_C: PutItem (registrar consentimiento)
-        WG->>EUMS: Mensaje de bienvenida + servicios
+        MP->>TW: Enviar mensaje con botones T&C (Twilio REST API)
+        Note over MP,SQS: SQS marca el mensaje como procesado.<br/>Cuando llegue el ButtonPayload, será otro msg en cola
     end
     alt Audio message
-        WG->>TS: StartTranscriptionJob (OGG/Opus)
-        TS-->>WG: Transcripción en texto
+        MP->>TS: StartTranscriptionJob (OGG/Opus desde Twilio Media URL)
+        TS-->>MP: Transcripción en texto
     end
-    WG->>DDB_A: GetItem (auth session check)
+    MP->>DDB_A: GetItem (auth session check)
     alt Sin Auth_Session activa
-        WG->>EUMS: Enviar botón "Iniciar sesión"
-        Note over BC,WG: Bank_Client completa login en Login_Page
-        Note over WG: Auth_Service crea Auth_Session en DDB_A
-        WG->>EUMS: Confirmación de autenticación exitosa
+        MP->>TW: Enviar enlace de login (Twilio REST)
+        Note over BC,MP: Bank_Client completa login en Login_Page (S3)<br/>Auth_Service crea Auth_Session en DDB_A
     end
-    WG->>BA: InvokeAgent (sessionId, inputText)
-    BA->>GR: Evaluar input
-    GR-->>BA: Input aprobado
-    BA->>AG_B: Invoke balance-query (si aplica)
-    BA->>AG_T: Invoke transfer-breb (si aplica)
-    BA->>AG_S: Invoke statement-generator (si aplica)
-    AG_S->>S3: PutObject (PDF)
-    AG_S-->>BA: S3 key del PDF generado
-    BA->>GR: Evaluar output
-    GR-->>BA: Output aprobado
-    BA-->>WG: Respuesta del agente (incluye S3 key del PDF)
-    WG->>S3: GetObject (descargar PDF)
-    S3-->>WG: PDF binary
-    WG->>EUMS: PostWhatsAppMessageMedia (upload PDF)
-    EUMS-->>WG: media_id
-    WG->>EUMS: SendWhatsAppMessage (document message con media_id)
-    EUMS->>BC: Mensaje WhatsApp (documento PDF adjunto)
+    MP->>SA: Invoke (sessionId, inputText, phoneNumber)
+    SA->>GR: Evaluar input
+    GR-->>SA: Input aprobado
+    alt Consulta de saldo
+        SA->>AG_B: Invoke balance-query
+        AG_B-->>SA: Saldos
+    end
+    alt Transferencia BRE-B
+        SA->>AG_TS: Invoke transfer-breb-initiator
+        AG_TS->>SFN: StartExecution (TransferBrebStateMachine)
+        AG_TS-->>SA: {executionArn, status: STARTED} (inmediato)
+        Note over SFN: Workflow async (ver sección Step Functions)<br/>Cuando termina, NotifyUserSuccess envía respuesta via Twilio
+    end
+    alt Generación de extracto
+        SA->>AG_S: Invoke statement-generator
+        AG_S->>S3: PutObject (PDF)
+        AG_S-->>SA: {s3Bucket, s3Key, fileName}
+    end
+    SA->>GR: Evaluar output
+    GR-->>SA: Output aprobado
+    SA-->>MP: Respuesta final (texto + S3 key si hay PDF)
+    alt Respuesta incluye PDF
+        MP->>S3: GetSignedUrl (presigned URL)
+        MP->>TW: Enviar documento adjunto via mediaUrl (Twilio REST)
+    end
+    MP->>TW: Enviar respuesta de texto (Twilio REST API)
+    TW->>BC: Respuesta en WhatsApp
+    MP-->>SQS: Mensaje completado (ACK implícito al retornar sin error)
 ```
 
 ### Flujo de Autenticación (Detalle)
@@ -89,31 +105,44 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant BC as Bank_Client
-    participant WA as WhatsApp
-    participant WG as WhatsApp_Gateway
+    participant TW as Twilio
+    participant APIGW as API Gateway
+    participant WHR as Webhook_Receiver
+    participant SQS as SQS FIFO
+    participant MP as Message_Processor
     participant LP as Login_Page (S3 Static)
     participant AS as Auth_Service Lambda
     participant DDB as DynamoDB (Auth_Session)
 
-    BC->>WA: "Quiero ver mi saldo"
-    WA->>WG: Mensaje entrante
-    WG->>DDB: GetItem(phoneNumber)
-    DDB-->>WG: No Auth_Session found
-    WG->>WA: Mensaje interactivo con botón "Iniciar sesión"
-    WA->>BC: Muestra botón
-    BC->>WA: Click "Iniciar sesión"
-    WA->>BC: Abre URL de Login_Page
-    BC->>LP: GET /login?phone=+57300XXXX&callback_token=xyz
-    LP-->>BC: Formulario HTML (usuario + contraseña)
+    BC->>TW: "Quiero ver mi saldo"
+    TW->>APIGW: POST /webhook/twilio
+    APIGW->>WHR: Invoke (sync)
+    WHR->>SQS: SendMessage
+    WHR-->>APIGW: 200 OK (<1s)
+    SQS->>MP: Trigger async
+    MP->>DDB: GetItem(phoneNumber)
+    DDB-->>MP: No Auth_Session found
+    MP->>TW: Enviar enlace de login (Twilio REST API)
+    TW->>BC: Mensaje con enlace
+
+    BC->>LP: GET /login?phone=+57300XXXX&token=xyz
+    LP-->>BC: Formulario HTML
     BC->>LP: POST /login (credentials)
-    LP->>AS: POST /authenticate (credentials + phone + token)
-    AS->>AS: Validar credenciales vs hardcoded users
+    LP->>AS: POST /authenticate
     AS->>DDB: PutItem(Auth_Session, TTL=30min)
-    AS-->>LP: 200 OK (redirect)
+    AS-->>LP: 200 OK
     LP-->>BC: "Autenticación exitosa, vuelve a WhatsApp"
-    Note over AS,WG: Auth_Service notifica a Gateway (o Gateway polling)
-    WG->>WA: "✅ Autenticación exitosa. Procesando tu solicitud..."
-    WG->>WG: Procesar solicitud original (consulta de saldo)
+
+    Note over BC,MP: El cliente vuelve a WhatsApp y reenvía su solicitud
+    BC->>TW: "Quiero ver mi saldo" (segundo intento)
+    TW->>APIGW: POST /webhook/twilio
+    APIGW->>WHR: Invoke
+    WHR->>SQS: SendMessage
+    WHR-->>APIGW: 200 OK
+    SQS->>MP: Trigger
+    MP->>DDB: GetItem(phoneNumber)
+    DDB-->>MP: Auth_Session activa
+    MP->>MP: Procesar solicitud (consulta de saldo)
 ```
 
 ## Architecture
@@ -123,20 +152,24 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Canal WhatsApp"
-        WA[WhatsApp Business Platform]
-        EUMS[AWS End User Messaging Social]
+        WA[WhatsApp - Cliente]
+        TWILIO[Twilio WhatsApp Sandbox]
     end
 
-    subgraph "Ingestion Layer"
-        SNS_IN[SNS Topic - Incoming Messages]
-        WG[WhatsApp_Gateway Lambda]
-        DDB_DEDUP[DynamoDB - Dedup Table]
+    subgraph "Sync Ingestion - latencia < 1s"
+        APIGW[API Gateway - POST /webhook/twilio]
+        WHR[Webhook_Receiver Lambda - Node.js 24]
+        SQS_IN[SQS FIFO - inbound-messages-queue<br/>MessageGroupId=phoneNumber<br/>MessageDeduplicationId=MessageSid]
+    end
+
+    subgraph "Async Processing - sin presión de tiempo"
+        MP[Message_Processor Lambda - Node.js 24]
         DDB_CONSENT[DynamoDB - Consent_Store]
     end
 
     subgraph "Authentication Layer"
         LP[Login_Page - S3 Static Site]
-        AS[Auth_Service Lambda]
+        AS[Auth_Service Lambda - Node.js 24]
         DDB_AUTH[DynamoDB - Auth_Session]
     end
 
@@ -145,15 +178,35 @@ graph TB
     end
 
     subgraph "AI Layer"
-        BA[Amazon Bedrock Agent]
-        FM[Claude Haiku 3.5 Foundation Model]
+        SA[Strands_Agent Lambda - Python 3.12]
+        FM[Bedrock Agent Core - Claude Haiku 3.5]
         GR[Bedrock Guardrails]
     end
 
-    subgraph "Action Groups"
-        AG_BAL[balance-query Lambda]
-        AG_TRF[transfer-breb Lambda]
-        AG_STM[statement-generator Lambda]
+    subgraph "Action Groups - Tools del Strands Agent"
+        AG_BAL[balance-query Lambda - Node.js 24]
+        AG_STM[statement-generator Lambda - Node.js 24]
+        AG_TRF_START[transfer-breb-initiator Lambda]
+    end
+
+    subgraph "Transfer Orchestration - AWS Step Functions"
+        SFN[TransferBrebStateMachine]
+        SFN_VAL[ValidateTransfer Lambda]
+        SFN_EXEC[ExecuteTransfer Lambda]
+    end
+
+    subgraph "OTP Service"
+        OTP[OTP_Service Lambda - Node.js 24]
+        PINPOINT[AWS Pinpoint - SMS]
+        DDB_OTP[DynamoDB - OTP Store + TaskToken]
+    end
+
+    subgraph "Async Notifications - Event-Driven"
+        SQS_EMAIL[SQS - email-notification-queue]
+        SQS_SMS[SQS - sms-notification-queue]
+        EMAIL[Email_Service Lambda - SQS triggered]
+        SMS_SVC[SMS_Service Lambda - SQS triggered]
+        SES[Amazon SES]
     end
 
     subgraph "Storage"
@@ -169,176 +222,249 @@ graph TB
     end
 
     subgraph "Security"
-        SM[Secrets Manager]
+        SM[Secrets Manager - Twilio creds]
         IAM[IAM Roles & Policies]
     end
 
-    WA <--> EUMS
-    EUMS --> SNS_IN
-    SNS_IN --> WG
-    WG --> DDB_DEDUP
-    WG --> DDB_CONSENT
-    WG --> DDB_AUTH
-    WG --> TRANSCRIBE
-    WG --> BA
-    WG --> EUMS
+    WA <--> TWILIO
+    TWILIO --> APIGW
+    APIGW --> WHR
+    WHR -->|SendMessage| SQS_IN
+    WHR -.->|200 OK <1s| APIGW
+    SQS_IN -->|Event Source Mapping<br/>batchSize=1| MP
+    MP --> DDB_CONSENT
+    MP --> DDB_AUTH
+    MP --> TRANSCRIBE
+    MP --> SA
+    MP --> TWILIO
+    MP -.->|SendTaskSuccess con OTP| SFN
     LP --> AS
     AS --> DDB_AUTH
-    BA --> FM
-    BA --> GR
-    BA --> AG_BAL
-    BA --> AG_TRF
-    BA --> AG_STM
+    SA --> FM
+    SA --> GR
+    SA --> AG_BAL
+    SA --> AG_STM
+    SA --> AG_TRF_START
+    AG_TRF_START -->|StartExecution| SFN
+    SFN --> SFN_VAL
+    SFN --> OTP
+    SFN --> SFN_EXEC
+    SFN -->|publish event| SQS_EMAIL
+    SFN -->|publish event| SQS_SMS
+    SFN -->|notifica al cliente| MP
     AG_BAL --> MOCK
-    AG_TRF --> MOCK
+    SFN_VAL --> MOCK
+    SFN_EXEC --> MOCK
     AG_STM --> MOCK
     AG_STM --> S3_STM
-    WG --> CW_LOGS
+    AG_STM -->|publish event| SQS_EMAIL
+    OTP --> PINPOINT
+    OTP --> DDB_OTP
+    SQS_EMAIL -->|trigger batch| EMAIL
+    SQS_SMS -->|trigger batch| SMS_SVC
+    EMAIL --> SES
+    EMAIL --> S3_STM
+    SMS_SVC --> PINPOINT
+    WHR --> CW_LOGS
+    MP --> CW_LOGS
+    SA --> CW_LOGS
     AG_BAL --> CW_LOGS
-    AG_TRF --> CW_LOGS
+    AG_TRF_START --> CW_LOGS
     AG_STM --> CW_LOGS
     AS --> CW_LOGS
+    OTP --> CW_LOGS
+    EMAIL --> CW_LOGS
+    SMS_SVC --> CW_LOGS
+    SFN --> CW_LOGS
+    SFN_VAL --> CW_LOGS
+    SFN_EXEC --> CW_LOGS
     CW_LOGS --> CW_DASH
     CW_ALARM --> SNS_ALARM
-    WG -.-> SM
+    WHR -.-> SM
+    MP -.-> SM
     AS -.-> SM
 ```
 
 ### Principios Arquitectónicos
 
-1. **Zero VPC**: Todas las Lambdas acceden a servicios AWS vía endpoints públicos. Elimina costos de VPC Endpoints y reduce cold start.
-2. **Stateless Lambdas**: Estado conversacional en Bedrock Agent (memoria nativa). Auth_Session y Consent en DynamoDB con TTL.
-3. **Three Action Groups**: `balance-query`, `transfer-breb`, `statement-generator` — cada uno con responsabilidad única.
-4. **Mock Data Inline**: Datos bancarios sintéticos hardcodeados en las Lambdas de Action Groups.
-5. **Multimodal Input**: Audio transcrito a texto antes de llegar al Bedrock Agent — pipeline transparente.
-6. **Consent-First**: Ningún servicio se ejecuta sin consentimiento previo registrado.
-7. **Auth-Before-Action**: Operaciones bancarias requieren Auth_Session activa (TTL 30min).
-8. **Encryption at Rest by Default**: AWS managed keys — zero cost, zero management.
+1. **VPC-first security**: Todas las Lambdas adjuntadas a las subnets privadas (10.0.11.0/24, 10.0.12.0/24) de la VPC `IA-Builder-sandbox-networking`. Ningún componente de cómputo expuesto directamente a internet. Tráfico saliente a través del NAT Gateway en PublicSubnet1.
+2. **Lambda Security Group**: Sin ingress de red (el trigger llega por invocación AWS). Egress TCP 443 a 0.0.0.0/0 únicamente. IDs de VPC y subnets importados del stack `IA-Builder-sandbox-networking` vía `Fn.importValue`.
+3. **Runtime mixto**: Node.js 24.x para Lambdas de negocio (Message_Handler, Action Groups, OTP_Service, Email_Service); Python 3.12 exclusivamente para Strands_Agent (IA).
+4. **Twilio como canal**: Twilio Sandbox recibe y envía mensajes WhatsApp. API Gateway expone el webhook público. Credenciales Twilio en Secrets Manager.
+4a. **Async Webhook Pattern**: Separación estricta `Webhook_Receiver` (sync, latencia <1s, solo valida firma y encola) + `Message_Processor` (async, SQS-triggered, hace todo el trabajo pesado). Twilio nunca espera transcripción ni invocación de Bedrock; recibe 200 OK inmediato. Spike de tráfico es absorbido por la cola, no por throttling de Lambda.
+4b. **SQS FIFO para mensajes entrantes**: `inbound-messages-queue.fifo` con `MessageGroupId=phoneNumber` (garantiza orden por cliente) y `MessageDeduplicationId=MessageSid` (dedup automática de retries de Twilio en ventana de 5 min — elimina necesidad de tabla Dedup custom). `batchSize=1` porque cada mensaje es una interacción crítica.
+5. **Strands + Bedrock Agent Core**: El Conversational_Agent usa Strands Agent SDK (Python) sobre Bedrock Agent Core (Claude Haiku 3.5). Strands maneja orquestación de herramientas y memoria de sesión.
+6. **Step Functions para transacciones distribuidas**: El flujo de transferencia BRE-B (validar → OTP → esperar callback → ejecutar → notificar) corre como state machine de AWS Step Functions usando el patrón `waitForTaskToken`. Esto resuelve el problema de "esperar input asíncrono del cliente" sin bloquear Lambdas y provee manejo nativo de timeouts, reintentos y compensación.
+7. **Event-Driven Async Notifications**: Email y SMS de confirmación se publican como eventos a SQS (`email-notification-queue`, `sms-notification-queue`). Las Lambdas consumidoras (`Email_Service`, `SMS_Service`) procesan en batch. El flujo principal no espera respuesta del envío — fire-and-forget total. Esto desacopla productores de consumidores y permite reintentos automáticos con DLQ.
+8. **OTP con Task Token**: El OTP_Service no "espera" al usuario. Step Functions pausa la ejecución con `waitForTaskToken`, almacenando el token en DynamoDB junto al OTP. Cuando el cliente responde con el código, el Message_Handler lo valida y llama `SendTaskSuccess`/`SendTaskFailure` para resumir el workflow.
+9. **Consent-First**: Ningún servicio se ejecuta sin consentimiento previo registrado en Consent_Store.
+10. **Auth-Before-Action**: Operaciones bancarias requieren Auth_Session activa (TTL 30min).
+11. **Mock Data Inline**: Datos bancarios sintéticos hardcodeados en las Lambdas de Action Groups para el demo.
+12. **Encryption at Rest by Default**: AWS managed keys en DynamoDB y S3 — zero cost, zero management.
 
 
 ## Components and Interfaces
 
-### 1. WhatsApp_Gateway Lambda
+### 1. Webhook_Receiver Lambda
 
-**Responsabilidad:** Punto de entrada del sistema. Recibe mensajes de WhatsApp (texto, audio, botones interactivos) vía SNS, gestiona flujo de consentimiento, verifica autenticación, ejecuta deduplicación, transcribe audio, invoca al Bedrock Agent, envía respuestas de texto y documentos PDF adjuntos.
+**Responsabilidad:** Punto de entrada SÍNCRONO del sistema. Su única misión es responder a Twilio en menos de un segundo. No hace negocio — valida la firma, parsea el payload y lo encola en SQS FIFO. Toda la lógica pesada se delega al Message_Processor de forma asíncrona.
 
-**Runtime:** Node.js 20.x (TypeScript)  
-**Memory:** 512 MB  
-**Timeout:** 60 seconds  
-**Trigger:** SNS Topic (incoming WhatsApp messages)
+**Runtime:** Node.js 24.x (TypeScript)
+**Memory:** 256 MB
+**Timeout:** 10 seconds (en práctica resuelve en <1s)
+**Trigger:** Amazon API Gateway (HTTP API — POST /webhook/twilio)
+**Provisioned Concurrency:** Recomendado en producción (no requerido para hackathon)
 
-#### Interface de Entrada (SNS Event)
+#### Lógica del Webhook_Receiver
 
 ```typescript
-interface WhatsAppIncomingEvent {
-  Records: Array<{
-    Sns: {
-      Message: string; // JSON string del payload de EUMS
-    };
-  }>;
-}
+import { validateRequest } from "twilio";
 
-interface EUMSIncomingPayload {
-  messageId: string;
-  whatsAppMessageId: string;
-  originationPhoneNumber: string; // E.164
-  destinationPhoneNumber: string; // E.164
-  messageBody: {
-    type: "text" | "audio" | "image" | "video" | "sticker" | "document" | "interactive";
-    text?: { body: string };
-    audio?: {
-      id: string;        // WhatsApp media ID
-      mimeType: string;  // "audio/ogg; codecs=opus"
-    };
-    interactive?: {
-      type: "button_reply" | "list_reply";
-      button_reply?: {
-        id: string;      // Button payload ID
-        title: string;
-      };
-    };
-  };
-  timestamp: string; // ISO 8601
+export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
+  const correlationId = uuidv4();
+  logger.appendKeys({ correlationId });
+
+  // 1. Validar firma X-Twilio-Signature (defensa contra requests no autorizados)
+  const signature = event.headers["x-twilio-signature"];
+  const url = `https://${event.requestContext.domainName}${event.rawPath}`;
+  const params = parseFormUrlencoded(event.body!);
+
+  if (!validateRequest(TWILIO_AUTH_TOKEN, signature!, url, params)) {
+    logger.warn("Invalid Twilio signature, rejecting");
+    return { statusCode: 403, body: "" };
+  }
+
+  // 2. Encolar en SQS FIFO — dedup automática por MessageSid
+  await sqsClient.send(new SendMessageCommand({
+    QueueUrl: INBOUND_MESSAGES_QUEUE_URL,
+    MessageBody: JSON.stringify({ ...params, correlationId, receivedAt: new Date().toISOString() }),
+    MessageGroupId: params.From,                    // Orden por cliente
+    MessageDeduplicationId: params.MessageSid,      // Dedup gratis 5 min
+  }));
+
+  // 3. 200 OK inmediato — Twilio happy
+  return { statusCode: 200, body: "" };
+};
+```
+
+#### IAM Role del Webhook_Receiver
+
+- `sqs:SendMessage` sobre `inbound-messages-queue.fifo`
+- `secretsmanager:GetSecretValue` sobre el secreto con `TWILIO_AUTH_TOKEN` (para validar firma)
+- `logs:*` para CloudWatch Logs
+
+> Notar que el Receiver NO necesita acceso a DynamoDB, Bedrock, Transcribe, S3, ni a Twilio REST API. Es deliberadamente minimalista para minimizar la superficie de ataque y el cold start.
+
+---
+
+### 2. Message_Processor Lambda
+
+**Responsabilidad:** Hace TODO el trabajo pesado de procesar un mensaje entrante: valida consentimiento, transcribe audio, valida sesión de autenticación, maneja callbacks de OTP, invoca al Strands_Agent y envía la respuesta al cliente vía Twilio REST API. Se ejecuta de forma asíncrona triggered por SQS — sin presión de tiempo del lado de Twilio.
+
+**Runtime:** Node.js 24.x (TypeScript)
+**Memory:** 512 MB
+**Timeout:** 120 seconds (suficiente para transcripción + Strands Agent + envío respuesta)
+**Trigger:** SQS Event Source Mapping sobre `inbound-messages-queue.fifo`
+**Batch Size:** 1 (cada mensaje es interacción crítica del usuario, no se batchea)
+**Visibility Timeout (en la cola):** 130s (apenas mayor que el timeout del Lambda para permitir reintento limpio)
+
+#### Interface de Entrada (SQS Event)
+
+```typescript
+// Payload que Twilio envía como form-urlencoded al webhook
+interface TwilioWebhookPayload {
+  MessageSid: string;        // ID único del mensaje (usado para dedup)
+  From: string;              // "whatsapp:+57300XXXXXXX"
+  To: string;                // "whatsapp:+14155XXXXXXX" (número Twilio)
+  Body: string;              // Texto del mensaje (vacío si es media)
+  NumMedia: string;          // "0" | "1" | ...
+  MediaUrl0?: string;        // URL del audio/imagen si NumMedia > 0
+  MediaContentType0?: string; // "audio/ogg" | "image/jpeg" | ...
+  ButtonPayload?: string;    // Payload del botón de respuesta rápida
+  ProfileName?: string;      // Nombre de perfil de WhatsApp del cliente
 }
 ```
 
 #### Lógica Principal
 
 ```typescript
-async function handler(event: SNSEvent): Promise<void> {
-  const correlationId = uuidv4();
-  logger.appendKeys({ correlationId });
+import { SQSEvent, SQSBatchResponse, SQSBatchItemFailure } from "aws-lambda";
 
-  const payload = parseIncomingMessage(event);
-  const phoneNumber = payload.originationPhoneNumber;
+// El Processor recibe un SQSEvent (con batchSize=1, será un solo record por invocación)
+async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
+  const batchItemFailures: SQSBatchItemFailure[] = [];
 
-  // 1. Deduplicación
-  const isDuplicate = await checkAndStoreDeduplicate(payload.whatsAppMessageId);
-  if (isDuplicate) {
-    logger.info("Duplicate message discarded", { whatsAppMessageId: payload.whatsAppMessageId });
-    return;
-  }
+  for (const record of event.Records) {
+    try {
+      const payload = JSON.parse(record.body) as TwilioWebhookPayload & { correlationId: string };
+      logger.appendKeys({ correlationId: payload.correlationId });
 
-  // 2. Verificar consentimiento
-  const consent = await getConsent(phoneNumber);
-  if (!consent?.accepted) {
-    // Manejar flujo de consentimiento (botones interactivos o respuesta a botón)
-    await handleConsentFlow(payload, consent);
-    return;
-  }
+      const phoneNumber = payload.From.replace("whatsapp:", ""); // E.164
 
-  // 3. Determinar tipo de mensaje y extraer texto
-  let inputText: string;
-  switch (payload.messageBody.type) {
-    case "text":
-      inputText = payload.messageBody.text!.body;
-      break;
-    case "audio":
-      inputText = await transcribeAudio(payload.messageBody.audio!);
-      if (!inputText) {
-        await sendErrorReply(phoneNumber, ERROR_MESSAGES.transcriptionFailed);
-        return;
+      // 1. OTP callback prioritario — si hay OTP pendiente, no llamamos al agente
+      const pendingOTP = await getPendingOTP(phoneNumber);
+      if (pendingOTP) {
+        await handleOTPCallback(phoneNumber, payload.Body, pendingOTP);
+        continue;
       }
-      break;
-    case "interactive":
-      inputText = handleInteractiveReply(payload.messageBody.interactive!);
-      break;
-    default:
-      await sendErrorReply(phoneNumber, ERROR_MESSAGES.unsupportedFormat);
-      return;
+
+      // 2. Verificar consentimiento
+      const consent = await getConsent(phoneNumber);
+      if (!consent?.accepted) {
+        await handleConsentFlow(payload, consent, phoneNumber);
+        continue;
+      }
+
+      // 3. Determinar tipo de mensaje y extraer texto
+      let inputText: string;
+      if (payload.ButtonPayload) {
+        inputText = payload.ButtonPayload;
+      } else if (payload.NumMedia !== "0" && payload.MediaContentType0?.startsWith("audio/")) {
+        inputText = await transcribeAudio(payload.MediaUrl0!, phoneNumber);
+        if (!inputText) {
+          await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.transcriptionFailed);
+          continue;
+        }
+      } else if (payload.Body?.trim()) {
+        inputText = payload.Body.trim();
+      } else {
+        await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.unsupportedFormat);
+        continue;
+      }
+
+      // 4. Verificar Auth_Session
+      const authSession = await getAuthSession(phoneNumber);
+      if (!authSession || isExpired(authSession)) {
+        await storePendingRequest(phoneNumber, inputText);
+        await sendLoginLink(phoneNumber);
+        continue;
+      }
+
+      // 5. Invocar Strands_Agent
+      const sessionId = deriveSessionId(phoneNumber);
+      const response = await invokeStrandsAgent(sessionId, inputText, phoneNumber);
+
+      // 6. Si la respuesta incluye un PDF (extracto), enviarlo como media adjunta
+      const statementInfo = extractStatementInfo(response);
+      if (statementInfo) {
+        await sendTwilioDocument(phoneNumber, statementInfo.s3Bucket, statementInfo.s3Key);
+      }
+
+      // 7. Enviar respuesta de texto (split si > 1600 chars)
+      const textResponse = removeStatementMetadata(response);
+      if (textResponse.trim()) {
+        await sendTwilioMessage(phoneNumber, textResponse);
+      }
+    } catch (error) {
+      // Reportar solo este mensaje como fallido — SQS lo reintentará individualmente
+      logger.error("Failed to process message", { error, messageId: record.messageId });
+      batchItemFailures.push({ itemIdentifier: record.messageId });
+    }
   }
 
-  // 4. Verificar Auth_Session para acciones bancarias
-  const authSession = await getAuthSession(phoneNumber);
-  if (!authSession || isExpired(authSession)) {
-    // Guardar solicitud pendiente y enviar botón de login
-    await storePendingRequest(phoneNumber, inputText);
-    await sendLoginButton(phoneNumber);
-    return;
-  }
+  return { batchItemFailures };
 
-  // 5. Invocar Bedrock Agent
-  const sessionId = deriveSessionId(phoneNumber);
-  const response = await invokeBedrockAgent(sessionId, inputText);
-
-  // 6. Verificar si la respuesta incluye un documento PDF (extracto)
-  const statementInfo = extractStatementInfo(response);
-  if (statementInfo) {
-    // Enviar PDF como documento adjunto vía WhatsApp
-    await sendWhatsAppDocument(
-      phoneNumber,
-      statementInfo.s3Bucket,
-      statementInfo.s3Key,
-      statementInfo.fileName,
-      statementInfo.caption
-    );
-  }
-
-  // 7. Enviar respuesta de texto (split si > 4096 chars)
-  const textResponse = removeStatementMetadata(response);
-  if (textResponse.trim()) {
-    await sendWhatsAppResponse(phoneNumber, textResponse);
-  }
+  return { statusCode: 200, body: "" };
 }
 ```
 
@@ -346,66 +472,47 @@ async function handler(event: SNSEvent): Promise<void> {
 
 ```typescript
 async function handleConsentFlow(
-  payload: EUMSIncomingPayload,
-  consent: ConsentRecord | null
+  payload: TwilioWebhookPayload,
+  consent: ConsentRecord | null,
+  phoneNumber: string
 ): Promise<void> {
-  const phoneNumber = payload.originationPhoneNumber;
-
-  // Si es respuesta a botón de T&C
-  if (payload.messageBody.type === "interactive" && payload.messageBody.interactive?.button_reply) {
-    const buttonId = payload.messageBody.interactive.button_reply.id;
-    
-    if (buttonId === "accept_tc") {
-      await storeConsent(phoneNumber, "accepted");
-      await sendWelcomeMessage(phoneNumber);
-      return;
-    }
-    
-    if (buttonId === "reject_tc") {
-      await storeConsent(phoneNumber, "rejected");
-      await sendReply(phoneNumber, ERROR_MESSAGES.consentRequired);
-      return;
-    }
+  // Respuesta a botón de T&C (Twilio envía el payload del botón en ButtonPayload)
+  if (payload.ButtonPayload === "accept_tc") {
+    await storeConsent(phoneNumber, "accepted");
+    await sendWelcomeMessage(phoneNumber);
+    return;
   }
 
-  // Primer mensaje sin consentimiento — enviar T&C con botones
+  if (payload.ButtonPayload === "reject_tc") {
+    await storeConsent(phoneNumber, "rejected");
+    await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.consentRequired);
+    return;
+  }
+
+  // Primer mensaje sin consentimiento — enviar T&C con botones de acción rápida (Twilio)
   await sendTermsAndConditionsMessage(phoneNumber);
 }
 
 async function sendTermsAndConditionsMessage(phoneNumber: string): Promise<void> {
-  const interactiveMessage = {
-    messaging_product: "whatsapp",
-    to: phoneNumber,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: {
-        text: "👋 ¡Bienvenido a BTG ConnectAI! Para usar nuestros servicios, necesitas aceptar los Términos y Condiciones. Puedes consultarlos en: https://btgpactual.com.co/terminos\n\n¿Aceptas los Términos y Condiciones?"
-      },
-      action: {
-        buttons: [
-          { type: "reply", reply: { id: "accept_tc", title: "✅ Acepto" } },
-          { type: "reply", reply: { id: "reject_tc", title: "❌ No acepto" } }
-        ]
-      }
-    }
-  };
-
-  await socialMessagingClient.send(new SendWhatsAppMessageCommand({
-    originationPhoneNumberId: ORIGINATION_PHONE_ID,
-    message: Buffer.from(JSON.stringify(interactiveMessage)),
-    metaApiVersion: "v21.0",
-  }));
+  // Twilio soporta botones de respuesta rápida via Content Templates o mensaje con lista
+  await twilioClient.messages.create({
+    from: `whatsapp:${TWILIO_NUMBER}`,
+    to: `whatsapp:${phoneNumber}`,
+    body: "Bienvenido a BTG ConnectAI. Para usar nuestros servicios acepta los Términos y Condiciones: https://btgpactual.com.co/terminos",
+    // Botones de respuesta rápida via Twilio Content API template
+    contentSid: TWILIO_TC_TEMPLATE_SID,
+    contentVariables: JSON.stringify({ phoneNumber }),
+  });
 }
 ```
 
 #### Transcripción de Audio
 
 ```typescript
-async function transcribeAudio(audio: { id: string; mimeType: string }): Promise<string | null> {
+async function transcribeAudio(mediaUrl: string, phoneNumber: string): Promise<string | null> {
   try {
-    // 1. Descargar audio desde WhatsApp Media API
-    const audioBuffer = await downloadWhatsAppMedia(audio.id);
+    // 1. Descargar audio desde Twilio Media URL (requiere autenticación Twilio)
+    const audioBuffer = await downloadTwilioMedia(mediaUrl);
 
     // 2. Subir a S3 temporal para Transcribe
     const s3Key = `audio-temp/${uuidv4()}.ogg`;
@@ -441,35 +548,18 @@ async function transcribeAudio(audio: { id: string; mimeType: string }): Promise
 }
 ```
 
-#### Envío de Mensajes Interactivos (Botón de Login)
+#### Envío de Enlace de Login
 
 ```typescript
-async function sendLoginButton(phoneNumber: string): Promise<void> {
+async function sendLoginLink(phoneNumber: string): Promise<void> {
   const callbackToken = generateCallbackToken(phoneNumber);
   const loginUrl = `${LOGIN_PAGE_URL}?phone=${encodeURIComponent(phoneNumber)}&token=${callbackToken}`;
 
-  const interactiveMessage = {
-    messaging_product: "whatsapp",
-    to: phoneNumber,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: {
-        text: "🔐 Para ejecutar operaciones bancarias necesitas autenticarte. Haz clic en el botón para iniciar sesión."
-      },
-      action: {
-        buttons: [
-          { type: "reply", reply: { id: "login_redirect", title: "🔑 Iniciar sesión" } }
-        ]
-      }
-    }
-  };
-
-  await socialMessagingClient.send(new SendWhatsAppMessageCommand({
-    originationPhoneNumberId: ORIGINATION_PHONE_ID,
-    message: Buffer.from(JSON.stringify(interactiveMessage)),
-    metaApiVersion: "v21.0",
-  }));
+  await twilioClient.messages.create({
+    from: `whatsapp:${TWILIO_NUMBER}`,
+    to: `whatsapp:${phoneNumber}`,
+    body: `🔐 Para ejecutar operaciones bancarias necesitas autenticarte.\n\nInicia sesión aquí: ${loginUrl}\n\nEl enlace es válido por 10 minutos.`,
+  });
 }
 ```
 
@@ -497,51 +587,39 @@ async function checkAndStoreDeduplicate(messageId: string): Promise<boolean> {
 }
 ```
 
-#### Invocación del Bedrock Agent
+#### Invocación del Strands_Agent Lambda
 
 ```typescript
-async function invokeBedrockAgent(sessionId: string, inputText: string): Promise<string> {
-  const command = new InvokeAgentCommand({
-    agentId: BEDROCK_AGENT_ID,
-    agentAliasId: BEDROCK_AGENT_ALIAS_ID,
-    sessionId,
-    inputText,
-  });
+async function invokeStrandsAgent(
+  sessionId: string,
+  inputText: string,
+  phoneNumber: string
+): Promise<string> {
+  const response = await lambdaClient.send(new InvokeCommand({
+    FunctionName: STRANDS_AGENT_LAMBDA_ARN,
+    InvocationType: "RequestResponse",
+    Payload: Buffer.from(JSON.stringify({ sessionId, inputText, phoneNumber })),
+  }));
 
-  const response = await bedrockAgentRuntimeClient.send(command);
-  
-  let fullResponse = "";
-  for await (const event of response.completion ?? []) {
-    if (event.chunk?.bytes) {
-      fullResponse += new TextDecoder().decode(event.chunk.bytes);
-    }
-  }
-  
-  return fullResponse;
+  const result = JSON.parse(new TextDecoder().decode(response.Payload));
+  return result.response as string;
 }
 ```
 
-#### Envío de Respuesta (con split)
+#### Envío de Respuesta vía Twilio (con split)
 
 ```typescript
-const MAX_WHATSAPP_LENGTH = 4096;
+const MAX_TWILIO_MESSAGE_LENGTH = 1600;
 
-async function sendWhatsAppResponse(phoneNumber: string, text: string): Promise<void> {
-  const chunks = splitMessage(text, MAX_WHATSAPP_LENGTH);
-  
+async function sendTwilioMessage(phoneNumber: string, text: string): Promise<void> {
+  const chunks = splitMessage(text, MAX_TWILIO_MESSAGE_LENGTH);
+
   for (const chunk of chunks) {
-    const messagePayload = JSON.stringify({
-      messaging_product: "whatsapp",
-      to: phoneNumber,
-      type: "text",
-      text: { body: chunk },
+    await twilioClient.messages.create({
+      from: `whatsapp:${TWILIO_NUMBER}`,
+      to: `whatsapp:${phoneNumber}`,
+      body: chunk,
     });
-
-    await socialMessagingClient.send(new SendWhatsAppMessageCommand({
-      originationPhoneNumberId: ORIGINATION_PHONE_ID,
-      message: Buffer.from(messagePayload),
-      metaApiVersion: "v21.0",
-    }));
   }
 }
 
@@ -572,60 +650,38 @@ function splitMessage(text: string, maxLength: number): string[] {
 }
 ```
 
-#### Envío de Documento PDF (Extracto Bancario)
+#### Envío de Documento PDF vía Twilio (Extracto Bancario)
 
 ```typescript
-async function sendWhatsAppDocument(
+async function sendTwilioDocument(
   phoneNumber: string,
   s3Bucket: string,
   s3Key: string,
-  fileName: string,
-  caption?: string
+  fileName: string
 ): Promise<void> {
-  // 1. Descargar PDF desde S3
-  const getObjectResponse = await s3Client.send(new GetObjectCommand({
-    Bucket: s3Bucket,
-    Key: s3Key,
-  }));
-  const pdfBuffer = await streamToBuffer(getObjectResponse.Body);
+  // 1. Generar presigned URL temporal de S3 (Twilio necesita una URL pública para descargar el media)
+  const presignedUrl = await getSignedUrl(
+    s3Client,
+    new GetObjectCommand({ Bucket: s3Bucket, Key: s3Key }),
+    { expiresIn: 300 } // 5 minutos — suficiente para que Twilio descargue
+  );
 
-  // 2. Subir media (PDF) a EUMS para obtener media_id
-  const mediaResponse = await socialMessagingClient.send(new PostWhatsAppMessageMediaCommand({
-    originationPhoneNumberId: ORIGINATION_PHONE_ID,
-    mediaContentType: "application/pdf",
-    sourceS3File: {
-      bucketName: s3Bucket,
-      key: s3Key,
-    },
-  }));
-  const mediaId = mediaResponse.mediaId;
-
-  // 3. Enviar mensaje de tipo document con el media_id
-  const documentMessage = JSON.stringify({
-    messaging_product: "whatsapp",
-    to: phoneNumber,
-    type: "document",
-    document: {
-      id: mediaId,
-      filename: fileName,
-      caption: caption ?? "📄 Aquí tienes tu extracto bancario.",
-    },
+  // 2. Enviar mensaje con media adjunto via Twilio
+  await twilioClient.messages.create({
+    from: `whatsapp:${TWILIO_NUMBER}`,
+    to: `whatsapp:${phoneNumber}`,
+    body: "📄 Aquí tienes tu extracto bancario.",
+    mediaUrl: [presignedUrl],
   });
-
-  await socialMessagingClient.send(new SendWhatsAppMessageCommand({
-    originationPhoneNumberId: ORIGINATION_PHONE_ID,
-    message: Buffer.from(documentMessage),
-    metaApiVersion: "v21.0",
-  }));
 }
 ```
 
 
-### 2. Auth_Service Lambda
+### 3. Auth_Service Lambda
 
 **Responsabilidad:** Backend de autenticación mock. Valida credenciales contra usuarios de prueba hardcodeados y crea Auth_Session en DynamoDB. Simula un flujo de autenticación vía enlace web.
 
-**Runtime:** Node.js 20.x (TypeScript)  
+**Runtime:** Node.js 24.x (TypeScript)  
 **Memory:** 128 MB  
 **Timeout:** 10 seconds  
 **Trigger:** API Gateway (HTTP API) o Function URL
@@ -729,7 +785,7 @@ async function authenticate(request: AuthenticateRequest): Promise<AuthenticateR
 }
 ```
 
-### 3. Login_Page (S3 Static Site)
+### 4. Login_Page (S3 Static Site)
 
 **Responsabilidad:** Página web simple con formulario de login. Hosted en S3 como sitio estático con CloudFront (o directamente S3 website hosting para MVP).
 
@@ -775,11 +831,11 @@ async function handleLogin(event: Event): Promise<void> {
 }
 ```
 
-### 4. Action_Group Lambda: balance-query
+### 5. Action_Group Lambda: balance-query
 
 **Responsabilidad:** Consultar saldos de Fondos de Inversión y Cuenta Corriente del Mock_Core.
 
-**Runtime:** Node.js 20.x (TypeScript)  
+**Runtime:** Node.js 24.x (TypeScript)  
 **Memory:** 128 MB  
 **Timeout:** 15 seconds  
 **Trigger:** Bedrock Agent Action Group invocation
@@ -820,11 +876,11 @@ interface BedrockAgentActionGroupResponse {
 |------|--------|------------|-------------|
 | `/balance` | GET | `phoneNumber` (required), `productType` (optional: "fondo_inversion" \| "cuenta_corriente") | Consulta saldos |
 
-### 5. Action_Group Lambda: transfer-breb
+### 6. Action_Group Lambda: transfer-breb
 
 **Responsabilidad:** Ejecutar transferencias BRE-B entre cuentas contra el Mock_Core.
 
-**Runtime:** Node.js 20.x (TypeScript)  
+**Runtime:** Node.js 24.x (TypeScript)  
 **Memory:** 128 MB  
 **Timeout:** 15 seconds  
 **Trigger:** Bedrock Agent Action Group invocation
@@ -881,11 +937,11 @@ async function executeTransfer(params: TransferParams): Promise<TransferResult> 
 }
 ```
 
-### 6. Action_Group Lambda: statement-generator
+### 7. Action_Group Lambda: statement-generator
 
-**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3 y retornar la referencia (S3 key) para que el WhatsApp_Gateway descargue y envíe el PDF como documento adjunto vía WhatsApp.
+**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3 y retornar la referencia (S3 key) para que el Message_Handler descargue y envíe el PDF como documento adjunto vía WhatsApp.
 
-**Runtime:** Node.js 20.x (TypeScript)  
+**Runtime:** Node.js 24.x (TypeScript)  
 **Memory:** 256 MB  
 **Timeout:** 30 seconds  
 **Trigger:** Bedrock Agent Action Group invocation
@@ -941,13 +997,17 @@ async function generateStatement(params: StatementParams): Promise<StatementResu
 ```
 
 
-### 7. Amazon Bedrock Agent (Conversational_Agent)
+### 8. Strands_Agent Lambda (Conversational_Agent)
 
-**Responsabilidad:** Interpretar intenciones en español (texto o audio transcrito), mantener contexto conversacional, decidir cuándo invocar Action Groups, solicitar confirmación para transferencias, y formular respuestas naturales.
+**Responsabilidad:** Interpretar intenciones en español (texto o audio transcrito), mantener contexto conversacional, decidir cuándo invocar herramientas (balance-query, transfer-breb, statement-generator), y formular respuestas naturales. Implementado como Lambda Python 3.12 usando Strands Agent SDK sobre Amazon Bedrock.
 
-**Foundation Model:** Claude 3.5 Haiku (anthropic.claude-3-5-haiku-20241022-v1:0)  
-**Session Timeout:** 30 minutos de inactividad  
-**Session ID Strategy:** Derivado del número telefónico del Bank_Client
+**Runtime:** Python 3.12  
+**Memory:** 512 MB  
+**Timeout:** 60 seconds  
+**Trigger:** Lambda InvokeFunction desde Message_Handler (sync)  
+**Foundation Model:** Claude 3.5 Haiku via Bedrock (anthropic.claude-3-5-haiku-20241022-v1:0)  
+**Session Strategy:** sessionId derivado del número de teléfono — Strands mantiene historial en memoria de sesión  
+**Guardrails:** Bedrock Guardrails aplicados sobre el modelo (content filtering + topic policies)
 
 #### Instrucciones del Agente (System Prompt)
 
@@ -1220,7 +1280,394 @@ components:
           type: string
 ```
 
-### 8. Bedrock Guardrails
+### 9. AWS Step Functions — TransferBrebStateMachine
+
+**Responsabilidad:** Orquestar el flujo completo de transferencia BRE-B, que es una **transacción distribuida** que requiere callback asíncrono del usuario (OTP). Reemplaza el `transfer-breb` Lambda monolítico anterior por una state machine que coordina múltiples Lambdas con manejo nativo de timeouts, reintentos y compensación.
+
+**Tipo:** Standard Workflow (vs Express) — permite `waitForTaskToken` con timeouts largos y trazabilidad por ejecución.
+
+**Entrada:**
+
+```json
+{
+  "phoneNumber": "+573001234567",
+  "sourceAccount": "1009876543",
+  "destinationAccount": "2009876544",
+  "amount": 500000,
+  "concept": "Pago arriendo",
+  "sessionId": "sess-abc123",
+  "correlationId": "uuid-..."
+}
+```
+
+**Salida:**
+
+```json
+{
+  "success": true,
+  "transactionId": "TRX-...",
+  "receipt": { /* TransferReceipt */ }
+}
+```
+
+#### Diagrama de Estados
+
+```mermaid
+stateDiagram-v2
+    [*] --> ValidateTransfer
+    ValidateTransfer --> GenerateOTP: Validación OK
+    ValidateTransfer --> NotifyValidationFailed: INSUFFICIENT_FUNDS / INVALID_DEST
+    GenerateOTP --> WaitForOTP: OTP enviado por SMS (Pinpoint)
+    WaitForOTP --> ValidateOTP: SendTaskSuccess(otp)
+    WaitForOTP --> NotifyOTPExpired: Timeout 5 min
+    ValidateOTP --> ExecuteTransfer: OTP válido
+    ValidateOTP --> WaitForOTP: OTP inválido, reintentos < 3
+    ValidateOTP --> NotifyOTPBlocked: 3 intentos fallidos
+    ExecuteTransfer --> PublishNotifications: Mock_Core actualizado
+    ExecuteTransfer --> NotifyTransferFailed: Error en ejecución
+    PublishNotifications --> NotifyUserSuccess: Eventos SQS publicados
+    NotifyUserSuccess --> [*]
+    NotifyValidationFailed --> [*]
+    NotifyOTPExpired --> [*]
+    NotifyOTPBlocked --> [*]
+    NotifyTransferFailed --> [*]
+```
+
+#### Definición ASL (Amazon States Language)
+
+```json
+{
+  "Comment": "Flujo de transferencia BRE-B con autorización OTP",
+  "StartAt": "ValidateTransfer",
+  "States": {
+    "ValidateTransfer": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:transfer-breb-validate",
+      "ResultPath": "$.validation",
+      "Next": "GenerateOTP",
+      "Catch": [
+        {
+          "ErrorEquals": ["InsufficientFundsError", "InvalidDestinationError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyValidationFailed"
+        }
+      ]
+    },
+    "GenerateOTP": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "otp-service",
+        "Payload": {
+          "operation": "generate-and-wait",
+          "phoneNumber.$": "$.phoneNumber",
+          "transferAmount.$": "$.amount",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "HeartbeatSeconds": 300,
+      "ResultPath": "$.otpResult",
+      "Next": "ValidateOTP",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "Next": "NotifyOTPExpired"
+        },
+        {
+          "ErrorEquals": ["OTPBlockedError"],
+          "Next": "NotifyOTPBlocked"
+        }
+      ]
+    },
+    "ValidateOTP": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.otpResult.valid",
+          "BooleanEquals": true,
+          "Next": "ExecuteTransfer"
+        }
+      ],
+      "Default": "NotifyOTPExpired"
+    },
+    "ExecuteTransfer": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:transfer-breb-execute",
+      "ResultPath": "$.receipt",
+      "Next": "PublishNotifications",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyTransferFailed"
+        }
+      ]
+    },
+    "PublishNotifications": {
+      "Type": "Parallel",
+      "ResultPath": "$.notifications",
+      "Branches": [
+        {
+          "StartAt": "PublishEmailEvent",
+          "States": {
+            "PublishEmailEvent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${EmailNotificationQueueUrl}",
+                "MessageBody": {
+                  "type": "transfer_confirmation",
+                  "receipt.$": "$.receipt",
+                  "correlationId.$": "$.correlationId"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "PublishSmsEvent",
+          "States": {
+            "PublishSmsEvent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${SmsNotificationQueueUrl}",
+                "MessageBody": {
+                  "type": "transfer_confirmation",
+                  "phoneNumber.$": "$.phoneNumber",
+                  "amount.$": "$.amount",
+                  "correlationId.$": "$.correlationId"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "NotifyUserSuccess"
+    },
+    "NotifyUserSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:message-handler-notify",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "transfer_success",
+        "receipt.$": "$.receipt"
+      },
+      "End": true
+    },
+    "NotifyValidationFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:message-handler-notify",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "validation_failed",
+        "error.$": "$.error"
+      },
+      "End": true
+    },
+    "NotifyOTPExpired": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:message-handler-notify",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "otp_expired"
+      },
+      "End": true
+    },
+    "NotifyOTPBlocked": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:message-handler-notify",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "otp_blocked"
+      },
+      "End": true
+    },
+    "NotifyTransferFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:::function:message-handler-notify",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "transfer_failed"
+      },
+      "End": true
+    }
+  }
+}
+```
+
+#### Patrón Task Token — Cómo funciona el callback del OTP
+
+Este es el corazón del state machine. Resuelve el problema crítico: **¿cómo "esperar" a que el usuario tipee el OTP sin bloquear una Lambda?**
+
+```mermaid
+sequenceDiagram
+    participant SFN as Step Functions
+    participant OTP as OTP_Service
+    participant DDB_OTP as DynamoDB OTP_Store
+    participant PIN as Pinpoint
+    participant BC as Bank_Client
+    participant TW as Twilio
+    participant APIGW as API Gateway
+    participant MH as Message_Handler
+
+    SFN->>OTP: invoke con $$.Task.Token
+    OTP->>OTP: Generar código 6 dígitos
+    OTP->>DDB_OTP: PutItem {phoneNumber, code, taskToken, ttl=5min, attempts=0}
+    OTP->>PIN: SendMessages (SMS con el código)
+    PIN-->>BC: SMS con OTP
+    OTP-->>SFN: Lambda retorna, pero SFN sigue PAUSADO esperando token
+    Note over SFN: Ejecución suspendida — no consume Lambda hours
+
+    BC->>TW: Mensaje WhatsApp con el código OTP
+    TW->>APIGW: POST /webhook/twilio
+    APIGW->>MH: Invoke
+    MH->>DDB_OTP: GetItem(phoneNumber)
+    MH->>MH: Validar código + attempts
+    alt OTP válido
+        MH->>SFN: SendTaskSuccess(taskToken, {valid: true})
+        Note over SFN: Workflow continúa a ExecuteTransfer
+    else OTP inválido
+        MH->>DDB_OTP: UpdateItem (attempts++)
+        alt attempts < 3
+            MH->>TW: "Código incorrecto, intenta de nuevo"
+            Note over SFN: Sigue esperando token
+        else attempts >= 3
+            MH->>SFN: SendTaskFailure(taskToken, OTPBlockedError)
+        end
+    end
+```
+
+**Key insight:** La Lambda OTP_Service termina rápido (solo envía el SMS), pero Step Functions queda esperando hasta que Message_Handler invoque `SendTaskSuccess` o `SendTaskFailure` con el token guardado. Cero costo de Lambda mientras se espera.
+
+#### Tabla DynamoDB extendida — OTP_Store con TaskToken
+
+| Attribute | Type | Description |
+| --------- | ---- | ----------- |
+| `pk` | String (PK) | phoneNumber (E.164) |
+| `code` | String | Código OTP de 6 dígitos |
+| `taskToken` | String | Token de Step Functions para resumir el workflow |
+| `executionArn` | String | ARN de la ejecución de Step Functions (para auditoría) |
+| `attempts` | Number | Intentos fallidos (max 3) |
+| `transferContext` | Map | Datos de la transferencia (monto, destino) para mostrar al validar |
+| `createdAt` | String | ISO 8601 |
+| `ttl` | Number | Unix epoch + 300s (5 min) |
+
+### 10. Notificaciones Asíncronas con SQS
+
+**Responsabilidad:** Desacoplar el envío de notificaciones (email, SMS de confirmación) del flujo principal. Las Lambdas productoras solo publican eventos a una cola; las consumidoras los procesan independientemente con reintentos automáticos.
+
+#### Arquitectura
+
+```mermaid
+graph LR
+    SFN[Step Functions<br/>TransferBreb] -->|publish event| Q1[SQS<br/>email-notification-queue]
+    STM[statement-generator] -->|publish event| Q1
+    SFN -->|publish event| Q2[SQS<br/>sms-notification-queue]
+    Q1 -->|Event Source Mapping<br/>batch=10| EMS[Email_Service Lambda]
+    Q2 -->|Event Source Mapping<br/>batch=10| SMS[SMS_Service Lambda]
+    EMS --> SES[Amazon SES]
+    EMS --> S3[S3 - statement PDF]
+    SMS --> PIN[AWS Pinpoint]
+    Q1 -.->|fallos > maxReceiveCount| DLQ1[email-dlq]
+    Q2 -.->|fallos > maxReceiveCount| DLQ2[sms-dlq]
+```
+
+#### Configuración de las colas
+
+**email-notification-queue:**
+
+| Setting | Valor | Razón |
+| ------- | ----- | ----- |
+| Visibility Timeout | 60s | Cubre Email_Service timeout (15s) + buffer |
+| Message Retention | 4 días | Tiempo razonable de retención si el consumer está caído |
+| maxReceiveCount | 3 | Después de 3 fallos consecutivos → DLQ |
+| Receive Wait Time | 20s | Long polling — reduce empty receives |
+| Encryption | SSE-SQS | AWS managed key |
+| DLQ | email-dlq | Para inspección manual de fallos |
+
+**sms-notification-queue:** Misma configuración con DLQ `sms-dlq`.
+
+#### Esquema de eventos (contrato productor ↔ consumidor)
+
+```typescript
+// Evento publicado a email-notification-queue
+interface EmailNotificationEvent {
+  type: "transfer_confirmation" | "statement_delivery";
+  correlationId: string;        // Para tracing
+  to: string;                   // Email del cliente
+  payload:
+    | {
+        type: "transfer_confirmation";
+        receipt: TransferReceipt;
+        clientName: string;
+      }
+    | {
+        type: "statement_delivery";
+        s3Bucket: string;
+        s3Key: string;
+        fileName: string;
+        clientName: string;
+        period: { start: string; end: string };
+      };
+}
+
+// Evento publicado a sms-notification-queue
+interface SmsNotificationEvent {
+  type: "transfer_confirmation";
+  correlationId: string;
+  phoneNumber: string;          // E.164
+  amount: number;
+  destinationAccount: string;   // Ya enmascarado
+}
+```
+
+#### Event Source Mapping (CDK)
+
+```typescript
+emailService.addEventSource(new SqsEventSource(emailNotificationQueue, {
+  batchSize: 10,
+  maxBatchingWindow: Duration.seconds(5),
+  reportBatchItemFailures: true,  // Solo reintenta los mensajes fallidos del batch, no todo el lote
+}));
+```
+
+#### Productores publican via SDK
+
+```typescript
+// Desde statement-generator Lambda después de generar el PDF
+await sqsClient.send(new SendMessageCommand({
+  QueueUrl: EMAIL_NOTIFICATION_QUEUE_URL,
+  MessageBody: JSON.stringify({
+    type: "statement_delivery",
+    correlationId: correlationId,
+    to: clientEmail,
+    payload: {
+      type: "statement_delivery",
+      s3Bucket: STATEMENT_BUCKET,
+      s3Key: s3Key,
+      fileName: fileName,
+      clientName: client.name,
+      period: { start: periodStart, end: cutoffDate },
+    },
+  }),
+  MessageAttributes: {
+    EventType: { DataType: "String", StringValue: "statement_delivery" },
+  },
+}));
+// Lambda termina inmediatamente — no espera al envío del email
+```
+
+#### Beneficios del patrón
+
+- **Resiliencia**: SES caído → mensajes se acumulan en SQS, se procesan cuando se recupere
+- **Escalabilidad independiente**: Email_Service puede escalar a 1000 invocaciones concurrentes sin afectar el flujo principal
+- **Reintentos automáticos**: SQS reintenta hasta `maxReceiveCount`, luego envía a DLQ
+- **Batch processing**: 10 emails por invocación reduce costo
+- **Observabilidad**: Métrica `ApproximateAgeOfOldestMessage` por cola alerta si los consumidores están atrasados
+
+### 11. Bedrock Guardrails
 
 **Responsabilidad:** Filtrar contenido inapropiado, restringir respuestas al dominio bancario, bloquear asesoría financiera personalizada y prevenir prompt injection.
 
@@ -1285,16 +1732,16 @@ const guardrailConfig = {
 ```
 
 
-### 9. Observability Stack
+### 12. Observability Stack
 
 #### CloudWatch Dashboard
 
 ```typescript
 const dashboardWidgets = [
-  // WhatsApp_Gateway
-  { title: "Gateway - Invocations", metric: "Invocations", functionName: "WhatsApp_Gateway" },
-  { title: "Gateway - Errors", metric: "Errors", functionName: "WhatsApp_Gateway" },
-  { title: "Gateway - Duration p50/p90", metric: "Duration", functionName: "WhatsApp_Gateway", stats: ["p50", "p90"] },
+  // Message_Handler
+  { title: "Gateway - Invocations", metric: "Invocations", functionName: "Message_Handler" },
+  { title: "Gateway - Errors", metric: "Errors", functionName: "Message_Handler" },
+  { title: "Gateway - Duration p50/p90", metric: "Duration", functionName: "Message_Handler", stats: ["p50", "p90"] },
   // Auth_Service
   { title: "AuthService - Invocations", metric: "Invocations", functionName: "Auth_Service" },
   { title: "AuthService - Errors", metric: "Errors", functionName: "Auth_Service" },
@@ -1328,7 +1775,7 @@ const createErrorRateAlarm = (functionName: string) => ({
 
 // Alarmas para cada Lambda
 const alarms = [
-  createErrorRateAlarm("WhatsApp_Gateway"),
+  createErrorRateAlarm("Message_Handler"),
   createErrorRateAlarm("Auth_Service"),
   createErrorRateAlarm("balance-query"),
   createErrorRateAlarm("transfer-breb"),
@@ -1336,7 +1783,7 @@ const alarms = [
 ];
 ```
 
-### 10. Infrastructure as Code (CDK Stack Structure)
+### 13. Infrastructure as Code (CDK Stack Structure)
 
 ```
 infra/
@@ -1346,7 +1793,7 @@ infra/
 │   ├── stacks/
 │   │   └── btg-connectai-stack.ts    # Main stack (all resources)
 │   ├── constructs/
-│   │   ├── whatsapp-gateway.ts       # Gateway Lambda + SNS subscription
+│   │   ├── message-handler.ts        # Message Handler Lambda + API Gateway integration
 │   │   ├── auth-service.ts           # Auth_Service Lambda + Function URL
 │   │   ├── login-page.ts             # S3 static site + deployment
 │   │   ├── balance-query.ts          # Action Group Lambda
@@ -1421,25 +1868,38 @@ src/
 #### IAM Roles (Least Privilege)
 
 ```typescript
-// WhatsApp_Gateway Lambda Role
-const gatewayRole = {
+// Webhook_Receiver Lambda Role — minimalista por diseño
+const webhookReceiverRole = {
   policies: [
-    // DynamoDB: dedup, consent, auth_session (read + write)
-    { effect: "Allow", actions: ["dynamodb:PutItem", "dynamodb:GetItem"], resources: [dedupTable.tableArn] },
+    // Encolar mensajes entrantes en SQS FIFO
+    { effect: "Allow", actions: ["sqs:SendMessage"], resources: [inboundMessagesQueue.queueArn] },
+    // Secrets Manager (solo para leer TWILIO_AUTH_TOKEN y validar firma)
+    { effect: "Allow", actions: ["secretsmanager:GetSecretValue"], resources: [twilioSecretArn] },
+    // CloudWatch Logs
+    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
+  ],
+};
+
+// Message_Processor Lambda Role — donde está el trabajo pesado
+const messageProcessorRole = {
+  policies: [
+    // SQS: consumir mensajes de la cola inbound (managed por Event Source Mapping pero documentamos el permiso)
+    { effect: "Allow", actions: ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"], resources: [inboundMessagesQueue.queueArn] },
+    // DynamoDB: consent_store (read + write), auth_session (read), OTP_Store (read + update + delete para callback)
     { effect: "Allow", actions: ["dynamodb:PutItem", "dynamodb:GetItem"], resources: [consentTable.tableArn] },
     { effect: "Allow", actions: ["dynamodb:GetItem"], resources: [authSessionTable.tableArn] },
-    // Bedrock Agent: invoke
-    { effect: "Allow", actions: ["bedrock:InvokeAgent"], resources: [agentArn] },
-    // EUMS: enviar mensajes y subir media
-    { effect: "Allow", actions: ["social-messaging:SendWhatsAppMessage", "social-messaging:GetWhatsAppMessageMedia", "social-messaging:PostWhatsAppMessageMedia"], resources: ["*"] },
-    // Transcribe: start + get job
+    { effect: "Allow", actions: ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], resources: [otpStoreTable.tableArn] },
+    // Lambda: invocar Strands_Agent
+    { effect: "Allow", actions: ["lambda:InvokeFunction"], resources: [strandsAgentLambda.functionArn] },
+    // Step Functions: callback del OTP (SendTaskSuccess/Failure)
+    { effect: "Allow", actions: ["states:SendTaskSuccess", "states:SendTaskFailure"], resources: [transferBrebStateMachine.stateMachineArn] },
+    // Transcribe
     { effect: "Allow", actions: ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"], resources: ["*"] },
-    // S3: audio temp bucket (read/write)
+    // S3: audio temp (read/write), statement bucket (read presigned URL)
     { effect: "Allow", actions: ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], resources: [`${audioTempBucket.bucketArn}/*`] },
-    // S3: statement bucket (read — para descargar PDF y enviar como documento adjunto)
     { effect: "Allow", actions: ["s3:GetObject"], resources: [`${statementBucket.bucketArn}/*`] },
-    // Secrets Manager
-    { effect: "Allow", actions: ["secretsmanager:GetSecretValue"], resources: [secretArn] },
+    // Secrets Manager (Twilio credentials para llamadas REST)
+    { effect: "Allow", actions: ["secretsmanager:GetSecretValue"], resources: [twilioSecretArn] },
     // CloudWatch Logs
     { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
   ],
@@ -1500,19 +1960,7 @@ const bedrockAgentRole = {
 
 ## Data Models
 
-### DynamoDB Table: Dedup (Deduplication)
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `pk` | String (Partition Key) | `whatsapp_message_id` del mensaje |
-| `ttl` | Number | Unix timestamp de expiración (createdAt + 600s = 10 min) |
-| `createdAt` | String | ISO 8601 timestamp de recepción |
-
-**Table Settings:**
-- Billing Mode: PAY_PER_REQUEST
-- TTL Attribute: `ttl`
-- Encryption: AWS managed key (`aws/dynamodb`)
-- No GSIs
+> **Nota sobre deduplicación de mensajes entrantes:** Se eliminó la tabla `Dedup` custom. La deduplicación ahora la maneja **SQS FIFO** nativamente con `MessageDeduplicationId = MessageSid` en ventana de 5 minutos. Esto reduce código, latencia y costo de DynamoDB.
 
 ### DynamoDB Table: Consent_Store
 
@@ -1691,14 +2139,14 @@ const MOCK_CLIENTS: MockClient[] = [
 - **Purpose:** Almacenamiento temporal de archivos de audio para Amazon Transcribe
 - **Lifecycle:** Objetos eliminados automáticamente después de 1 día
 - **Encryption:** AWS managed key (`aws/s3`)
-- **Access:** Solo WhatsApp_Gateway Lambda
+- **Access:** Solo Message_Handler Lambda
 
 #### Statement_Bucket
 
 - **Purpose:** Almacenamiento temporal de PDFs de extractos bancarios antes de envío como documento adjunto
 - **Lifecycle:** Objetos eliminados automáticamente después de 1 día (PDF se entrega inmediatamente como adjunto)
 - **Encryption:** AWS managed key (`aws/s3`)
-- **Access:** statement-generator Lambda (write) + WhatsApp_Gateway Lambda (read/download)
+- **Access:** statement-generator Lambda (write) + Message_Handler Lambda (read/download)
 - **Block Public Access:** Enabled (all 4 settings)
 
 ### Secrets Manager Structure
@@ -1860,16 +2308,16 @@ interface StructuredLog {
 
 | Error Scenario | Component | User-Facing Response | Log Action |
 |---------------|-----------|---------------------|------------|
-| Non-text/audio message | WhatsApp_Gateway | "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta." | INFO log with message type |
-| Duplicate message | WhatsApp_Gateway | None (silently discarded) | INFO log with message ID |
-| Consent_Store unavailable | WhatsApp_Gateway | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with DDB error |
-| T&C rejected | WhatsApp_Gateway | "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje." | INFO log |
-| Audio transcription failed | WhatsApp_Gateway | "No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto." | ERROR log with transcription error |
-| Auth_Session expired | WhatsApp_Gateway | "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar." + login button | INFO log |
-| Auth_Session not found | WhatsApp_Gateway | "🔐 Para ejecutar operaciones bancarias necesitas autenticarte." + login button | INFO log |
+| Non-text/audio message | Message_Handler | "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta." | INFO log with message type |
+| Duplicate message | Message_Handler | None (silently discarded) | INFO log with message ID |
+| Consent_Store unavailable | Message_Handler | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with DDB error |
+| T&C rejected | Message_Handler | "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje." | INFO log |
+| Audio transcription failed | Message_Handler | "No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto." | ERROR log with transcription error |
+| Auth_Session expired | Message_Handler | "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar." + login button | INFO log |
+| Auth_Session not found | Message_Handler | "🔐 Para ejecutar operaciones bancarias necesitas autenticarte." + login button | INFO log |
 | Invalid credentials | Auth_Service | Login_Page shows: "Credenciales incorrectas. Verifica tu usuario y contraseña." | WARN log with masked username |
-| Bedrock Agent timeout (>15s) | WhatsApp_Gateway | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with latency |
-| Bedrock Agent error | WhatsApp_Gateway | "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo." | ERROR log with error details |
+| Bedrock Agent timeout (>15s) | Message_Handler | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with latency |
+| Bedrock Agent error | Message_Handler | "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo." | ERROR log with error details |
 | Guardrails block (input) | Bedrock Agent | Guardrail's configured blocked input message | WARN log with block reason |
 | Guardrails block (output) | Bedrock Agent | Guardrail's configured blocked output message | WARN log with block reason |
 | Client not found in Mock_Core | Action Groups | Agent formats: "No encontré información de cuenta asociada a tu número." | INFO log with masked phone |
@@ -1877,10 +2325,10 @@ interface StructuredLog {
 | Invalid destination account | transfer-breb | Agent formats: "La cuenta destino no fue encontrada. Verifica el número e intenta de nuevo." | INFO log |
 | Future cutoff date | statement-generator | Agent formats: "La fecha de corte debe ser una fecha pasada. Por favor indica una fecha anterior a hoy." | INFO log |
 | PDF generation failure | statement-generator | Agent formats: "No pude generar el extracto. Por favor intenta de nuevo." | ERROR log |
-| DynamoDB write failure (dedup) | WhatsApp_Gateway | Process message anyway (dedup is best-effort) | ERROR log, continue processing |
-| DynamoDB read failure (auth) | WhatsApp_Gateway | "⚠️ Servicio temporalmente no disponible." | ERROR log |
+| DynamoDB write failure (dedup) | Message_Handler | Process message anyway (dedup is best-effort) | ERROR log, continue processing |
+| DynamoDB read failure (auth) | Message_Handler | "⚠️ Servicio temporalmente no disponible." | ERROR log |
 | Secrets Manager failure | All Lambdas | "Servicio temporalmente no disponible." | ERROR log with secret name |
-| EUMS SendMessage failure | WhatsApp_Gateway | None (cannot reach user) | ERROR log with EUMS error |
+| EUMS SendMessage failure | Message_Handler | None (cannot reach user) | ERROR log with EUMS error |
 
 ### Retry Strategy
 
@@ -1918,7 +2366,7 @@ const ERROR_MESSAGES = {
 
 | Component | Timeout | Rationale |
 |-----------|---------|-----------|
-| WhatsApp_Gateway Lambda | 60s | Accommodates transcription (10s) + agent (15s) + EUMS send |
+| Message_Handler Lambda | 60s | Accommodates transcription (10s) + agent (15s) + EUMS send |
 | Auth_Service Lambda | 10s | Simple credential check + DDB write |
 | balance-query Lambda | 15s | Mock data instant, buffer for cold start |
 | transfer-breb Lambda | 15s | Mock data instant, buffer for cold start |
@@ -1956,9 +2404,9 @@ Properties to implement as PBT:
 
 | Test | Component | What it verifies |
 |------|-----------|-----------------|
-| T&C interactive message format | WhatsApp_Gateway | Correct WhatsApp interactive payload structure |
-| Welcome message content | WhatsApp_Gateway | All 3 services listed in welcome |
-| Login button message format | WhatsApp_Gateway | Correct interactive button payload |
+| T&C interactive message format | Message_Handler | Correct WhatsApp interactive payload structure |
+| Welcome message content | Message_Handler | All 3 services listed in welcome |
+| Login button message format | Message_Handler | Correct interactive button payload |
 | Auth_Service with each test user | Auth_Service | Each of 3 users can authenticate |
 | Transfer cancellation | transfer-breb | No state change on cancel |
 | Empty statement generation | statement-generator | PDF generated with "no transactions" note |
@@ -1987,7 +2435,7 @@ Properties to implement as PBT:
 | S3 bucket policies | Block public access enabled |
 | IAM policy scoping | Least privilege per Lambda |
 | CloudWatch alarm configuration | 10% error threshold, 5min window |
-| Lambda runtime | All Lambdas use Node.js 20.x |
+| Lambda runtime | All Lambdas use Node.js 24.x |
 
 ### Test Execution
 
