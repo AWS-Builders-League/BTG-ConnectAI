@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implementación incremental de un asistente bancario conversacional para WhatsApp usando Twilio (sandbox), Amazon API Gateway, Strands Agent SDK sobre Amazon Bedrock (Claude Haiku 3.5). **Stack 100% Python 3.13** para todas las Lambdas. IaC con **CloudFormation puro (YAML)** siguiendo el patrón del repo `infra`. Las Lambdas corren en subnets privadas de la VPC `IA-Builder-sandbox-networking` con salida a internet via NAT Gateway.
+Implementación incremental de un asistente bancario conversacional para WhatsApp usando Twilio (sandbox), Amazon API Gateway, Strands Agent SDK sobre Amazon Bedrock (Claude Haiku 3.5). **Stack 100% Python 3.13** para todas las Lambdas. IaC con **CloudFormation puro (YAML)** siguiendo el patrón del repo `infra`. **Estrategia de red híbrida**: las Lambdas del dominio bancario (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) corren en subnets privadas de `IA-Builder-sandbox-networking` con acceso a AWS solo vía VPC Endpoints (sin NAT, cero salida a internet); el resto corre fuera de VPC en la red managed de Lambda (necesitan Twilio/APIs AWS públicas, seguras por IAM).
 
 **Patrones arquitectónicos clave:**
 
@@ -77,13 +77,17 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     - Outputs con URLs y ARNs (Export para nested stacks)
     - _Requirements: 17.1, 17.6_
 
-  - [ ] 2.5 Create Lambda Security Group template (importa networking)
-    - Create `cloudformation/templates/connectai/security-group.yaml`
-    - Importar `VpcId` vía `Fn::ImportValue: IA-Builder-sandbox-networking-VpcId`
-    - `AWS::EC2::SecurityGroup` para Lambdas: sin reglas de ingress, egress TCP 443 a 0.0.0.0/0
-    - Las subnets privadas se importan vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds` (split con `Fn::Split`)
-    - Output: SecurityGroupId + SubnetIds para uso en los templates de Lambdas
-    - _Requirements: 15.1, 15.2, 15.7_
+  - [ ] 2.5 Create VPC networking template (Security Group + VPC Endpoints) para el dominio bancario
+    - Create `cloudformation/templates/connectai/vpc-access.yaml`
+    - Importar `VpcId`, `PrivateSubnetIds`, `PrivateRouteTableId` vía `Fn::ImportValue` (split de subnets con `Fn::Split`)
+    - `AWS::EC2::SecurityGroup` `BankingLambdaSG`: sin reglas de ingress; egress TCP 443 (hacia los VPC Endpoints)
+    - **VPC Endpoints** (las subnets privadas NO tienen ruta 0.0.0.0/0):
+      - Gateway Endpoint S3 (`com.amazonaws.us-east-1.s3`) asociado al PrivateRouteTable — gratis
+      - Gateway Endpoint DynamoDB (`...dynamodb`) asociado al PrivateRouteTable — gratis (para EXT-1)
+      - Interface Endpoint SQS (`...sqs`) en las subnets privadas + SG, `PrivateDnsEnabled: true` — requerido por `statement_generator`
+    - Output: `BankingLambdaSGId` + `PrivateSubnetIds` para los templates de Lambdas en VPC
+    - NOTA: el NAT Gateway NO se usa (`EnableNatGateway=false` en el stack de red); CloudWatch Logs no requiere endpoint
+    - _Requirements: 15.1, 15.3, 15.4, 15.9_
 
   - [ ] 2.6 Create Inbound Messages Queue (SQS FIFO)
     - Create `cloudformation/templates/connectai/queues.yaml` (parte 2) o `inbound-queue.yaml`
@@ -339,35 +343,42 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
 - [ ] 15. Implement compute & wiring CloudFormation templates
   - [ ] 15.1 Create ingestion Lambdas template (Webhook_Receiver + Message_Processor)
     - Create `cloudformation/templates/connectai/lambdas-ingestion.yaml`
-    - **WebhookReceiverFunction**: `Runtime: python3.13`, MemorySize 256, Timeout 10, `VpcConfig` (subnets privadas + SG importados), `Code: {S3Bucket, S3Key}`, `Layers: [SharedLayer]`. IAM: `sqs:SendMessage` (inbound) + `secretsmanager:GetSecretValue` (Twilio). Env: `INBOUND_QUEUE_URL`, `TWILIO_SECRET_ARN`
-    - **MessageProcessorFunction**: `Runtime: python3.13`, MemorySize 512, Timeout 120, VpcConfig. IAM: SQS consume (inbound) + DynamoDB (consent/auth/otp) + Lambda Invoke (ai-agent) + Step Functions SendTask* + Transcribe + S3 + Secrets
+    - **WebhookReceiverFunction**: `Runtime: python3.13`, MemorySize 256, Timeout 10, **SIN VpcConfig** (red managed), `Code: {S3Bucket, S3Key}`, `Layers: [SharedLayer]`. IAM: `sqs:SendMessage` (inbound) + `secretsmanager:GetSecretValue` (Twilio). Env: `INBOUND_QUEUE_URL`, `TWILIO_SECRET_ARN`
+    - **MessageProcessorFunction**: `Runtime: python3.13`, MemorySize 512, Timeout 120, **SIN VpcConfig** (necesita llamar a Twilio). IAM: SQS consume (inbound) + DynamoDB (consent/auth/otp) + Lambda Invoke (ai-agent) + Step Functions SendTask* + Transcribe + S3 + Secrets
     - `AWS::Lambda::EventSourceMapping` sobre `inbound-messages-queue.fifo`: `BatchSize: 1`, `FunctionResponseTypes: [ReportBatchItemFailures]`, `ScalingConfig.MaximumConcurrency: 10`
     - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.6, 3.7, 3.9, 15.1, 15.2, 15.9, 15.10, 16.5, 16.7_
 
   - [ ] 15.2 Create Auth_Service Lambda template
     - Create `cloudformation/templates/connectai/lambda-auth.yaml`
-    - `Runtime: python3.13`, 128MB, 10s, VpcConfig, Function URL con CORS; IAM: DynamoDB Auth_Session PutItem
+    - `Runtime: python3.13`, 128MB, 10s, **SIN VpcConfig**, Function URL con CORS; IAM: DynamoDB Auth_Session PutItem
     - _Requirements: 5.3, 14.3, 15.1_
 
   - [ ] 15.3 Create action group / state-machine task Lambdas template
     - Create `cloudformation/templates/connectai/lambdas-actions.yaml`
-    - `balance-query` (128MB/15s, IAM solo Logs), `transfer-breb-initiator` (128MB/10s, IAM Step Functions StartExecution), `transfer-breb-validate` (128MB/10s, solo Logs), `transfer-breb-execute` (128MB/15s, solo Logs), `statement-generator` (256MB/30s, IAM S3 PutObject + SQS SendMessage email), `message-handler-notify` (128MB/10s, IAM Secrets Twilio). Todas `python3.13` + VpcConfig + Layer
+    - **EN VPC** (dominio bancario, `VpcConfig` con BankingLambdaSG + subnets privadas, `python3.13` + Layer):
+      - `balance-query` (128MB/15s, IAM solo Logs)
+      - `transfer-breb-validate` (128MB/10s, solo Logs)
+      - `transfer-breb-execute` (128MB/15s, solo Logs)
+      - `statement-generator` (256MB/30s, IAM S3 PutObject + SQS SendMessage email; usa Gateway+Interface Endpoints)
+    - **FUERA de VPC** (`python3.13` + Layer, sin VpcConfig):
+      - `transfer-breb-initiator` (128MB/10s, IAM Step Functions StartExecution)
+      - `message-handler-notify` (128MB/10s, IAM Secrets Twilio)
     - _Requirements: 14.3, 15.1, 17.3, 18.7_
 
   - [ ] 15.4 Create OTP_Service Lambda template
     - Create `cloudformation/templates/connectai/lambda-otp.yaml`
-    - `python3.13`, 128MB, 10s, VpcConfig; IAM: DynamoDB OTP_Store PutItem + Pinpoint SendMessages. Invocada solo por Step Functions (waitForTaskToken)
+    - `python3.13`, 128MB, 10s, **SIN VpcConfig**; IAM: DynamoDB OTP_Store PutItem + Pinpoint SendMessages. Invocada solo por Step Functions (waitForTaskToken)
     - _Requirements: 16.1, 16.2, 16.3_
 
   - [ ] 15.5 Create Email_Service & SMS_Service Lambda templates (SQS triggered)
     - Create `cloudformation/templates/connectai/lambdas-notify.yaml`
-    - **EmailService**: `python3.13`, 256MB, 30s, VpcConfig; EventSourceMapping sobre `email-notification-queue` (`BatchSize: 10`, `MaximumBatchingWindowInSeconds: 5`, `FunctionResponseTypes: [ReportBatchItemFailures]`); IAM: SES Send*, S3 GetObject, SQS consume
-    - **SmsService**: `python3.13`, 128MB, 15s, VpcConfig; EventSourceMapping sobre `sms-notification-queue`; IAM: Pinpoint SendMessages, SQS consume
+    - **EmailService**: `python3.13`, 256MB, 30s, **SIN VpcConfig**; EventSourceMapping sobre `email-notification-queue` (`BatchSize: 10`, `MaximumBatchingWindowInSeconds: 5`, `FunctionResponseTypes: [ReportBatchItemFailures]`); IAM: SES Send*, S3 GetObject, SQS consume
+    - **SmsService**: `python3.13`, 128MB, 15s, **SIN VpcConfig**; EventSourceMapping sobre `sms-notification-queue`; IAM: Pinpoint SendMessages, SQS consume
     - _Requirements: 17.2, 17.3, 17.4, 17.8_
 
   - [ ] 15.6 Create Strands_Agent Lambda + Guardrails template
     - Create `cloudformation/templates/connectai/lambda-ai-agent.yaml` y `guardrails.yaml`
-    - **AiAgentFunction**: `python3.13`, 512MB, 60s, VpcConfig; IAM: Bedrock InvokeModel + ApplyGuardrail + Lambda Invoke (tools)
+    - **AiAgentFunction**: `python3.13`, 512MB, 60s, **SIN VpcConfig** (solo Bedrock + Lambda invoke, APIs AWS públicas); IAM: Bedrock InvokeModel + ApplyGuardrail + Lambda Invoke (tools)
     - `AWS::Bedrock::Guardrail`: content filtering (HATE, VIOLENCE, MISCONDUCT, PROMPT_ATTACK), topic policies (investment-advice DENY, non-banking DENY, competitor-info DENY), blocked messages en español
     - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.5, 14.3_
 
@@ -383,7 +394,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     - _Requirements: 3.1, 15.5_
 
   - [ ] 15.9 Create root composite stack
-    - Create `cloudformation/stacks/sandbox/connectai.yaml` — `AWS::CloudFormation::Stack` anidados en orden de dependencias: security-group → data/storage/queues/secrets → guardrails → lambdas-actions/otp/ai-agent → state-machine → lambdas-ingestion/notify → api-gateway → observability
+    - Create `cloudformation/stacks/sandbox/connectai.yaml` — `AWS::CloudFormation::Stack` anidados en orden de dependencias: vpc-access (SG + endpoints) → data/storage/queues/secrets → guardrails → lambdas-actions/otp/ai-agent → state-machine → lambdas-ingestion/notify → api-gateway → observability
     - Parámetros: `ProjectName=BTGConnectAI`, `Environment=sandbox`, `TemplatesBucket`, `LambdaArtifactsBucket`, `LambdaCodeKey` (git-sha)
     - Importa networking vía `Fn::ImportValue` (VpcId, PrivateSubnetIds)
     - _Requirements: 15.1, 15.4, 15.5_
@@ -409,7 +420,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
   - `pytest src/tests` (unit + property) en verde
   - `cfn-lint cloudformation/**/*.yaml` y `checkov -d cloudformation/` sin findings críticos
   - `aws stepfunctions validate-state-machine-definition --definition file://cloudformation/state-machines/transfer-breb.asl.json`
-  - Verificar que todos los `AWS::Lambda::Function` tienen `Runtime: python3.13` y `VpcConfig` con subnets privadas IA-Builder
+  - Verificar que todos los `AWS::Lambda::Function` tienen `Runtime: python3.13`; que SOLO las 4 Lambdas bancarias (balance-query, transfer-breb-validate/execute, statement-generator) tienen `VpcConfig`; y que NO existe `AWS::EC2::NatGateway` ni ruta 0.0.0.0/0 en las subnets privadas
   - Verificar que `inbound-messages-queue.fifo` existe con dedup por `MessageDeduplicationId`; NO existe tabla DynamoDB Dedup
   - Verificar EventSourceMappings (Message_Processor, Email_Service, SMS_Service) con `FunctionResponseTypes: [ReportBatchItemFailures]`
   - `aws cloudformation deploy` del stack raíz en sandbox; configurar webhook URL del API Gateway en Twilio Sandbox
@@ -424,7 +435,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
 - **Stack 100% Python 3.13** en todas las Lambdas; tests con **pytest** + **hypothesis** (property-based)
 - **CloudFormation puro (YAML)** — sin CDK ni SAM; nested stacks + GitHub Actions OIDC, igual que el repo `infra`
 - Código Lambda zipeado a S3 + dependencias compartidas en Lambda Layer
-- Todas las Lambdas en subnets privadas (10.0.11.0/24, 10.0.12.0/24) via NAT Gateway
+- **Estrategia de red híbrida**: solo el dominio bancario (balance-query, transfer-breb-validate/execute, statement-generator) en subnets privadas (10.0.11.0/24, 10.0.12.0/24) con VPC Endpoints y cero salida a internet; el resto fuera de VPC. **Sin NAT Gateway** — más barato y más seguro (no hay ruta de exfiltración desde el dominio bancario)
 - Mock data inline en las Action Group Lambdas — sin base de datos para datos bancarios
 - Credenciales Twilio en Secrets Manager, nunca hardcodeadas
 - **Async Webhook Pattern**: Webhook_Receiver responde 200 en <1s; Message_Processor consume async. Twilio nunca timeoutea

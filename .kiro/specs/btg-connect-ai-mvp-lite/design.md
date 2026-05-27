@@ -287,8 +287,8 @@ graph TB
 
 ### Principios Arquitectónicos
 
-1. **VPC-first security**: Todas las Lambdas adjuntadas a las subnets privadas (10.0.11.0/24, 10.0.12.0/24) de la VPC `IA-Builder-sandbox-networking`. Ningún componente de cómputo expuesto directamente a internet. Tráfico saliente a través del NAT Gateway en PublicSubnet1.
-2. **Lambda Security Group**: Sin ingress de red (el trigger llega por invocación AWS). Egress TCP 443 a 0.0.0.0/0 únicamente. IDs de VPC y subnets importados del stack `IA-Builder-sandbox-networking` vía `Fn.importValue`.
+1. **Estrategia de red híbrida (VPC solo donde aporta)**: VPC no es seguridad por defecto en serverless — el control de acceso real es IAM. Por eso solo las Lambdas del **dominio bancario** (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) corren en subnets privadas de `IA-Builder-sandbox-networking`. Son las que en EXT-1 se conectarán al core privado. El resto (canal, orquestación, IA, notificaciones, auth) corre **fuera de VPC** en la red managed de Lambda. **No hay NAT Gateway** (`EnableNatGateway=false`).
+2. **Cero salida a internet para el dominio bancario**: Las Lambdas en VPC NO tienen ruta `0.0.0.0/0` — alcanzan servicios AWS solo vía **VPC Endpoints** (Gateway gratis para S3/DynamoDB; Interface para SQS). Esto elimina cualquier ruta de exfiltración: aunque una Lambda bancaria se comprometa, no puede sacar datos a internet. Security Group sin ingress de red, egress 443 solo hacia los endpoints. CloudWatch Logs no requiere endpoint (la plataforma de Lambda los envía, no la ENI).
 3. **Runtime único Python 3.13**: Todas las Lambdas (Webhook_Receiver, Message_Processor, Action Groups, OTP_Service, notificadores, Strands_Agent) corren en Python 3.13. Stack 100% Python por decisión de equipo. boto3 para AWS, `aws-lambda-powertools` para logging/tracing, `twilio` SDK para mensajería.
 4. **Twilio como canal**: Twilio Sandbox recibe y envía mensajes WhatsApp. API Gateway expone el webhook público. Credenciales Twilio en Secrets Manager.
 4a. **Async Webhook Pattern**: Separación estricta `Webhook_Receiver` (sync, latencia <1s, solo valida firma y encola) + `Message_Processor` (async, SQS-triggered, hace todo el trabajo pesado). Twilio nunca espera transcripción ni invocación de Bedrock; recibe 200 OK inmediato. Spike de tráfico es absorbido por la cola, no por throttling de Lambda.
@@ -1645,7 +1645,7 @@ Las Lambdas Python se empaquetan como ZIP y se suben a S3 antes del deploy. El p
 #### IAM Roles (Least Privilege) — CloudFormation
 
 ```yaml
-# Webhook_Receiver Role — minimalista por diseño
+# Webhook_Receiver Role — minimalista, FUERA de VPC (basic execution role)
 WebhookReceiverRole:
   Type: AWS::IAM::Role
   Properties:
@@ -1656,7 +1656,7 @@ WebhookReceiverRole:
           Principal: { Service: lambda.amazonaws.com }
           Action: sts:AssumeRole
     ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
     Policies:
       - PolicyName: webhook-receiver-policy
         PolicyDocument:
@@ -1669,7 +1669,7 @@ WebhookReceiverRole:
               Action: secretsmanager:GetSecretValue
               Resource: !Ref TwilioSecretArn
 
-# Message_Processor Role — el trabajo pesado
+# Message_Processor Role — el trabajo pesado, FUERA de VPC (necesita llamar a Twilio)
 MessageProcessorRole:
   Type: AWS::IAM::Role
   Properties:
@@ -1680,7 +1680,7 @@ MessageProcessorRole:
           Principal: { Service: lambda.amazonaws.com }
           Action: sts:AssumeRole
     ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
     Policies:
       - PolicyName: message-processor-policy
         PolicyDocument:
@@ -1718,7 +1718,11 @@ MessageProcessorRole:
               Resource: !Ref TwilioSecretArn
 ```
 
-> Roles análogos (CloudFormation `AWS::IAM::Role`) para: `Auth_Service` (DynamoDB Auth_Session PutItem), `balance-query` (solo Logs + VPC), `transfer-breb-validate/execute` (solo Logs + VPC, mock inline), `statement-generator` (S3 PutObject + SQS SendMessage a email-queue), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + S3 GetObject + SQS consume), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), y el rol del state machine (Lambda InvokeFunction de las tasks + SQS SendMessage). Todos incluyen `AWSLambdaVPCAccessExecutionRole` para correr en subnets privadas.
+> Roles análogos (CloudFormation `AWS::IAM::Role`) para el resto de Lambdas. La diferencia clave es el managed policy de ejecución según la ubicación de red:
+>
+> - **Fuera de VPC** → `AWSLambdaBasicExecutionRole`: `Auth_Service` (DynamoDB Auth_Session PutItem), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + S3 GetObject + SQS consume), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), `transfer-breb-initiator` (Step Functions StartExecution), `message-handler-notify` (Secrets Twilio)
+> - **Dentro de VPC** → `AWSLambdaVPCAccessExecutionRole` (dominio bancario, subnets privadas): `balance-query` (solo Logs, mock inline), `transfer-breb-validate/execute` (solo Logs, mock inline), `statement-generator` (S3 PutObject vía Gateway Endpoint + SQS SendMessage a email-queue vía Interface Endpoint)
+> - El rol del **state machine** (no es Lambda): Lambda InvokeFunction de las tasks + SQS SendMessage a las colas de notificación.
 
 ## Data Models
 
@@ -2157,7 +2161,8 @@ Properties to implement as PBT (con hypothesis):
 | Test | Tool | What it verifies |
 |------|------|-----------------|
 | Template lint | `cfn-lint` | Sintaxis y best practices de todos los templates YAML |
-| VpcConfig en todas las Lambdas | `cfn-lint` custom rule / pytest sobre template | Todas las Lambdas tienen `VpcConfig` apuntando a subnets privadas IA-Builder |
+| VpcConfig solo en dominio bancario | pytest sobre template | `balance-query`, `transfer-breb-validate/execute`, `statement-generator` tienen `VpcConfig` a subnets privadas; el resto NO tiene VpcConfig |
+| Sin NAT Gateway | pytest sobre template | No existe `AWS::EC2::NatGateway`; subnets privadas sin ruta 0.0.0.0/0; VPC Endpoints presentes (S3, DynamoDB, SQS) |
 | DynamoDB encryption | pytest sobre template | AWS managed keys configuradas |
 | S3 Block Public Access | pytest sobre template | Los 4 settings habilitados en cada bucket |
 | IAM policy scoping | `cfn-nag` / `checkov` | Least privilege por Lambda, sin wildcards peligrosos |

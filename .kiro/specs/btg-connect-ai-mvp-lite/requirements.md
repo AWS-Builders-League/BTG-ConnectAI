@@ -13,7 +13,7 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 **Arquitectura técnica:**
 
-- Serverless (Lambda, DynamoDB, S3) — Lambdas adjuntadas a subnets privadas de la VPC IA-Builder (us-east-1) con salida a internet via NAT Gateway
+- Serverless (Lambda, DynamoDB, S3) — estrategia de red híbrida: solo las Lambdas del dominio bancario corren en subnets privadas de la VPC IA-Builder (us-east-1) con VPC Endpoints (sin NAT, cero salida a internet); el resto corre fuera de VPC, seguro por IAM
 - **Python 3.13 para todas las Lambdas** (negocio y Conversational_Agent con Strands Agent SDK)
 - **CloudFormation puro (YAML)** para IaC — templates anidados siguiendo el patrón del repo `infra` (no se usa CDK ni SAM). Empaquetado de Lambdas vía ZIP a S3 + GitHub Actions con OIDC
 - Twilio (WhatsApp Sandbox) como canal de mensajería
@@ -251,25 +251,32 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 6. IF una llamada entre componentes internos es rechazada por IAM (AccessDeniedException), THEN THE system SHALL registrar el evento en CloudWatch Logs incluyendo el `correlation_id`, el recurso denegado y el timestamp, sin exponer detalles del secreto o la política
 7. THE Statement_Bucket SHALL configurar una lifecycle policy de 1 día para eliminar automáticamente los PDFs de extractos después de su entrega, dado que el documento se envía directamente como adjunto al Bank_Client
 
-### Requisito 15: Infraestructura Serverless con Aislamiento de Red en VPC
+### Requisito 15: Infraestructura Serverless con Estrategia de Red Híbrida
 
-**Historia de Usuario:** Como security architect, quiero que todas las Lambdas corran dentro de la VPC corporativa en subnets privadas, para demostrar un modelo de seguridad de red robusto donde ningún componente de cómputo queda expuesto directamente a internet.
+**Historia de Usuario:** Como solution architect, quiero aplicar VPC solo donde aporta seguridad real (las Lambdas del dominio bancario que mañana se conectan al core privado), y dejar fuera de VPC las Lambdas de canal/orquestación que solo consumen APIs públicas (Twilio, Bedrock, Pinpoint, SES), para no sobre-arquitectar, evitar el NAT Gateway, y mantener una postura de seguridad fuerte sin fricción innecesaria.
 
-**Contexto de red de la cuenta:** La cuenta AWS sandbox tiene desplegado el stack `IA-Builder-sandbox-networking` (región us-east-1, CIDR 10.0.0.0/16) con dos subnets privadas disponibles (10.0.11.0/24 en us-east-1a y 10.0.12.0/24 en us-east-1b). El stack de IaC de red incluye un NAT Gateway en PublicSubnet1 para dar salida a internet a las subnets privadas, necesario para que las Lambdas alcancen servicios externos (Twilio) y servicios AWS (Bedrock, Transcribe, Pinpoint, SES).
+**Contexto de red de la cuenta:** La cuenta AWS sandbox tiene desplegado el stack `IA-Builder-sandbox-networking` (región us-east-1, CIDR 10.0.0.0/16) con dos subnets privadas disponibles (10.0.11.0/24 en us-east-1a y 10.0.12.0/24 en us-east-1b). **El NAT Gateway NO se usa en este proyecto** (`EnableNatGateway=false`): las Lambdas del dominio bancario no tienen salida a internet — alcanzan servicios AWS exclusivamente vía VPC Endpoints, lo que garantiza cero exfiltración posible.
+
+**Estrategia de ubicación de Lambdas:**
+
+- **Fuera de VPC** (red managed de Lambda, acceso a internet + APIs AWS públicas, control de acceso por IAM): `Webhook_Receiver`, `Message_Processor`, `message_handler_notify`, `ai_agent`, `auth_service`, `otp_service`, `email_service`, `sms_service`, `transfer_breb_initiator`. Estas necesitan internet (Twilio) o solo APIs AWS públicas.
+- **Dentro de VPC** (subnets privadas, sin NAT, sin salida a internet, solo VPC Endpoints): `balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`. Son el dominio bancario — las que en EXT-1 se conectarán al core real vía PrivateLink.
 
 #### Criterios de Aceptación
 
-1. THE system SHALL configurar todas las funciones Lambda con `VpcConfig` adjuntándolas a las subnets privadas (`PrivateSubnet1Id`, `PrivateSubnet2Id`) de la VPC `IA-Builder-sandbox-networking`, importando los IDs en los templates de CloudFormation vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds`
-2. THE system SHALL crear un Security Group dedicado para las Lambdas de aplicación con: cero reglas de ingress de red (el tráfico de entrada llega por invocación AWS, no por red) y egress TCP 443 (HTTPS) a 0.0.0.0/0 para salida a servicios AWS y Twilio
-3. THE system SHALL usar IAM roles y policies como mecanismo de control de acceso entre las Lambdas y los servicios AWS consumidos (DynamoDB, S3, Secrets Manager, CloudWatch Logs, Amazon Bedrock, Amazon Transcribe, Pinpoint, SES)
-4. THE system SHALL desplegarse usando templates de CloudFormation (YAML) con todas las Lambdas en runtime Python 3.13, en la región us-east-1, siguiendo el patrón de nested stacks del repo `infra` (templates en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`)
-5. THE system SHALL exponer un Amazon API Gateway (HTTP API) público con una ruta POST `/webhook/twilio` que reciba los webhooks de Twilio y active el Webhook_Receiver. La URL del endpoint SHALL configurarse como webhook en la cuenta Twilio Sandbox
-6. THE system SHALL almacenar las credenciales de Twilio (Account SID, Auth Token, número de origen) en AWS Secrets Manager y no hardcodearlas en el código
-7. WHEN se despliega la infraestructura, THE system SHALL importar el `VpcId` del stack de red vía `Fn::ImportValue: IA-Builder-sandbox-networking-VpcId` para crear el Security Group de Lambdas en la VPC correcta
-8. THE system SHALL empaquetar el código de cada Lambda Python (con sus dependencias pip) como ZIP, subirlo a S3, y referenciarlo en el template vía `Code: { S3Bucket, S3Key }`. Las dependencias compartidas (boto3 viene en runtime; aws-lambda-powertools, twilio, strands-agents) SHALL empaquetarse vía Lambda Layers donde sea conveniente
-9. THE system SHALL crear una cola SQS FIFO `inbound-messages-queue.fifo` con `ContentBasedDeduplication=false` (la dedup se hace explícitamente por `MessageDeduplicationId`), `VisibilityTimeout=130s`, `MessageRetentionPeriod=1d`, encryption SSE-SQS, DLQ `inbound-messages-dlq.fifo` y `maxReceiveCount=3`
-10. THE Webhook_Receiver Lambda SHALL configurarse con timeout máximo de 10 segundos (en la práctica resuelve en <1s) y memory 256MB. NO requiere acceso a DynamoDB, Bedrock, Transcribe, S3 ni Twilio REST API — solo SQS SendMessage y Secrets Manager GetSecretValue
-11. THE Message_Processor Lambda SHALL configurarse con SQS Event Source Mapping sobre `inbound-messages-queue.fifo` con `batchSize=1`, `reportBatchItemFailures=true`, timeout 120s y memory 512MB
+1. THE system SHALL configurar con `VpcConfig` (subnets privadas + Security Group dedicado) ÚNICAMENTE las Lambdas del dominio bancario: `balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`, importando los subnet IDs vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds`
+2. THE system SHALL desplegar las Lambdas de canal/orquestación/notificaciones SIN `VpcConfig` (red managed de Lambda), accediendo a internet (Twilio) y a APIs AWS públicas con control de acceso por IAM. Esto elimina la necesidad del NAT Gateway
+3. THE system SHALL proveer acceso a servicios AWS desde las Lambdas en VPC mediante VPC Endpoints: Gateway Endpoints para S3 y DynamoDB (sin costo), e Interface Endpoint para SQS (requerido por `statement_generator` para publicar a `email-notification-queue`). Las subnets privadas NO SHALL tener ruta `0.0.0.0/0` (cero salida a internet)
+4. THE system SHALL crear un Security Group dedicado para las Lambdas en VPC con: cero reglas de ingress de red y egress TCP 443 (HTTPS) hacia los VPC Endpoints. CloudWatch Logs NO requiere endpoint (Lambda envía logs por la plataforma, no por la ENI)
+5. THE system SHALL usar IAM roles y policies como mecanismo principal de control de acceso entre las Lambdas y los servicios AWS consumidos
+6. THE system SHALL desplegarse usando templates de CloudFormation (YAML) con todas las Lambdas en runtime Python 3.13, en la región us-east-1, siguiendo el patrón de nested stacks del repo `infra` (templates en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`)
+7. THE system SHALL exponer un Amazon API Gateway (HTTP API) público con una ruta POST `/webhook/twilio` que reciba los webhooks de Twilio y active el Webhook_Receiver. La URL del endpoint SHALL configurarse como webhook en la cuenta Twilio Sandbox
+8. THE system SHALL almacenar las credenciales de Twilio (Account SID, Auth Token, número de origen) en AWS Secrets Manager y no hardcodearlas en el código
+9. WHEN se crean los VPC Endpoints y el Security Group, THE system SHALL importar el `VpcId` y el `PrivateRouteTableId` del stack de red vía `Fn::ImportValue` (`IA-Builder-sandbox-networking-VpcId`, `IA-Builder-sandbox-networking-PrivateRouteTableId`)
+10. THE system SHALL empaquetar el código de cada Lambda Python (con sus dependencias pip) como ZIP, subirlo a S3, y referenciarlo en el template vía `Code: { S3Bucket, S3Key }`. Las dependencias compartidas (boto3 viene en runtime; aws-lambda-powertools, twilio, strands-agents) SHALL empaquetarse vía Lambda Layers donde sea conveniente
+11. THE system SHALL crear una cola SQS FIFO `inbound-messages-queue.fifo` con `ContentBasedDeduplication=false` (la dedup se hace explícitamente por `MessageDeduplicationId`), `VisibilityTimeout=130s`, `MessageRetentionPeriod=1d`, encryption SSE-SQS, DLQ `inbound-messages-dlq.fifo` y `maxReceiveCount=3`
+12. THE Webhook_Receiver Lambda SHALL configurarse con timeout máximo de 10 segundos (en la práctica resuelve en <1s) y memory 256MB, SIN VpcConfig. Solo requiere SQS SendMessage y Secrets Manager GetSecretValue
+13. THE Message_Processor Lambda SHALL configurarse SIN VpcConfig (necesita llamar a Twilio), con SQS Event Source Mapping sobre `inbound-messages-queue.fifo` con `batchSize=1`, `reportBatchItemFailures=true`, timeout 120s y memory 512MB
 
 ### Requisito 16: Autorización OTP con Patrón Task Token
 
@@ -327,7 +334,7 @@ Esta sección documenta el camino claro desde MVP Lite hacia producción.
 
 **Trigger:** Cuando se reemplace el Mock_Core con el API real del core bancario de BTG Pactual.
 
-**Path:** La VPC IA-Builder (10.0.0.0/16, us-east-1) ya existe en la cuenta sandbox con subnets privadas listas (10.0.11.0/24 y 10.0.12.0/24). El path requiere: agregar NAT Gateway (o VPC Endpoints para DynamoDB, S3, Bedrock, Transcribe) para dar salida a internet a las subnets privadas, adjuntar las Lambdas a esas subnets, agregar security groups de aplicación, y establecer conectividad privada al core bancario. Reemplazar datos mock con llamadas reales.
+**Path:** Las Lambdas del dominio bancario (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) ya corren en las subnets privadas de la VPC IA-Builder (10.0.11.0/24, 10.0.12.0/24) sin salida a internet — exactamente donde deben estar para conectarse al core. El path requiere: establecer conectividad privada al core bancario de BTG (PrivateLink o VPN site-to-site), reemplazar el Mock_Core por llamadas reales al API del core, y agregar el VPC Endpoint correspondiente si el core se expone como servicio AWS. No se requiere NAT Gateway — el tráfico al core es privado, no por internet.
 
 ### EXT-2: Autenticación con Proveedor de Identidad Real
 
