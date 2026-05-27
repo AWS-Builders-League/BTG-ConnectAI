@@ -8,9 +8,9 @@ BTG ConnectAI MVP Lite es un asistente bancario conversacional serverless que co
 
 | Decisión | Elección | Razón |
 | -------- | -------- | ----- |
-| Runtime (negocio) | TypeScript (Node.js 24.x) | Tipado fuerte, cold start rápido, Powertools nativo |
-| Runtime (IA) | Python 3.12 | Strands Agent SDK disponible y maduro en Python |
-| IaC | AWS CDK (TypeScript) | Mismo lenguaje que Lambdas de negocio, L2 constructs |
+| Runtime (todas las Lambdas) | Python 3.13 | Decisión de equipo: stack 100% Python. Strands SDK nativo, boto3, aws-lambda-powertools |
+| IaC | CloudFormation puro (YAML) | Mismo patrón que el repo `infra` (networking). Nested stacks, deploy via GitHub Actions + OIDC. Sin CDK ni SAM |
+| Empaquetado Lambda | ZIP a S3 + Lambda Layers | CloudFormation `Code: {S3Bucket, S3Key}`. Dependencias pip en Layers compartidos |
 | AI Engine | Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) | Framework open-source AWS sobre Bedrock; control de orquestación, herramientas y memoria de sesión |
 | Canal WhatsApp | Twilio (WhatsApp Sandbox) | Onboarding rápido sin aprobación Meta, webhooks REST simples |
 | Entrada HTTP | Amazon API Gateway (HTTP API) | Endpoint público expuesto a Twilio; bajo costo, sin servidor |
@@ -158,18 +158,18 @@ graph TB
 
     subgraph "Sync Ingestion - latencia < 1s"
         APIGW[API Gateway - POST /webhook/twilio]
-        WHR[Webhook_Receiver Lambda - Node.js 24]
+        WHR[Webhook_Receiver Lambda - Python 3.13]
         SQS_IN[SQS FIFO - inbound-messages-queue<br/>MessageGroupId=phoneNumber<br/>MessageDeduplicationId=MessageSid]
     end
 
     subgraph "Async Processing - sin presión de tiempo"
-        MP[Message_Processor Lambda - Node.js 24]
+        MP[Message_Processor Lambda - Python 3.13]
         DDB_CONSENT[DynamoDB - Consent_Store]
     end
 
     subgraph "Authentication Layer"
         LP[Login_Page - S3 Static Site]
-        AS[Auth_Service Lambda - Node.js 24]
+        AS[Auth_Service Lambda - Python 3.13]
         DDB_AUTH[DynamoDB - Auth_Session]
     end
 
@@ -178,14 +178,14 @@ graph TB
     end
 
     subgraph "AI Layer"
-        SA[Strands_Agent Lambda - Python 3.12]
+        SA[Strands_Agent Lambda - Python 3.13]
         FM[Bedrock Agent Core - Claude Haiku 3.5]
         GR[Bedrock Guardrails]
     end
 
     subgraph "Action Groups - Tools del Strands Agent"
-        AG_BAL[balance-query Lambda - Node.js 24]
-        AG_STM[statement-generator Lambda - Node.js 24]
+        AG_BAL[balance-query Lambda - Python 3.13]
+        AG_STM[statement-generator Lambda - Python 3.13]
         AG_TRF_START[transfer-breb-initiator Lambda]
     end
 
@@ -196,7 +196,7 @@ graph TB
     end
 
     subgraph "OTP Service"
-        OTP[OTP_Service Lambda - Node.js 24]
+        OTP[OTP_Service Lambda - Python 3.13]
         PINPOINT[AWS Pinpoint - SMS]
         DDB_OTP[DynamoDB - OTP Store + TaskToken]
     end
@@ -289,14 +289,14 @@ graph TB
 
 1. **VPC-first security**: Todas las Lambdas adjuntadas a las subnets privadas (10.0.11.0/24, 10.0.12.0/24) de la VPC `IA-Builder-sandbox-networking`. Ningún componente de cómputo expuesto directamente a internet. Tráfico saliente a través del NAT Gateway en PublicSubnet1.
 2. **Lambda Security Group**: Sin ingress de red (el trigger llega por invocación AWS). Egress TCP 443 a 0.0.0.0/0 únicamente. IDs de VPC y subnets importados del stack `IA-Builder-sandbox-networking` vía `Fn.importValue`.
-3. **Runtime mixto**: Node.js 24.x para Lambdas de negocio (Message_Handler, Action Groups, OTP_Service, Email_Service); Python 3.12 exclusivamente para Strands_Agent (IA).
+3. **Runtime único Python 3.13**: Todas las Lambdas (Webhook_Receiver, Message_Processor, Action Groups, OTP_Service, notificadores, Strands_Agent) corren en Python 3.13. Stack 100% Python por decisión de equipo. boto3 para AWS, `aws-lambda-powertools` para logging/tracing, `twilio` SDK para mensajería.
 4. **Twilio como canal**: Twilio Sandbox recibe y envía mensajes WhatsApp. API Gateway expone el webhook público. Credenciales Twilio en Secrets Manager.
 4a. **Async Webhook Pattern**: Separación estricta `Webhook_Receiver` (sync, latencia <1s, solo valida firma y encola) + `Message_Processor` (async, SQS-triggered, hace todo el trabajo pesado). Twilio nunca espera transcripción ni invocación de Bedrock; recibe 200 OK inmediato. Spike de tráfico es absorbido por la cola, no por throttling de Lambda.
 4b. **SQS FIFO para mensajes entrantes**: `inbound-messages-queue.fifo` con `MessageGroupId=phoneNumber` (garantiza orden por cliente) y `MessageDeduplicationId=MessageSid` (dedup automática de retries de Twilio en ventana de 5 min — elimina necesidad de tabla Dedup custom). `batchSize=1` porque cada mensaje es una interacción crítica.
 5. **Strands + Bedrock Agent Core**: El Conversational_Agent usa Strands Agent SDK (Python) sobre Bedrock Agent Core (Claude Haiku 3.5). Strands maneja orquestación de herramientas y memoria de sesión.
 6. **Step Functions para transacciones distribuidas**: El flujo de transferencia BRE-B (validar → OTP → esperar callback → ejecutar → notificar) corre como state machine de AWS Step Functions usando el patrón `waitForTaskToken`. Esto resuelve el problema de "esperar input asíncrono del cliente" sin bloquear Lambdas y provee manejo nativo de timeouts, reintentos y compensación.
 7. **Event-Driven Async Notifications**: Email y SMS de confirmación se publican como eventos a SQS (`email-notification-queue`, `sms-notification-queue`). Las Lambdas consumidoras (`Email_Service`, `SMS_Service`) procesan en batch. El flujo principal no espera respuesta del envío — fire-and-forget total. Esto desacopla productores de consumidores y permite reintentos automáticos con DLQ.
-8. **OTP con Task Token**: El OTP_Service no "espera" al usuario. Step Functions pausa la ejecución con `waitForTaskToken`, almacenando el token en DynamoDB junto al OTP. Cuando el cliente responde con el código, el Message_Handler lo valida y llama `SendTaskSuccess`/`SendTaskFailure` para resumir el workflow.
+8. **OTP con Task Token**: El OTP_Service no "espera" al usuario. Step Functions pausa la ejecución con `waitForTaskToken`, almacenando el token en DynamoDB junto al OTP. Cuando el cliente responde con el código, el Message_Processor lo valida y llama `SendTaskSuccess`/`SendTaskFailure` para resumir el workflow.
 9. **Consent-First**: Ningún servicio se ejecuta sin consentimiento previo registrado en Consent_Store.
 10. **Auth-Before-Action**: Operaciones bancarias requieren Auth_Session activa (TTL 30min).
 11. **Mock Data Inline**: Datos bancarios sintéticos hardcodeados en las Lambdas de Action Groups para el demo.
@@ -309,7 +309,7 @@ graph TB
 
 **Responsabilidad:** Punto de entrada SÍNCRONO del sistema. Su única misión es responder a Twilio en menos de un segundo. No hace negocio — valida la firma, parsea el payload y lo encola en SQS FIFO. Toda la lógica pesada se delega al Message_Processor de forma asíncrona.
 
-**Runtime:** Node.js 24.x (TypeScript)
+**Runtime:** Python 3.13
 **Memory:** 256 MB
 **Timeout:** 10 seconds (en práctica resuelve en <1s)
 **Trigger:** Amazon API Gateway (HTTP API — POST /webhook/twilio)
@@ -317,34 +317,53 @@ graph TB
 
 #### Lógica del Webhook_Receiver
 
-```typescript
-import { validateRequest } from "twilio";
+```python
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import parse_qs
 
-export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
-  const correlationId = uuidv4();
-  logger.appendKeys({ correlationId });
+import boto3
+from aws_lambda_powertools import Logger
+from twilio.request_validator import RequestValidator
 
-  // 1. Validar firma X-Twilio-Signature (defensa contra requests no autorizados)
-  const signature = event.headers["x-twilio-signature"];
-  const url = `https://${event.requestContext.domainName}${event.rawPath}`;
-  const params = parseFormUrlencoded(event.body!);
+logger = Logger(service="webhook-receiver")
+sqs = boto3.client("sqs")
 
-  if (!validateRequest(TWILIO_AUTH_TOKEN, signature!, url, params)) {
-    logger.warn("Invalid Twilio signature, rejecting");
-    return { statusCode: 403, body: "" };
-  }
+INBOUND_QUEUE_URL = os.environ["INBOUND_QUEUE_URL"]
+TWILIO_AUTH_TOKEN = _load_twilio_auth_token()  # desde Secrets Manager, cacheado en cold start
 
-  // 2. Encolar en SQS FIFO — dedup automática por MessageSid
-  await sqsClient.send(new SendMessageCommand({
-    QueueUrl: INBOUND_MESSAGES_QUEUE_URL,
-    MessageBody: JSON.stringify({ ...params, correlationId, receivedAt: new Date().toISOString() }),
-    MessageGroupId: params.From,                    // Orden por cliente
-    MessageDeduplicationId: params.MessageSid,      // Dedup gratis 5 min
-  }));
 
-  // 3. 200 OK inmediato — Twilio happy
-  return { statusCode: 200, body: "" };
-};
+@logger.inject_lambda_context
+def handler(event: dict, context) -> dict:
+    correlation_id = str(uuid.uuid4())
+    logger.append_keys(correlation_id=correlation_id)
+
+    # 1. Validar firma X-Twilio-Signature (defensa contra requests no autorizados)
+    signature = event["headers"].get("x-twilio-signature", "")
+    url = f"https://{event['requestContext']['domainName']}{event['rawPath']}"
+    params = {k: v[0] for k, v in parse_qs(event.get("body", "")).items()}
+
+    validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    if not validator.validate(url, params, signature):
+        logger.warning("Invalid Twilio signature, rejecting")
+        return {"statusCode": 403, "body": ""}
+
+    # 2. Encolar en SQS FIFO — dedup automática por MessageSid
+    sqs.send_message(
+        QueueUrl=INBOUND_QUEUE_URL,
+        MessageBody=json.dumps({
+            **params,
+            "correlationId": correlation_id,
+            "receivedAt": datetime.now(timezone.utc).isoformat(),
+        }),
+        MessageGroupId=params["From"],              # Orden por cliente
+        MessageDeduplicationId=params["MessageSid"],  # Dedup gratis 5 min
+    )
+
+    # 3. 200 OK inmediato — Twilio happy
+    return {"statusCode": 200, "body": ""}
 ```
 
 #### IAM Role del Webhook_Receiver
@@ -361,7 +380,7 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
 
 **Responsabilidad:** Hace TODO el trabajo pesado de procesar un mensaje entrante: valida consentimiento, transcribe audio, valida sesión de autenticación, maneja callbacks de OTP, invoca al Strands_Agent y envía la respuesta al cliente vía Twilio REST API. Se ejecuta de forma asíncrona triggered por SQS — sin presión de tiempo del lado de Twilio.
 
-**Runtime:** Node.js 24.x (TypeScript)
+**Runtime:** Python 3.13
 **Memory:** 512 MB
 **Timeout:** 120 seconds (suficiente para transcripción + Strands Agent + envío respuesta)
 **Trigger:** SQS Event Source Mapping sobre `inbound-messages-queue.fifo`
@@ -370,310 +389,256 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
 
 #### Interface de Entrada (SQS Event)
 
-```typescript
-// Payload que Twilio envía como form-urlencoded al webhook
-interface TwilioWebhookPayload {
-  MessageSid: string;        // ID único del mensaje (usado para dedup)
-  From: string;              // "whatsapp:+57300XXXXXXX"
-  To: string;                // "whatsapp:+14155XXXXXXX" (número Twilio)
-  Body: string;              // Texto del mensaje (vacío si es media)
-  NumMedia: string;          // "0" | "1" | ...
-  MediaUrl0?: string;        // URL del audio/imagen si NumMedia > 0
-  MediaContentType0?: string; // "audio/ogg" | "image/jpeg" | ...
-  ButtonPayload?: string;    // Payload del botón de respuesta rápida
-  ProfileName?: string;      // Nombre de perfil de WhatsApp del cliente
-}
+```python
+from typing import TypedDict, NotRequired
+
+# Payload que Twilio envía como form-urlencoded al webhook,
+# re-empaquetado como JSON por el Webhook_Receiver al encolar en SQS
+class TwilioWebhookPayload(TypedDict):
+    MessageSid: str                       # ID único del mensaje (usado para dedup)
+    From: str                             # "whatsapp:+57300XXXXXXX"
+    To: str                               # "whatsapp:+14155XXXXXXX" (número Twilio)
+    Body: str                             # Texto del mensaje (vacío si es media)
+    NumMedia: str                         # "0" | "1" | ...
+    MediaUrl0: NotRequired[str]           # URL del audio/imagen si NumMedia > 0
+    MediaContentType0: NotRequired[str]   # "audio/ogg" | "image/jpeg" | ...
+    ButtonPayload: NotRequired[str]       # Payload del botón de respuesta rápida
+    ProfileName: NotRequired[str]         # Nombre de perfil de WhatsApp del cliente
+    correlationId: str                    # Inyectado por el Webhook_Receiver
 ```
 
 #### Lógica Principal
 
-```typescript
-import { SQSEvent, SQSBatchResponse, SQSBatchItemFailure } from "aws-lambda";
+```python
+import json
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.utilities.batch import BatchProcessor, EventType, process_partial_response
 
-// El Processor recibe un SQSEvent (con batchSize=1, será un solo record por invocación)
-async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
-  const batchItemFailures: SQSBatchItemFailure[] = [];
+logger = Logger(service="message-processor")
+processor = BatchProcessor(event_type=EventType.SQS)
 
-  for (const record of event.Records) {
-    try {
-      const payload = JSON.parse(record.body) as TwilioWebhookPayload & { correlationId: string };
-      logger.appendKeys({ correlationId: payload.correlationId });
 
-      const phoneNumber = payload.From.replace("whatsapp:", ""); // E.164
+def record_handler(record) -> None:
+    """Procesa un único mensaje SQS. Si lanza excepción, Powertools lo reporta
+    como batchItemFailure para que SQS lo reintente individualmente."""
+    payload: TwilioWebhookPayload = json.loads(record["body"])
+    logger.append_keys(correlation_id=payload["correlationId"])
 
-      // 1. OTP callback prioritario — si hay OTP pendiente, no llamamos al agente
-      const pendingOTP = await getPendingOTP(phoneNumber);
-      if (pendingOTP) {
-        await handleOTPCallback(phoneNumber, payload.Body, pendingOTP);
-        continue;
-      }
+    phone_number = payload["From"].replace("whatsapp:", "")  # E.164
 
-      // 2. Verificar consentimiento
-      const consent = await getConsent(phoneNumber);
-      if (!consent?.accepted) {
-        await handleConsentFlow(payload, consent, phoneNumber);
-        continue;
-      }
+    # 1. OTP callback prioritario — si hay OTP pendiente, no llamamos al agente
+    pending_otp = get_pending_otp(phone_number)
+    if pending_otp:
+        handle_otp_callback(phone_number, payload.get("Body", ""), pending_otp)
+        return
 
-      // 3. Determinar tipo de mensaje y extraer texto
-      let inputText: string;
-      if (payload.ButtonPayload) {
-        inputText = payload.ButtonPayload;
-      } else if (payload.NumMedia !== "0" && payload.MediaContentType0?.startsWith("audio/")) {
-        inputText = await transcribeAudio(payload.MediaUrl0!, phoneNumber);
-        if (!inputText) {
-          await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.transcriptionFailed);
-          continue;
-        }
-      } else if (payload.Body?.trim()) {
-        inputText = payload.Body.trim();
-      } else {
-        await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.unsupportedFormat);
-        continue;
-      }
+    # 2. Verificar consentimiento
+    consent = get_consent(phone_number)
+    if not consent or not consent.get("accepted"):
+        handle_consent_flow(payload, consent, phone_number)
+        return
 
-      // 4. Verificar Auth_Session
-      const authSession = await getAuthSession(phoneNumber);
-      if (!authSession || isExpired(authSession)) {
-        await storePendingRequest(phoneNumber, inputText);
-        await sendLoginLink(phoneNumber);
-        continue;
-      }
+    # 3. Determinar tipo de mensaje y extraer texto
+    if payload.get("ButtonPayload"):
+        input_text = payload["ButtonPayload"]
+    elif payload.get("NumMedia", "0") != "0" and payload.get("MediaContentType0", "").startswith("audio/"):
+        input_text = transcribe_audio(payload["MediaUrl0"], phone_number)
+        if not input_text:
+            send_twilio_message(phone_number, ERROR_MESSAGES["transcription_failed"])
+            return
+    elif payload.get("Body", "").strip():
+        input_text = payload["Body"].strip()
+    else:
+        send_twilio_message(phone_number, ERROR_MESSAGES["unsupported_format"])
+        return
 
-      // 5. Invocar Strands_Agent
-      const sessionId = deriveSessionId(phoneNumber);
-      const response = await invokeStrandsAgent(sessionId, inputText, phoneNumber);
+    # 4. Verificar Auth_Session
+    auth_session = get_auth_session(phone_number)
+    if not auth_session or is_expired(auth_session):
+        store_pending_request(phone_number, input_text)
+        send_login_link(phone_number)
+        return
 
-      // 6. Si la respuesta incluye un PDF (extracto), enviarlo como media adjunta
-      const statementInfo = extractStatementInfo(response);
-      if (statementInfo) {
-        await sendTwilioDocument(phoneNumber, statementInfo.s3Bucket, statementInfo.s3Key);
-      }
+    # 5. Invocar Strands_Agent
+    session_id = derive_session_id(phone_number)
+    response = invoke_strands_agent(session_id, input_text, phone_number)
 
-      // 7. Enviar respuesta de texto (split si > 1600 chars)
-      const textResponse = removeStatementMetadata(response);
-      if (textResponse.trim()) {
-        await sendTwilioMessage(phoneNumber, textResponse);
-      }
-    } catch (error) {
-      // Reportar solo este mensaje como fallido — SQS lo reintentará individualmente
-      logger.error("Failed to process message", { error, messageId: record.messageId });
-      batchItemFailures.push({ itemIdentifier: record.messageId });
-    }
-  }
+    # 6. Si la respuesta incluye un PDF (extracto), enviarlo como media adjunta
+    statement_info = extract_statement_info(response)
+    if statement_info:
+        send_twilio_document(phone_number, statement_info["s3_bucket"], statement_info["s3_key"])
 
-  return { batchItemFailures };
+    # 7. Enviar respuesta de texto (split si > 1600 chars)
+    text_response = remove_statement_metadata(response)
+    if text_response.strip():
+        send_twilio_message(phone_number, text_response)
 
-  return { statusCode: 200, body: "" };
-}
+
+@logger.inject_lambda_context
+def handler(event: dict, context):
+    # batchSize=1, pero process_partial_response soporta cualquier tamaño con reportBatchItemFailures
+    return process_partial_response(
+        event=event,
+        record_handler=record_handler,
+        processor=processor,
+        context=context,
+    )
 ```
 
 #### Flujo de Consentimiento
 
-```typescript
-async function handleConsentFlow(
-  payload: TwilioWebhookPayload,
-  consent: ConsentRecord | null,
-  phoneNumber: string
-): Promise<void> {
-  // Respuesta a botón de T&C (Twilio envía el payload del botón en ButtonPayload)
-  if (payload.ButtonPayload === "accept_tc") {
-    await storeConsent(phoneNumber, "accepted");
-    await sendWelcomeMessage(phoneNumber);
-    return;
-  }
+```python
+def handle_consent_flow(payload: TwilioWebhookPayload, consent: dict | None, phone_number: str) -> None:
+    # Respuesta a botón de T&C (Twilio envía el payload del botón en ButtonPayload)
+    if payload.get("ButtonPayload") == "accept_tc":
+        store_consent(phone_number, "accepted")
+        send_welcome_message(phone_number)
+        return
 
-  if (payload.ButtonPayload === "reject_tc") {
-    await storeConsent(phoneNumber, "rejected");
-    await sendTwilioMessage(phoneNumber, ERROR_MESSAGES.consentRequired);
-    return;
-  }
+    if payload.get("ButtonPayload") == "reject_tc":
+        store_consent(phone_number, "rejected")
+        send_twilio_message(phone_number, ERROR_MESSAGES["consent_required"])
+        return
 
-  // Primer mensaje sin consentimiento — enviar T&C con botones de acción rápida (Twilio)
-  await sendTermsAndConditionsMessage(phoneNumber);
-}
+    # Primer mensaje sin consentimiento — enviar T&C con botones de acción rápida (Twilio)
+    send_terms_and_conditions_message(phone_number)
 
-async function sendTermsAndConditionsMessage(phoneNumber: string): Promise<void> {
-  // Twilio soporta botones de respuesta rápida via Content Templates o mensaje con lista
-  await twilioClient.messages.create({
-    from: `whatsapp:${TWILIO_NUMBER}`,
-    to: `whatsapp:${phoneNumber}`,
-    body: "Bienvenido a BTG ConnectAI. Para usar nuestros servicios acepta los Términos y Condiciones: https://btgpactual.com.co/terminos",
-    // Botones de respuesta rápida via Twilio Content API template
-    contentSid: TWILIO_TC_TEMPLATE_SID,
-    contentVariables: JSON.stringify({ phoneNumber }),
-  });
-}
+
+def send_terms_and_conditions_message(phone_number: str) -> None:
+    # Twilio soporta botones de respuesta rápida via Content Templates
+    twilio_client.messages.create(
+        from_=f"whatsapp:{TWILIO_NUMBER}",
+        to=f"whatsapp:{phone_number}",
+        content_sid=TWILIO_TC_TEMPLATE_SID,
+        content_variables=json.dumps({"phoneNumber": phone_number}),
+    )
 ```
 
 #### Transcripción de Audio
 
-```typescript
-async function transcribeAudio(mediaUrl: string, phoneNumber: string): Promise<string | null> {
-  try {
-    // 1. Descargar audio desde Twilio Media URL (requiere autenticación Twilio)
-    const audioBuffer = await downloadTwilioMedia(mediaUrl);
+```python
+def transcribe_audio(media_url: str, phone_number: str) -> str | None:
+    try:
+        # 1. Descargar audio desde Twilio Media URL (requiere auth Twilio)
+        audio_bytes = download_twilio_media(media_url)
 
-    // 2. Subir a S3 temporal para Transcribe
-    const s3Key = `audio-temp/${uuidv4()}.ogg`;
-    await s3Client.send(new PutObjectCommand({
-      Bucket: AUDIO_TEMP_BUCKET,
-      Key: s3Key,
-      Body: audioBuffer,
-      ContentType: "audio/ogg",
-    }));
+        # 2. Subir a S3 temporal para Transcribe
+        s3_key = f"audio-temp/{uuid.uuid4()}.ogg"
+        s3.put_object(Bucket=AUDIO_TEMP_BUCKET, Key=s3_key, Body=audio_bytes, ContentType="audio/ogg")
 
-    // 3. Iniciar transcripción
-    const jobName = `btg-connectai-${uuidv4()}`;
-    await transcribeClient.send(new StartTranscriptionJobCommand({
-      TranscriptionJobName: jobName,
-      LanguageCode: "es-CO",
-      MediaFormat: "ogg",
-      Media: { MediaFileUri: `s3://${AUDIO_TEMP_BUCKET}/${s3Key}` },
-      OutputBucketName: AUDIO_TEMP_BUCKET,
-      OutputKey: `transcriptions/${jobName}.json`,
-    }));
+        # 3. Iniciar transcripción
+        job_name = f"btg-connectai-{uuid.uuid4()}"
+        transcribe.start_transcription_job(
+            TranscriptionJobName=job_name,
+            LanguageCode="es-CO",
+            MediaFormat="ogg",
+            Media={"MediaFileUri": f"s3://{AUDIO_TEMP_BUCKET}/{s3_key}"},
+            OutputBucketName=AUDIO_TEMP_BUCKET,
+            OutputKey=f"transcriptions/{job_name}.json",
+        )
 
-    // 4. Polling hasta completar (max 10s)
-    const transcript = await waitForTranscription(jobName, 10_000);
+        # 4. Polling hasta completar (sin presión de tiempo gracias al async; max 30s)
+        transcript = wait_for_transcription(job_name, timeout_seconds=30)
 
-    // 5. Limpiar archivos temporales
-    await cleanupTempFiles(s3Key, `transcriptions/${jobName}.json`);
-
-    return transcript;
-  } catch (error) {
-    logger.error("Audio transcription failed", { error });
-    return null;
-  }
-}
+        # 5. Limpiar archivos temporales
+        cleanup_temp_files(s3_key, f"transcriptions/{job_name}.json")
+        return transcript
+    except Exception:
+        logger.exception("Audio transcription failed")
+        return None
 ```
 
 #### Envío de Enlace de Login
 
-```typescript
-async function sendLoginLink(phoneNumber: string): Promise<void> {
-  const callbackToken = generateCallbackToken(phoneNumber);
-  const loginUrl = `${LOGIN_PAGE_URL}?phone=${encodeURIComponent(phoneNumber)}&token=${callbackToken}`;
+```python
+def send_login_link(phone_number: str) -> None:
+    callback_token = generate_callback_token(phone_number)
+    login_url = f"{LOGIN_PAGE_URL}?phone={quote(phone_number)}&token={callback_token}"
 
-  await twilioClient.messages.create({
-    from: `whatsapp:${TWILIO_NUMBER}`,
-    to: `whatsapp:${phoneNumber}`,
-    body: `🔐 Para ejecutar operaciones bancarias necesitas autenticarte.\n\nInicia sesión aquí: ${loginUrl}\n\nEl enlace es válido por 10 minutos.`,
-  });
-}
+    twilio_client.messages.create(
+        from_=f"whatsapp:{TWILIO_NUMBER}",
+        to=f"whatsapp:{phone_number}",
+        body=(
+            "🔐 Para ejecutar operaciones bancarias necesitas autenticarte.\n\n"
+            f"Inicia sesión aquí: {login_url}\n\nEl enlace es válido por 10 minutos."
+        ),
+    )
 ```
 
-#### Deduplicación
-
-```typescript
-async function checkAndStoreDeduplicate(messageId: string): Promise<boolean> {
-  try {
-    await dynamoClient.send(new PutItemCommand({
-      TableName: DEDUP_TABLE,
-      Item: {
-        pk: { S: messageId },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 600) }, // 10 min TTL
-        createdAt: { S: new Date().toISOString() },
-      },
-      ConditionExpression: "attribute_not_exists(pk)",
-    }));
-    return false;
-  } catch (error) {
-    if (error instanceof ConditionalCheckFailedException) {
-      return true;
-    }
-    throw error;
-  }
-}
-```
+> **Deduplicación**: ya NO existe función custom. SQS FIFO descarta duplicados por `MessageDeduplicationId = MessageSid` en ventana de 5 minutos. Ver decisiones arquitectónicas.
 
 #### Invocación del Strands_Agent Lambda
 
-```typescript
-async function invokeStrandsAgent(
-  sessionId: string,
-  inputText: string,
-  phoneNumber: string
-): Promise<string> {
-  const response = await lambdaClient.send(new InvokeCommand({
-    FunctionName: STRANDS_AGENT_LAMBDA_ARN,
-    InvocationType: "RequestResponse",
-    Payload: Buffer.from(JSON.stringify({ sessionId, inputText, phoneNumber })),
-  }));
-
-  const result = JSON.parse(new TextDecoder().decode(response.Payload));
-  return result.response as string;
-}
+```python
+def invoke_strands_agent(session_id: str, input_text: str, phone_number: str) -> str:
+    response = lambda_client.invoke(
+        FunctionName=STRANDS_AGENT_LAMBDA_ARN,
+        InvocationType="RequestResponse",
+        Payload=json.dumps({
+            "sessionId": session_id,
+            "inputText": input_text,
+            "phoneNumber": phone_number,
+        }).encode("utf-8"),
+    )
+    result = json.loads(response["Payload"].read())
+    return result["response"]
 ```
 
 #### Envío de Respuesta vía Twilio (con split)
 
-```typescript
-const MAX_TWILIO_MESSAGE_LENGTH = 1600;
+```python
+MAX_TWILIO_MESSAGE_LENGTH = 1600
 
-async function sendTwilioMessage(phoneNumber: string, text: string): Promise<void> {
-  const chunks = splitMessage(text, MAX_TWILIO_MESSAGE_LENGTH);
 
-  for (const chunk of chunks) {
-    await twilioClient.messages.create({
-      from: `whatsapp:${TWILIO_NUMBER}`,
-      to: `whatsapp:${phoneNumber}`,
-      body: chunk,
-    });
-  }
-}
+def send_twilio_message(phone_number: str, text: str) -> None:
+    for chunk in split_message(text, MAX_TWILIO_MESSAGE_LENGTH):
+        twilio_client.messages.create(
+            from_=f"whatsapp:{TWILIO_NUMBER}",
+            to=f"whatsapp:{phone_number}",
+            body=chunk,
+        )
 
-function splitMessage(text: string, maxLength: number): string[] {
-  if (text.length <= maxLength) return [text];
-  
-  const chunks: string[] = [];
-  let remaining = text;
-  
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
-      break;
-    }
-    // Buscar último salto de línea o espacio antes del límite
-    let splitIndex = remaining.lastIndexOf("\n", maxLength);
-    if (splitIndex === -1 || splitIndex < maxLength * 0.5) {
-      splitIndex = remaining.lastIndexOf(" ", maxLength);
-    }
-    if (splitIndex === -1) {
-      splitIndex = maxLength;
-    }
-    chunks.push(remaining.substring(0, splitIndex));
-    remaining = remaining.substring(splitIndex).trimStart();
-  }
-  
-  return chunks;
-}
+
+def split_message(text: str, max_length: int) -> list[str]:
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+        # Buscar último salto de línea o espacio antes del límite
+        split_index = remaining.rfind("\n", 0, max_length)
+        if split_index == -1 or split_index < max_length * 0.5:
+            split_index = remaining.rfind(" ", 0, max_length)
+        if split_index == -1:
+            split_index = max_length
+        chunks.append(remaining[:split_index])
+        remaining = remaining[split_index:].lstrip()
+
+    return chunks
 ```
 
 #### Envío de Documento PDF vía Twilio (Extracto Bancario)
 
-```typescript
-async function sendTwilioDocument(
-  phoneNumber: string,
-  s3Bucket: string,
-  s3Key: string,
-  fileName: string
-): Promise<void> {
-  // 1. Generar presigned URL temporal de S3 (Twilio necesita una URL pública para descargar el media)
-  const presignedUrl = await getSignedUrl(
-    s3Client,
-    new GetObjectCommand({ Bucket: s3Bucket, Key: s3Key }),
-    { expiresIn: 300 } // 5 minutos — suficiente para que Twilio descargue
-  );
+```python
+def send_twilio_document(phone_number: str, s3_bucket: str, s3_key: str) -> None:
+    # 1. Generar presigned URL temporal de S3 (Twilio necesita URL pública para descargar el media)
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": s3_bucket, "Key": s3_key},
+        ExpiresIn=300,  # 5 minutos — suficiente para que Twilio descargue
+    )
 
-  // 2. Enviar mensaje con media adjunto via Twilio
-  await twilioClient.messages.create({
-    from: `whatsapp:${TWILIO_NUMBER}`,
-    to: `whatsapp:${phoneNumber}`,
-    body: "📄 Aquí tienes tu extracto bancario.",
-    mediaUrl: [presignedUrl],
-  });
-}
+    # 2. Enviar mensaje con media adjunto via Twilio
+    twilio_client.messages.create(
+        from_=f"whatsapp:{TWILIO_NUMBER}",
+        to=f"whatsapp:{phone_number}",
+        body="📄 Aquí tienes tu extracto bancario.",
+        media_url=[presigned_url],
+    )
 ```
 
 
@@ -681,119 +646,101 @@ async function sendTwilioDocument(
 
 **Responsabilidad:** Backend de autenticación mock. Valida credenciales contra usuarios de prueba hardcodeados y crea Auth_Session en DynamoDB. Simula un flujo de autenticación vía enlace web.
 
-**Runtime:** Node.js 24.x (TypeScript)  
+**Runtime:** Python 3.13  
 **Memory:** 128 MB  
 **Timeout:** 10 seconds  
 **Trigger:** API Gateway (HTTP API) o Function URL
 
 #### Interface
 
-```typescript
-// POST /authenticate
-interface AuthenticateRequest {
-  username: string;
-  password: string;
-  phoneNumber: string;    // E.164 — vincula sesión al teléfono
-  callbackToken: string;  // Token para validar origen legítimo
-}
+```python
+from typing import TypedDict, NotRequired
 
-interface AuthenticateResponse {
-  success: boolean;
-  message: string;
-  sessionId?: string;     // Solo si success=true
-  expiresAt?: string;     // ISO 8601 — TTL de la sesión
-}
+# POST /authenticate
+class AuthenticateRequest(TypedDict):
+    username: str
+    password: str
+    phoneNumber: str      # E.164 — vincula sesión al teléfono
+    callbackToken: str    # Token para validar origen legítimo
+
+class AuthenticateResponse(TypedDict):
+    success: bool
+    message: str
+    sessionId: NotRequired[str]   # Solo si success=True
+    expiresAt: NotRequired[str]   # ISO 8601 — TTL de la sesión
 ```
 
 #### Usuarios de Prueba Hardcodeados
 
-```typescript
-const TEST_USERS: TestUser[] = [
-  {
-    username: "carlos.rodriguez",
-    password: "Btg2024*Test",
-    phoneNumber: "+573001234567",
-    name: "Carlos Rodríguez",
-    documentId: "1234567890",
-  },
-  {
-    username: "maria.lopez",
-    password: "Btg2024*Demo",
-    phoneNumber: "+573009876543",
-    name: "María López",
-    documentId: "0987654321",
-  },
-  {
-    username: "juan.garcia",
-    password: "Btg2024*Hack",
-    phoneNumber: "+573005551234",
-    name: "Juan García",
-    documentId: "1122334455",
-  },
-];
+```python
+TEST_USERS = [
+    {"username": "carlos.rodriguez", "password": "Btg2024*Test",
+     "phone_number": "+573001234567", "name": "Carlos Rodríguez", "document_id": "1234567890"},
+    {"username": "maria.lopez", "password": "Btg2024*Demo",
+     "phone_number": "+573009876543", "name": "María López", "document_id": "0987654321"},
+    {"username": "juan.garcia", "password": "Btg2024*Hack",
+     "phone_number": "+573005551234", "name": "Juan García", "document_id": "1122334455"},
+]
 ```
 
 #### Lógica de Autenticación
 
-```typescript
-async function authenticate(request: AuthenticateRequest): Promise<AuthenticateResponse> {
-  // 1. Validar callback token
-  if (!isValidCallbackToken(request.callbackToken, request.phoneNumber)) {
-    return { success: false, message: "Token inválido" };
-  }
+```python
+import uuid
+from datetime import datetime, timedelta, timezone
 
-  // 2. Buscar usuario
-  const user = TEST_USERS.find(
-    u => u.username === request.username && u.password === request.password
-  );
 
-  if (!user) {
-    return { success: false, message: "Credenciales incorrectas" };
-  }
+def authenticate(request: AuthenticateRequest) -> AuthenticateResponse:
+    # 1. Validar callback token
+    if not is_valid_callback_token(request["callbackToken"], request["phoneNumber"]):
+        return {"success": False, "message": "Token inválido"}
 
-  // 3. Validar que el teléfono coincide con el usuario
-  if (user.phoneNumber !== request.phoneNumber) {
-    return { success: false, message: "Credenciales incorrectas" };
-  }
+    # 2. Buscar usuario
+    user = next(
+        (u for u in TEST_USERS
+         if u["username"] == request["username"] and u["password"] == request["password"]),
+        None,
+    )
+    if not user:
+        return {"success": False, "message": "Credenciales incorrectas"}
 
-  // 4. Crear Auth_Session en DynamoDB
-  const sessionId = uuidv4();
-  const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min TTL
-  const ttl = Math.floor(expiresAt.getTime() / 1000);
+    # 3. Validar que el teléfono coincide con el usuario
+    if user["phone_number"] != request["phoneNumber"]:
+        return {"success": False, "message": "Credenciales incorrectas"}
 
-  await dynamoClient.send(new PutItemCommand({
-    TableName: AUTH_SESSION_TABLE,
-    Item: {
-      pk: { S: request.phoneNumber },
-      sessionId: { S: sessionId },
-      username: { S: user.username },
-      name: { S: user.name },
-      documentId: { S: user.documentId },
-      createdAt: { S: new Date().toISOString() },
-      expiresAt: { S: expiresAt.toISOString() },
-      ttl: { N: String(ttl) },
-    },
-  }));
+    # 4. Crear Auth_Session en DynamoDB
+    session_id = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)  # 30 min TTL
+    ttl = int(expires_at.timestamp())
 
-  // 5. Notificar al Gateway (via DynamoDB stream o polling)
-  return {
-    success: true,
-    message: "Autenticación exitosa",
-    sessionId,
-    expiresAt: expiresAt.toISOString(),
-  };
-}
+    auth_table.put_item(Item={
+        "pk": request["phoneNumber"],
+        "sessionId": session_id,
+        "username": user["username"],
+        "name": user["name"],
+        "documentId": user["document_id"],
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "expiresAt": expires_at.isoformat(),
+        "ttl": ttl,
+    })
+
+    return {
+        "success": True,
+        "message": "Autenticación exitosa",
+        "sessionId": session_id,
+        "expiresAt": expires_at.isoformat(),
+    }
 ```
 
 ### 4. Login_Page (S3 Static Site)
 
 **Responsabilidad:** Página web simple con formulario de login. Hosted en S3 como sitio estático con CloudFront (o directamente S3 website hosting para MVP).
 
-**Tecnología:** HTML + CSS + JavaScript vanilla (sin framework)
+**Tecnología:** HTML + CSS + JavaScript vanilla (sin framework) — esto corre en el **navegador del cliente**, no es una Lambda, por lo que se mantiene en JavaScript
 
 #### Estructura
 
-```
+```text
 login-page/
 ├── index.html      # Formulario de login
 ├── styles.css      # Estilos BTG Pactual branding
@@ -804,11 +751,11 @@ login-page/
 
 #### Flujo de la Login_Page
 
-```typescript
-// app.js (client-side)
-async function handleLogin(event: Event): Promise<void> {
+```javascript
+// app.js (client-side, corre en el navegador — se mantiene en JavaScript)
+async function handleLogin(event) {
   event.preventDefault();
-  
+
   const username = document.getElementById("username").value;
   const password = document.getElementById("password").value;
   const params = new URLSearchParams(window.location.search);
@@ -822,7 +769,7 @@ async function handleLogin(event: Event): Promise<void> {
   });
 
   const result = await response.json();
-  
+
   if (result.success) {
     showSuccess("✅ Autenticación exitosa. Puedes volver a WhatsApp.");
   } else {
@@ -835,176 +782,170 @@ async function handleLogin(event: Event): Promise<void> {
 
 **Responsabilidad:** Consultar saldos de Fondos de Inversión y Cuenta Corriente del Mock_Core.
 
-**Runtime:** Node.js 24.x (TypeScript)  
+**Runtime:** Python 3.13  
 **Memory:** 128 MB  
 **Timeout:** 15 seconds  
 **Trigger:** Bedrock Agent Action Group invocation
 
-#### Interface de Entrada/Salida (Bedrock Agent)
+#### Interface de Entrada/Salida (Strands tool → Lambda invoke)
 
-```typescript
-interface BedrockAgentActionGroupEvent {
-  messageVersion: "1.0";
-  agent: { name: string; id: string; alias: string; version: string };
-  inputText: string;
-  sessionId: string;
-  actionGroup: string;
-  apiPath: string;
-  httpMethod: string;
-  parameters: Array<{ name: string; type: string; value: string }>;
-  sessionAttributes: Record<string, string>;
-  promptSessionAttributes: Record<string, string>;
-}
+Las Action Group Lambdas son invocadas por las tools del Strands_Agent vía `boto3 lambda.invoke` con un payload JSON simple (no usan el formato de Bedrock Agents managed):
 
-interface BedrockAgentActionGroupResponse {
-  messageVersion: "1.0";
-  response: {
-    actionGroup: string;
-    apiPath: string;
-    httpMethod: string;
-    httpStatusCode: number;
-    responseBody: {
-      "application/json": { body: string };
-    };
-  };
-}
+```python
+# Evento que recibe la Lambda (enviado por la tool del Strands Agent)
+class BalanceQueryEvent(TypedDict):
+    phoneNumber: str
+    productType: NotRequired[str]   # "fondo_inversion" | "cuenta_corriente"
+
+# Respuesta de la Lambda
+class ActionGroupResponse(TypedDict):
+    success: bool
+    data: NotRequired[dict]         # payload específico de la acción
+    error: NotRequired[str]         # código de error si success=False
+    message: NotRequired[str]
 ```
 
-#### API Paths
+### 6. Action_Group Lambda: transfer-breb (validate + execute)
 
-| Path | Method | Parámetros | Descripción |
-|------|--------|------------|-------------|
-| `/balance` | GET | `phoneNumber` (required), `productType` (optional: "fondo_inversion" \| "cuenta_corriente") | Consulta saldos |
+**Responsabilidad:** Validar y ejecutar transferencias BRE-B contra el Mock_Core. Estas funciones son invocadas por los estados `ValidateTransfer` y `ExecuteTransfer` del `TransferBrebStateMachine` (ver sección Step Functions), NO directamente por el Strands Agent (que solo dispara el state machine via `transfer-breb-initiator`).
 
-### 6. Action_Group Lambda: transfer-breb
-
-**Responsabilidad:** Ejecutar transferencias BRE-B entre cuentas contra el Mock_Core.
-
-**Runtime:** Node.js 24.x (TypeScript)  
+**Runtime:** Python 3.13  
 **Memory:** 128 MB  
 **Timeout:** 15 seconds  
-**Trigger:** Bedrock Agent Action Group invocation
-
-#### API Paths
-
-| Path | Method | Parámetros | Descripción |
-|------|--------|------------|-------------|
-| `/transfer` | POST | `sourceAccount`, `destinationAccount`, `amount`, `concept`, `phoneNumber` | Ejecutar transferencia |
-| `/transfer/validate` | POST | `sourceAccount`, `destinationAccount`, `amount`, `phoneNumber` | Validar antes de confirmar |
+**Trigger:** Step Functions task (`ValidateTransfer`, `ExecuteTransfer`)
 
 #### Lógica de Transferencia
 
-```typescript
-async function executeTransfer(params: TransferParams): Promise<TransferResult> {
-  const { sourceAccount, destinationAccount, amount, concept, phoneNumber } = params;
+```python
+import uuid
+from datetime import datetime, timezone
 
-  // 1. Validar cuenta origen existe y pertenece al cliente
-  const sourceAcct = findAccountByNumber(phoneNumber, sourceAccount);
-  if (!sourceAcct) {
-    return { success: false, error: "ACCOUNT_NOT_FOUND", message: "Cuenta origen no encontrada" };
-  }
 
-  // 2. Validar saldo suficiente
-  if (sourceAcct.availableBalance < amount) {
-    return { success: false, error: "INSUFFICIENT_FUNDS", message: "Fondos insuficientes" };
-  }
+class InsufficientFundsError(Exception):
+    """Error de dominio — capturado por el Catch del state machine."""
 
-  // 3. Validar cuenta destino existe
-  const destAcct = findAccountByNumber(null, destinationAccount);
-  if (!destAcct) {
-    return { success: false, error: "DEST_NOT_FOUND", message: "Cuenta destino no encontrada" };
-  }
 
-  // 4. Ejecutar transferencia (mock — actualizar saldos en memoria)
-  sourceAcct.availableBalance -= amount;
-  sourceAcct.totalBalance -= amount;
-  destAcct.availableBalance += amount;
-  destAcct.totalBalance += amount;
+class InvalidDestinationError(Exception):
+    """Error de dominio — capturado por el Catch del state machine."""
 
-  // 5. Generar comprobante
-  const receipt: TransferReceipt = {
-    transactionId: `TRX-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
-    sourceAccount: maskAccountNumber(sourceAccount),
-    destinationAccount: maskAccountNumber(destinationAccount),
-    amount,
-    currency: "COP",
-    concept,
-    executedAt: new Date().toISOString(),
-    status: "COMPLETED",
-  };
 
-  return { success: true, receipt };
-}
+def execute_transfer(params: dict) -> dict:
+    source_account = params["sourceAccount"]
+    destination_account = params["destinationAccount"]
+    amount = params["amount"]
+    concept = params.get("concept", "")
+    phone_number = params["phoneNumber"]
+
+    # 1. Validar cuenta origen existe y pertenece al cliente
+    source_acct = find_account_by_number(phone_number, source_account)
+    if not source_acct:
+        raise InvalidDestinationError("Cuenta origen no encontrada")
+
+    # 2. Validar saldo suficiente
+    if source_acct["available_balance"] < amount:
+        raise InsufficientFundsError("Fondos insuficientes")
+
+    # 3. Validar cuenta destino existe
+    dest_acct = find_account_by_number(None, destination_account)
+    if not dest_acct:
+        raise InvalidDestinationError("Cuenta destino no encontrada")
+
+    # 4. Ejecutar transferencia (mock — actualizar saldos)
+    source_acct["available_balance"] -= amount
+    source_acct["total_balance"] -= amount
+    dest_acct["available_balance"] += amount
+    dest_acct["total_balance"] += amount
+
+    # 5. Generar comprobante
+    receipt = {
+        "transactionId": f"TRX-{int(datetime.now(timezone.utc).timestamp())}-{uuid.uuid4().hex[:6]}",
+        "sourceAccount": mask_account_number(source_account),
+        "destinationAccount": mask_account_number(destination_account),
+        "amount": amount,
+        "currency": "COP",
+        "concept": concept,
+        "executedAt": datetime.now(timezone.utc).isoformat(),
+        "status": "COMPLETED",
+    }
+    return {"success": True, "receipt": receipt}
 ```
 
 ### 7. Action_Group Lambda: statement-generator
 
-**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3 y retornar la referencia (S3 key) para que el Message_Handler descargue y envíe el PDF como documento adjunto vía WhatsApp.
+**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3, publicar evento `statement_delivery` a `email-notification-queue`, y retornar la referencia (S3 key) para que el Message_Processor descargue y envíe el PDF vía Twilio.
 
-**Runtime:** Node.js 24.x (TypeScript)  
+**Runtime:** Python 3.13  
 **Memory:** 256 MB  
 **Timeout:** 30 seconds  
-**Trigger:** Bedrock Agent Action Group invocation
-
-#### API Paths
-
-| Path | Method | Parámetros | Descripción |
-|------|--------|------------|-------------|
-| `/statement` | POST | `phoneNumber`, `accountId`, `cutoffDate` | Generar extracto PDF |
+**Trigger:** Strands Agent tool invocation (Lambda invoke via boto3)
 
 #### Lógica de Generación
 
-```typescript
-async function generateStatement(params: StatementParams): Promise<StatementResult> {
-  const { phoneNumber, accountId, cutoffDate } = params;
+```python
+from datetime import datetime, timezone
 
-  // 1. Validar fecha de corte (debe ser pasada)
-  const cutoff = new Date(cutoffDate);
-  if (cutoff >= new Date()) {
-    return { success: false, error: "INVALID_DATE", message: "La fecha de corte debe ser una fecha pasada" };
-  }
 
-  // 2. Obtener datos del cliente y transacciones
-  const client = findClientByPhone(phoneNumber);
-  const transactions = getTransactionsUntilDate(accountId, cutoffDate);
+def generate_statement(params: dict) -> dict:
+    phone_number = params["phoneNumber"]
+    account_id = params["accountId"]
+    cutoff_date = params["cutoffDate"]
 
-  // 3. Generar PDF (usando pdfkit o similar)
-  const pdfBuffer = await generatePDF({
-    clientName: client.name,
-    accountNumber: maskAccountNumber(accountId),
-    period: { start: getStartOfMonth(cutoffDate), end: cutoffDate },
-    transactions,
-    finalBalance: calculateBalance(transactions),
-  });
+    # 1. Validar fecha de corte (debe ser pasada)
+    cutoff = datetime.fromisoformat(cutoff_date)
+    if cutoff >= datetime.now(timezone.utc):
+        return {"success": False, "error": "INVALID_DATE",
+                "message": "La fecha de corte debe ser una fecha pasada"}
 
-  // 4. Subir a S3
-  const s3Key = `statements/${phoneNumber}/${accountId}/${cutoffDate}-${uuidv4()}.pdf`;
-  await s3Client.send(new PutObjectCommand({
-    Bucket: STATEMENT_BUCKET,
-    Key: s3Key,
-    Body: pdfBuffer,
-    ContentType: "application/pdf",
-  }));
+    # 2. Obtener datos del cliente y transacciones
+    client = find_client_by_phone(phone_number)
+    transactions = get_transactions_until_date(account_id, cutoff_date)
 
-  // 5. Retornar referencia S3 para que el Gateway descargue y envíe como documento adjunto
-  return {
-    success: true,
-    s3Bucket: STATEMENT_BUCKET,
-    s3Key,
-    fileName: `extracto_${accountId}_${cutoffDate}.pdf`,
-  };
-}
+    # 3. Generar PDF (usando reportlab o fpdf2)
+    pdf_bytes = generate_pdf({
+        "client_name": client["name"],
+        "account_number": mask_account_number(account_id),
+        "period": {"start": get_start_of_month(cutoff_date), "end": cutoff_date},
+        "transactions": transactions,
+        "final_balance": calculate_balance(transactions),
+    })
+
+    # 4. Subir a S3
+    s3_key = f"statements/{phone_number}/{account_id}/{cutoff_date}-{uuid.uuid4()}.pdf"
+    s3.put_object(Bucket=STATEMENT_BUCKET, Key=s3_key, Body=pdf_bytes, ContentType="application/pdf")
+
+    # 5. Publicar evento a email-notification-queue (fire-and-forget)
+    sqs.send_message(
+        QueueUrl=EMAIL_NOTIFICATION_QUEUE_URL,
+        MessageBody=json.dumps({
+            "type": "statement_delivery",
+            "correlationId": params.get("correlationId"),
+            "to": client["email"],
+            "payload": {
+                "s3Bucket": STATEMENT_BUCKET, "s3Key": s3_key,
+                "fileName": f"extracto_{account_id}_{cutoff_date}.pdf",
+                "clientName": client["name"],
+            },
+        }),
+    )
+
+    # 6. Retornar referencia S3 para que el Message_Processor envíe el PDF vía Twilio
+    return {
+        "success": True,
+        "s3Bucket": STATEMENT_BUCKET,
+        "s3Key": s3_key,
+        "fileName": f"extracto_{account_id}_{cutoff_date}.pdf",
+    }
 ```
 
 
 ### 8. Strands_Agent Lambda (Conversational_Agent)
 
-**Responsabilidad:** Interpretar intenciones en español (texto o audio transcrito), mantener contexto conversacional, decidir cuándo invocar herramientas (balance-query, transfer-breb, statement-generator), y formular respuestas naturales. Implementado como Lambda Python 3.12 usando Strands Agent SDK sobre Amazon Bedrock.
+**Responsabilidad:** Interpretar intenciones en español (texto o audio transcrito), mantener contexto conversacional, decidir cuándo invocar herramientas (balance-query, transfer-breb, statement-generator), y formular respuestas naturales. Implementado como Lambda Python 3.13 usando Strands Agent SDK sobre Amazon Bedrock.
 
-**Runtime:** Python 3.12  
+**Runtime:** Python 3.13  
 **Memory:** 512 MB  
 **Timeout:** 60 seconds  
-**Trigger:** Lambda InvokeFunction desde Message_Handler (sync)  
+**Trigger:** Lambda InvokeFunction desde Message_Processor (sync)  
 **Foundation Model:** Claude 3.5 Haiku via Bedrock (anthropic.claude-3-5-haiku-20241022-v1:0)  
 **Session Strategy:** sessionId derivado del número de teléfono — Strands mantiene historial en memoria de sesión  
 **Guardrails:** Bedrock Guardrails aplicados sobre el modelo (content filtering + topic policies)
@@ -1038,246 +979,79 @@ FORMATO DE RESPUESTA:
 - Mantén las respuestas concisas (máximo 3 párrafos)
 ```
 
-#### OpenAPI Schema — Action Group: balance-query
+#### Definición de Tools del Strands Agent
 
-```yaml
-openapi: "3.0.0"
-info:
-  title: "BTG ConnectAI Balance Query API"
-  version: "1.0.0"
-  description: "API para consulta de saldos de Fondos de Inversión y Cuenta Corriente"
-paths:
-  /balance:
-    get:
-      summary: "Consultar saldos del cliente"
-      description: "Retorna saldos de Fondos de Inversión y/o Cuenta Corriente del cliente"
-      operationId: "getBalance"
-      parameters:
-        - name: phoneNumber
-          in: query
-          required: true
-          schema:
-            type: string
-          description: "Número de teléfono del cliente en formato E.164"
-        - name: productType
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: ["fondo_inversion", "cuenta_corriente", "all"]
-          description: "Tipo de producto. Si no se especifica, retorna todos los productos"
-      responses:
-        "200":
-          description: "Saldos consultados exitosamente"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BalanceResponse"
-        "404":
-          description: "Cliente no encontrado"
-components:
-  schemas:
-    BalanceResponse:
-      type: object
-      properties:
-        products:
-          type: array
-          items:
-            $ref: "#/components/schemas/ProductBalance"
-    ProductBalance:
-      type: object
-      properties:
-        productType:
-          type: string
-          enum: ["fondo_inversion", "cuenta_corriente"]
-        productName:
-          type: string
-          example: "Fondo BTG Pactual Liquidez"
-        accountNumber:
-          type: string
-        currency:
-          type: string
-          example: "COP"
-        availableBalance:
-          type: number
-        totalBalance:
-          type: number
-        cutoffDate:
-          type: string
-          format: date
-```
+Con Strands Agent SDK, las herramientas se definen con el decorador `@tool` en Python. El docstring y los type hints son lo que el modelo usa para decidir cuándo invocar cada tool — no se requieren OpenAPI schemas (eso era específico de Bedrock Agents managed).
 
-#### OpenAPI Schema — Action Group: transfer-breb
+```python
+from strands import tool
+import boto3
+import json
 
-```yaml
-openapi: "3.0.0"
-info:
-  title: "BTG ConnectAI BRE-B Transfer API"
-  version: "1.0.0"
-  description: "API para transferencias BRE-B entre cuentas"
-paths:
-  /transfer/validate:
-    post:
-      summary: "Validar transferencia antes de ejecutar"
-      description: "Valida que la transferencia sea posible (saldo, cuentas válidas)"
-      operationId: "validateTransfer"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/TransferRequest"
-      responses:
-        "200":
-          description: "Transferencia válida"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ValidationResult"
-        "400":
-          description: "Transferencia inválida"
-  /transfer:
-    post:
-      summary: "Ejecutar transferencia BRE-B"
-      description: "Ejecuta la transferencia después de confirmación del cliente"
-      operationId: "executeTransfer"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/TransferRequest"
-      responses:
-        "200":
-          description: "Transferencia ejecutada"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TransferReceipt"
-        "400":
-          description: "Error en transferencia"
-components:
-  schemas:
-    TransferRequest:
-      type: object
-      required: [phoneNumber, sourceAccount, destinationAccount, amount]
-      properties:
-        phoneNumber:
-          type: string
-          description: "Teléfono del cliente en E.164"
-        sourceAccount:
-          type: string
-          description: "Número de cuenta origen"
-        destinationAccount:
-          type: string
-          description: "Número de cuenta destino"
-        amount:
-          type: number
-          minimum: 1
-          description: "Monto en COP"
-        concept:
-          type: string
-          maxLength: 100
-          description: "Concepto de la transferencia"
-    ValidationResult:
-      type: object
-      properties:
-        valid:
-          type: boolean
-        sourceAccountName:
-          type: string
-        destinationAccountName:
-          type: string
-        availableBalance:
-          type: number
-        error:
-          type: string
-    TransferReceipt:
-      type: object
-      properties:
-        transactionId:
-          type: string
-        sourceAccount:
-          type: string
-        destinationAccount:
-          type: string
-        amount:
-          type: number
-        currency:
-          type: string
-        concept:
-          type: string
-        executedAt:
-          type: string
-          format: date-time
-        status:
-          type: string
-          enum: ["COMPLETED", "FAILED"]
-```
+lambda_client = boto3.client("lambda")
 
-#### OpenAPI Schema — Action Group: statement-generator
 
-```yaml
-openapi: "3.0.0"
-info:
-  title: "BTG ConnectAI Statement Generator API"
-  version: "1.0.0"
-  description: "API para generación de extractos bancarios en PDF"
-paths:
-  /statement:
-    post:
-      summary: "Generar extracto bancario PDF"
-      description: "Genera un extracto en PDF, lo almacena en S3 y retorna la referencia para envío como documento adjunto vía WhatsApp"
-      operationId: "generateStatement"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/StatementRequest"
-      responses:
-        "200":
-          description: "Extracto generado exitosamente"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StatementResult"
-        "400":
-          description: "Fecha de corte inválida"
-        "404":
-          description: "Cliente o cuenta no encontrada"
-components:
-  schemas:
-    StatementRequest:
-      type: object
-      required: [phoneNumber, accountId, cutoffDate]
-      properties:
-        phoneNumber:
-          type: string
-          description: "Teléfono del cliente en E.164"
-        accountId:
-          type: string
-          description: "ID de la cuenta"
-        cutoffDate:
-          type: string
-          format: date
-          description: "Fecha de corte del extracto (debe ser fecha pasada)"
-    StatementResult:
-      type: object
-      properties:
-        success:
-          type: boolean
-        s3Bucket:
-          type: string
-          description: "Nombre del bucket S3 donde se almacenó el PDF"
-        s3Key:
-          type: string
-          description: "Key del objeto PDF en S3"
-        fileName:
-          type: string
-          description: "Nombre del archivo PDF para envío como documento adjunto"
-        error:
-          type: string
+@tool
+def query_balance(phone_number: str, product_type: str | None = None) -> dict:
+    """Consulta los saldos del cliente en BTG Pactual.
+
+    Args:
+        phone_number: Número de teléfono del cliente en formato E.164.
+        product_type: Opcional. "fondo_inversion" o "cuenta_corriente".
+                      Si se omite, retorna todos los productos.
+
+    Returns:
+        dict con la lista de productos y sus saldos (availableBalance, totalBalance, cutoffDate).
+    """
+    resp = lambda_client.invoke(
+        FunctionName="balance-query",
+        Payload=json.dumps({"phoneNumber": phone_number, "productType": product_type}).encode(),
+    )
+    return json.loads(resp["Payload"].read())
+
+
+@tool
+def initiate_transfer_breb(
+    source_account: str, destination_account: str, amount: float,
+    concept: str, phone_number: str,
+) -> dict:
+    """Inicia una transferencia BRE-B. Dispara el TransferBrebStateMachine que enviará
+    un OTP por SMS al cliente para autorizar. NO espera el OTP — retorna inmediatamente.
+
+    Úsala SOLO después de que el cliente confirmó explícitamente la operación.
+
+    Returns:
+        dict con executionArn y un mensaje indicando que se envió el OTP por SMS.
+    """
+    resp = lambda_client.invoke(
+        FunctionName="transfer-breb-initiator",
+        Payload=json.dumps({
+            "sourceAccount": source_account, "destinationAccount": destination_account,
+            "amount": amount, "concept": concept, "phoneNumber": phone_number,
+        }).encode(),
+    )
+    return json.loads(resp["Payload"].read())
+
+
+@tool
+def generate_statement(phone_number: str, account_id: str, cutoff_date: str) -> dict:
+    """Genera un extracto bancario en PDF para una cuenta hasta una fecha de corte.
+
+    Args:
+        phone_number: Teléfono del cliente en E.164.
+        account_id: ID de la cuenta.
+        cutoff_date: Fecha de corte (ISO 8601). DEBE ser una fecha pasada.
+
+    Returns:
+        dict con {success, s3Bucket, s3Key, fileName} o error si la fecha es futura.
+    """
+    resp = lambda_client.invoke(
+        FunctionName="statement-generator",
+        Payload=json.dumps({
+            "phoneNumber": phone_number, "accountId": account_id, "cutoffDate": cutoff_date,
+        }).encode(),
+    )
+    return json.loads(resp["Payload"].read())
 ```
 
 ### 9. AWS Step Functions — TransferBrebStateMachine
@@ -1510,7 +1284,7 @@ sequenceDiagram
     participant BC as Bank_Client
     participant TW as Twilio
     participant APIGW as API Gateway
-    participant MH as Message_Handler
+    participant MH as Message_Processor
 
     SFN->>OTP: invoke con $$.Task.Token
     OTP->>OTP: Generar código 6 dígitos
@@ -1539,7 +1313,7 @@ sequenceDiagram
     end
 ```
 
-**Key insight:** La Lambda OTP_Service termina rápido (solo envía el SMS), pero Step Functions queda esperando hasta que Message_Handler invoque `SendTaskSuccess` o `SendTaskFailure` con el token guardado. Cero costo de Lambda mientras se espera.
+**Key insight:** La Lambda OTP_Service termina rápido (solo envía el SMS), pero Step Functions queda esperando hasta que Message_Processor invoque `SendTaskSuccess` o `SendTaskFailure` con el token guardado. Cero costo de Lambda mientras se espera.
 
 #### Tabla DynamoDB extendida — OTP_Store con TaskToken
 
@@ -1591,72 +1365,58 @@ graph LR
 
 #### Esquema de eventos (contrato productor ↔ consumidor)
 
-```typescript
-// Evento publicado a email-notification-queue
-interface EmailNotificationEvent {
-  type: "transfer_confirmation" | "statement_delivery";
-  correlationId: string;        // Para tracing
-  to: string;                   // Email del cliente
-  payload:
-    | {
-        type: "transfer_confirmation";
-        receipt: TransferReceipt;
-        clientName: string;
-      }
-    | {
-        type: "statement_delivery";
-        s3Bucket: string;
-        s3Key: string;
-        fileName: string;
-        clientName: string;
-        period: { start: string; end: string };
-      };
-}
+```python
+from typing import TypedDict, Literal
 
-// Evento publicado a sms-notification-queue
-interface SmsNotificationEvent {
-  type: "transfer_confirmation";
-  correlationId: string;
-  phoneNumber: string;          // E.164
-  amount: number;
-  destinationAccount: string;   // Ya enmascarado
-}
+# Evento publicado a email-notification-queue
+class EmailNotificationEvent(TypedDict):
+    type: Literal["transfer_confirmation", "statement_delivery"]
+    correlationId: str   # Para tracing
+    to: str              # Email del cliente
+    payload: dict        # receipt+clientName | s3Bucket+s3Key+fileName+clientName+period
+
+# Evento publicado a sms-notification-queue
+class SmsNotificationEvent(TypedDict):
+    type: Literal["transfer_confirmation"]
+    correlationId: str
+    phoneNumber: str          # E.164
+    amount: float
+    destinationAccount: str   # Ya enmascarado
 ```
 
-#### Event Source Mapping (CDK)
+#### Event Source Mapping (CloudFormation)
 
-```typescript
-emailService.addEventSource(new SqsEventSource(emailNotificationQueue, {
-  batchSize: 10,
-  maxBatchingWindow: Duration.seconds(5),
-  reportBatchItemFailures: true,  // Solo reintenta los mensajes fallidos del batch, no todo el lote
-}));
+```yaml
+EmailServiceEventSourceMapping:
+  Type: AWS::Lambda::EventSourceMapping
+  Properties:
+    EventSourceArn: !GetAtt EmailNotificationQueue.Arn
+    FunctionName: !Ref EmailServiceFunction
+    BatchSize: 10
+    MaximumBatchingWindowInSeconds: 5
+    FunctionResponseTypes:
+      - ReportBatchItemFailures   # Solo reintenta los mensajes fallidos del batch
 ```
 
-#### Productores publican via SDK
+#### Productores publican via boto3
 
-```typescript
-// Desde statement-generator Lambda después de generar el PDF
-await sqsClient.send(new SendMessageCommand({
-  QueueUrl: EMAIL_NOTIFICATION_QUEUE_URL,
-  MessageBody: JSON.stringify({
-    type: "statement_delivery",
-    correlationId: correlationId,
-    to: clientEmail,
-    payload: {
-      type: "statement_delivery",
-      s3Bucket: STATEMENT_BUCKET,
-      s3Key: s3Key,
-      fileName: fileName,
-      clientName: client.name,
-      period: { start: periodStart, end: cutoffDate },
-    },
-  }),
-  MessageAttributes: {
-    EventType: { DataType: "String", StringValue: "statement_delivery" },
-  },
-}));
-// Lambda termina inmediatamente — no espera al envío del email
+```python
+# Desde statement-generator Lambda después de generar el PDF
+sqs.send_message(
+    QueueUrl=EMAIL_NOTIFICATION_QUEUE_URL,
+    MessageBody=json.dumps({
+        "type": "statement_delivery",
+        "correlationId": correlation_id,
+        "to": client_email,
+        "payload": {
+            "s3Bucket": STATEMENT_BUCKET, "s3Key": s3_key, "fileName": file_name,
+            "clientName": client["name"],
+            "period": {"start": period_start, "end": cutoff_date},
+        },
+    }),
+    MessageAttributes={"EventType": {"DataType": "String", "StringValue": "statement_delivery"}},
+)
+# Lambda termina inmediatamente — no espera al envío del email
 ```
 
 #### Beneficios del patrón
@@ -1673,290 +1433,292 @@ await sqsClient.send(new SendMessageCommand({
 
 #### Configuración
 
-```typescript
-const guardrailConfig = {
-  name: "btg-connectai-guardrail",
-  description: "Guardrail para asistente bancario BTG Pactual Colombia",
-  
-  contentPolicyConfig: {
-    filtersConfig: [
-      { type: "SEXUAL", inputStrength: "HIGH", outputStrength: "HIGH" },
-      { type: "VIOLENCE", inputStrength: "HIGH", outputStrength: "HIGH" },
-      { type: "HATE", inputStrength: "HIGH", outputStrength: "HIGH" },
-      { type: "INSULTS", inputStrength: "MEDIUM", outputStrength: "HIGH" },
-      { type: "MISCONDUCT", inputStrength: "HIGH", outputStrength: "HIGH" },
-      { type: "PROMPT_ATTACK", inputStrength: "HIGH", outputStrength: "NONE" },
-    ],
-  },
+El Guardrail se define como recurso CloudFormation `AWS::Bedrock::Guardrail` y se referencia desde el Strands Agent al invocar el modelo (parámetro `guardrailIdentifier`/`guardrailVersion` en el `converse`/`invoke_model`):
 
-  topicPolicyConfig: {
-    topicsConfig: [
-      {
-        name: "investment-advice",
-        definition: "Recomendaciones específicas de inversión, compra o venta de activos financieros, sugerencias sobre portafolio",
-        examples: [
-          "¿Debería invertir en acciones de X?",
-          "¿Es buen momento para comprar dólares?",
-          "Recomiéndame un CDT",
-          "¿Qué fondo me conviene más?",
-        ],
-        type: "DENY",
-      },
-      {
-        name: "non-banking-topics",
-        definition: "Temas no relacionados con servicios bancarios de BTG Pactual como política, deportes, entretenimiento, salud, cocina",
-        examples: [
-          "¿Quién ganó el partido ayer?",
-          "¿Qué opinas del presidente?",
-          "Dame una receta de cocina",
-          "¿Cómo está el clima?",
-        ],
-        type: "DENY",
-      },
-      {
-        name: "competitor-info",
-        definition: "Información sobre productos o servicios de otros bancos o entidades financieras competidoras",
-        examples: [
-          "¿Qué tasas ofrece Bancolombia?",
-          "Compara BTG con Davivienda",
-          "¿Es mejor un CDT en Nequi?",
-        ],
-        type: "DENY",
-      },
-    ],
-  },
-
-  blockedInputMessaging: "Lo siento, no puedo procesar esa solicitud. Solo puedo ayudarte con: consulta de saldos, transferencias BRE-B y generación de extractos bancarios de BTG Pactual.",
-  blockedOutputsMessaging: "Lo siento, no puedo proporcionar esa información. ¿Puedo ayudarte con consulta de saldos, transferencias o extractos bancarios?",
-};
+```yaml
+BtgConnectAiGuardrail:
+  Type: AWS::Bedrock::Guardrail
+  Properties:
+    Name: btg-connectai-guardrail
+    Description: Guardrail para asistente bancario BTG Pactual Colombia
+    BlockedInputMessaging: "Lo siento, no puedo procesar esa solicitud. Solo puedo ayudarte con: consulta de saldos, transferencias BRE-B y generación de extractos bancarios de BTG Pactual."
+    BlockedOutputsMessaging: "Lo siento, no puedo proporcionar esa información. ¿Puedo ayudarte con consulta de saldos, transferencias o extractos bancarios?"
+    ContentPolicyConfig:
+      FiltersConfig:
+        - Type: SEXUAL
+          InputStrength: HIGH
+          OutputStrength: HIGH
+        - Type: VIOLENCE
+          InputStrength: HIGH
+          OutputStrength: HIGH
+        - Type: HATE
+          InputStrength: HIGH
+          OutputStrength: HIGH
+        - Type: INSULTS
+          InputStrength: MEDIUM
+          OutputStrength: HIGH
+        - Type: MISCONDUCT
+          InputStrength: HIGH
+          OutputStrength: HIGH
+        - Type: PROMPT_ATTACK
+          InputStrength: HIGH
+          OutputStrength: NONE
+    TopicPolicyConfig:
+      TopicsConfig:
+        - Name: investment-advice
+          Type: DENY
+          Definition: "Recomendaciones específicas de inversión, compra o venta de activos financieros, sugerencias sobre portafolio"
+          Examples:
+            - "¿Debería invertir en acciones de X?"
+            - "¿Es buen momento para comprar dólares?"
+            - "Recomiéndame un CDT"
+            - "¿Qué fondo me conviene más?"
+        - Name: non-banking-topics
+          Type: DENY
+          Definition: "Temas no relacionados con servicios bancarios de BTG Pactual como política, deportes, entretenimiento, salud, cocina"
+          Examples:
+            - "¿Quién ganó el partido ayer?"
+            - "¿Qué opinas del presidente?"
+            - "Dame una receta de cocina"
+            - "¿Cómo está el clima?"
+        - Name: competitor-info
+          Type: DENY
+          Definition: "Información sobre productos o servicios de otros bancos o entidades financieras competidoras"
+          Examples:
+            - "¿Qué tasas ofrece Bancolombia?"
+            - "Compara BTG con Davivienda"
+            - "¿Es mejor un CDT en Nequi?"
 ```
 
 
 ### 12. Observability Stack
 
-#### CloudWatch Dashboard
+El Dashboard y las Alarms se definen como recursos CloudFormation (`AWS::CloudWatch::Dashboard`, `AWS::CloudWatch::Alarm`) en el template `observability.yaml`. El Dashboard incluye widgets de invocations/errors/latency p50/p90 para cada Lambda (Webhook_Receiver, Message_Processor, Auth_Service, Strands_Agent, OTP_Service, Email_Service, SMS_Service, balance-query, transfer-breb-validate, transfer-breb-execute, statement-generator, message-handler-notify), más métricas de Step Functions y SQS.
 
-```typescript
-const dashboardWidgets = [
-  // Message_Handler
-  { title: "Gateway - Invocations", metric: "Invocations", functionName: "Message_Handler" },
-  { title: "Gateway - Errors", metric: "Errors", functionName: "Message_Handler" },
-  { title: "Gateway - Duration p50/p90", metric: "Duration", functionName: "Message_Handler", stats: ["p50", "p90"] },
-  // Auth_Service
-  { title: "AuthService - Invocations", metric: "Invocations", functionName: "Auth_Service" },
-  { title: "AuthService - Errors", metric: "Errors", functionName: "Auth_Service" },
-  // balance-query
-  { title: "BalanceQuery - Invocations", metric: "Invocations", functionName: "balance-query" },
-  { title: "BalanceQuery - Errors", metric: "Errors", functionName: "balance-query" },
-  { title: "BalanceQuery - Duration p50/p90", metric: "Duration", functionName: "balance-query", stats: ["p50", "p90"] },
-  // transfer-breb
-  { title: "TransferBREB - Invocations", metric: "Invocations", functionName: "transfer-breb" },
-  { title: "TransferBREB - Errors", metric: "Errors", functionName: "transfer-breb" },
-  // statement-generator
-  { title: "StatementGen - Invocations", metric: "Invocations", functionName: "statement-generator" },
-  { title: "StatementGen - Errors", metric: "Errors", functionName: "statement-generator" },
-  { title: "StatementGen - Duration p50/p90", metric: "Duration", functionName: "statement-generator", stats: ["p50", "p90"] },
-];
+#### CloudWatch Alarms (CloudFormation)
+
+```yaml
+# Patrón de alarma error-rate por Lambda (math expression errors/invocations*100 > 10%)
+MessageProcessorErrorRateAlarm:
+  Type: AWS::CloudWatch::Alarm
+  Properties:
+    AlarmName: btg-connectai-message-processor-error-rate
+    AlarmDescription: "Error rate > 10% en ventana de 5 min"
+    Threshold: 10
+    ComparisonOperator: GreaterThanThreshold
+    EvaluationPeriods: 1
+    AlarmActions:
+      - !Ref AlarmsTopic
+    Metrics:
+      - Id: error_rate
+        Expression: "(errors / invocations) * 100"
+        Label: ErrorRatePercent
+      - Id: errors
+        ReturnData: false
+        MetricStat:
+          Metric:
+            Namespace: AWS/Lambda
+            MetricName: Errors
+            Dimensions:
+              - Name: FunctionName
+                Value: !Ref MessageProcessorFunction
+          Period: 300
+          Stat: Sum
+      - Id: invocations
+        ReturnData: false
+        MetricStat:
+          Metric:
+            Namespace: AWS/Lambda
+            MetricName: Invocations
+            Dimensions:
+              - Name: FunctionName
+                Value: !Ref MessageProcessorFunction
+          Period: 300
+          Stat: Sum
 ```
 
-#### CloudWatch Alarms
+> Se replica este patrón de alarma para cada Lambda. Adicionalmente:
+> - **Webhook_Receiver latency p99 > 1000ms** (rompe SLO de respuesta async a Twilio)
+> - **Step Functions `ExecutionsFailed` > 5 en 5min** sobre TransferBrebStateMachine
+> - **SQS DLQ `ApproximateNumberOfMessagesVisible` > 0** en inbound-messages-dlq, email-dlq, sms-dlq
+> - **SQS `ApproximateAgeOfOldestMessage` > 60s** en inbound-messages-queue (Processor saturado)
 
-```typescript
-// Error rate alarm per Lambda (>10% en 5 min)
-const createErrorRateAlarm = (functionName: string) => ({
-  alarmName: `btg-connectai-${functionName}-error-rate`,
-  metric: mathExpression("errors / invocations * 100"),
-  threshold: 10,
-  evaluationPeriods: 1,
-  period: 300, // 5 minutes
-  comparisonOperator: "GreaterThanThreshold",
-  alarmActions: [snsAlarmTopic.topicArn],
-});
+### 13. Infrastructure as Code (CloudFormation)
 
-// Alarmas para cada Lambda
-const alarms = [
-  createErrorRateAlarm("Message_Handler"),
-  createErrorRateAlarm("Auth_Service"),
-  createErrorRateAlarm("balance-query"),
-  createErrorRateAlarm("transfer-breb"),
-  createErrorRateAlarm("statement-generator"),
-];
-```
+El IaC sigue el mismo patrón del repo `infra` (donde está el networking): templates anidados en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`. NO se usa CDK ni SAM.
 
-### 13. Infrastructure as Code (CDK Stack Structure)
+#### Estructura de repositorio
 
-```
-infra/
-├── bin/
-│   └── app.ts                        # CDK App entry point
-├── lib/
-│   ├── stacks/
-│   │   └── btg-connectai-stack.ts    # Main stack (all resources)
-│   ├── constructs/
-│   │   ├── message-handler.ts        # Message Handler Lambda + API Gateway integration
-│   │   ├── auth-service.ts           # Auth_Service Lambda + Function URL
-│   │   ├── login-page.ts             # S3 static site + deployment
-│   │   ├── balance-query.ts          # Action Group Lambda
-│   │   ├── transfer-breb.ts          # Action Group Lambda
-│   │   ├── statement-generator.ts    # Action Group Lambda + S3 bucket
-│   │   ├── bedrock-agent.ts          # Bedrock Agent + Guardrails
-│   │   ├── dynamodb-tables.ts        # Dedup + Consent_Store + Auth_Session
-│   │   ├── audio-processing.ts       # S3 temp bucket for Transcribe
-│   │   ├── observability.ts          # Dashboard + Alarms + SNS
-│   │   └── security.ts              # IAM roles + Secrets Manager
-│   └── config/
-│       └── environment.ts            # Environment-specific config
-├── cdk.json
-└── tsconfig.json
+```text
+cloudformation/
+├── templates/
+│   └── connectai/
+│       ├── data.yaml                 # DynamoDB: Consent_Store, Auth_Session, OTP_Store
+│       ├── storage.yaml              # S3: Statement, Audio_Temp, Login_Page
+│       ├── queues.yaml               # SQS FIFO inbound + email + sms + DLQs
+│       ├── secrets.yaml              # Secrets Manager (Twilio creds)
+│       ├── iam.yaml                  # IAM roles de todas las Lambdas
+│       ├── lambdas-ingestion.yaml    # webhook-receiver, message-processor + EventSourceMapping
+│       ├── lambdas-actions.yaml      # balance-query, transfer-breb-validate/execute/initiator, statement-generator
+│       ├── lambdas-notify.yaml       # otp-service, email-service, sms-service, message-handler-notify
+│       ├── lambda-ai-agent.yaml      # strands agent
+│       ├── guardrails.yaml           # AWS::Bedrock::Guardrail
+│       ├── state-machine.yaml        # AWS::StepFunctions::StateMachine (carga ASL)
+│       ├── api-gateway.yaml          # AWS::ApiGatewayV2 (HTTP API) + ruta /webhook/twilio
+│       └── observability.yaml        # Dashboard + Alarms + SNS topic
+├── stacks/
+│   └── sandbox/
+│       └── connectai.yaml            # Stack raíz: nested stacks + parámetros + Fn::ImportValue networking
+├── state-machines/
+│   └── transfer-breb.asl.json        # Definición Amazon States Language
+└── .github/workflows/
+    └── cfn-deploy.yml                # Deploy via OIDC (mismo patrón que infra)
 
-src/
+src/                                  # Código fuente de las Lambdas (Python 3.13)
 ├── lambdas/
-│   ├── whatsapp-gateway/
-│   │   ├── index.ts                  # Handler
-│   │   ├── consent.ts                # Consent flow logic
-│   │   ├── auth.ts                   # Auth session check
-│   │   ├── transcription.ts          # Audio transcription
-│   │   ├── dedup.ts                  # Deduplication logic
-│   │   ├── messaging.ts             # WhatsApp message sending (text + documents)
-│   │   └── types.ts                  # TypeScript interfaces
-│   ├── auth-service/
-│   │   ├── index.ts                  # Handler
-│   │   ├── users.ts                  # Hardcoded test users
-│   │   └── types.ts
-│   ├── balance-query/
-│   │   ├── index.ts                  # Handler
-│   │   ├── mock-data.ts             # Mock_Core data
-│   │   └── types.ts
-│   ├── transfer-breb/
-│   │   ├── index.ts                  # Handler
-│   │   ├── mock-data.ts             # Mock_Core data
-│   │   └── types.ts
-│   └── statement-generator/
-│       ├── index.ts                  # Handler
-│       ├── pdf-generator.ts          # PDF creation logic
-│       ├── mock-data.ts             # Mock_Core data
-│       └── types.ts
-├── shared/
-│   ├── logger.ts                     # Powertools logger config
-│   ├── masking.ts                    # Data masking utilities
-│   ├── types.ts                      # Shared types
-│   └── constants.ts                  # Shared constants
-├── login-page/
+│   ├── webhook_receiver/
+│   │   ├── handler.py                # Entry point (valida firma, encola)
+│   │   ├── twilio_signature.py
+│   │   ├── parser.py
+│   │   └── enqueue.py
+│   ├── message_processor/
+│   │   ├── handler.py                # SQS handler con BatchProcessor
+│   │   ├── consent.py
+│   │   ├── auth.py
+│   │   ├── transcription.py
+│   │   ├── otp_callback.py
+│   │   └── messaging.py
+│   ├── ai_agent/
+│   │   ├── handler.py                # Strands Agent
+│   │   ├── agent.py
+│   │   ├── tools.py                  # @tool definitions
+│   │   └── prompts.py
+│   ├── auth_service/
+│   │   ├── handler.py
+│   │   └── users.py
+│   ├── balance_query/
+│   │   ├── handler.py
+│   │   └── mock_data.py
+│   ├── transfer_breb/
+│   │   ├── initiator.py              # Tool → StartExecution
+│   │   ├── validate.py               # Step Functions task
+│   │   ├── execute.py                # Step Functions task
+│   │   └── mock_data.py
+│   ├── statement_generator/
+│   │   ├── handler.py
+│   │   ├── pdf_generator.py          # reportlab / fpdf2
+│   │   └── mock_data.py
+│   ├── otp_service/
+│   │   └── handler.py
+│   ├── email_service/
+│   │   └── handler.py                # SQS-triggered
+│   ├── sms_service/
+│   │   └── handler.py                # SQS-triggered
+│   └── message_handler_notify/
+│       └── handler.py                # Llamada por Step Functions
+├── shared/                           # Empaquetado como Lambda Layer
+│   ├── logger.py                     # Powertools logger config
+│   ├── masking.py
+│   ├── formatting.py
+│   ├── constants.py
+│   └── types.py
+├── login-page/                       # Sitio estático (browser JS)
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── tests/
-    ├── unit/
-    │   ├── dedup.test.ts
-    │   ├── split-message.test.ts
-    │   ├── masking.test.ts
-    │   ├── consent.test.ts
-    │   ├── auth.test.ts
-    │   ├── balance-query.test.ts
-    │   ├── transfer-breb.test.ts
-    │   └── statement-generator.test.ts
-    └── property/
-        ├── split-message.property.test.ts
-        ├── masking.property.test.ts
-        ├── dedup.property.test.ts
-        ├── session-id.property.test.ts
-        ├── balance-query.property.test.ts
-        ├── transfer-breb.property.test.ts
-        └── statement-date.property.test.ts
+├── tests/
+│   ├── unit/                         # pytest
+│   └── property/                     # hypothesis
+├── requirements.txt                  # Dependencias runtime (twilio, aws-lambda-powertools, strands-agents)
+└── requirements-dev.txt              # pytest, hypothesis, moto, boto3-stubs
 ```
 
-#### IAM Roles (Least Privilege)
+#### Empaquetado de Lambdas
 
-```typescript
-// Webhook_Receiver Lambda Role — minimalista por diseño
-const webhookReceiverRole = {
-  policies: [
-    // Encolar mensajes entrantes en SQS FIFO
-    { effect: "Allow", actions: ["sqs:SendMessage"], resources: [inboundMessagesQueue.queueArn] },
-    // Secrets Manager (solo para leer TWILIO_AUTH_TOKEN y validar firma)
-    { effect: "Allow", actions: ["secretsmanager:GetSecretValue"], resources: [twilioSecretArn] },
-    // CloudWatch Logs
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
+Las Lambdas Python se empaquetan como ZIP y se suben a S3 antes del deploy. El pipeline (`cfn-deploy.yml`) hace:
 
-// Message_Processor Lambda Role — donde está el trabajo pesado
-const messageProcessorRole = {
-  policies: [
-    // SQS: consumir mensajes de la cola inbound (managed por Event Source Mapping pero documentamos el permiso)
-    { effect: "Allow", actions: ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"], resources: [inboundMessagesQueue.queueArn] },
-    // DynamoDB: consent_store (read + write), auth_session (read), OTP_Store (read + update + delete para callback)
-    { effect: "Allow", actions: ["dynamodb:PutItem", "dynamodb:GetItem"], resources: [consentTable.tableArn] },
-    { effect: "Allow", actions: ["dynamodb:GetItem"], resources: [authSessionTable.tableArn] },
-    { effect: "Allow", actions: ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], resources: [otpStoreTable.tableArn] },
-    // Lambda: invocar Strands_Agent
-    { effect: "Allow", actions: ["lambda:InvokeFunction"], resources: [strandsAgentLambda.functionArn] },
-    // Step Functions: callback del OTP (SendTaskSuccess/Failure)
-    { effect: "Allow", actions: ["states:SendTaskSuccess", "states:SendTaskFailure"], resources: [transferBrebStateMachine.stateMachineArn] },
-    // Transcribe
-    { effect: "Allow", actions: ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"], resources: ["*"] },
-    // S3: audio temp (read/write), statement bucket (read presigned URL)
-    { effect: "Allow", actions: ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], resources: [`${audioTempBucket.bucketArn}/*`] },
-    { effect: "Allow", actions: ["s3:GetObject"], resources: [`${statementBucket.bucketArn}/*`] },
-    // Secrets Manager (Twilio credentials para llamadas REST)
-    { effect: "Allow", actions: ["secretsmanager:GetSecretValue"], resources: [twilioSecretArn] },
-    // CloudWatch Logs
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
+1. `pip install -r src/shared/requirements.txt -t layer/python/` y zip → Lambda Layer compartido (twilio, aws-lambda-powertools, código `shared/`)
+2. Por cada Lambda: zip del código → `s3://<bucket>/lambdas/<nombre>-<git-sha>.zip`
+3. `aws cloudformation deploy` con `--parameter-overrides LambdaCodeKey=<sha>` para que los templates referencien el ZIP correcto
+4. Cada `AWS::Lambda::Function` usa `Code: {S3Bucket, S3Key}` y `Layers: [!Ref SharedLayer]`
 
-// Auth_Service Lambda Role
-const authServiceRole = {
-  policies: [
-    // DynamoDB: auth_session (write)
-    { effect: "Allow", actions: ["dynamodb:PutItem"], resources: [authSessionTable.tableArn] },
-    // CloudWatch Logs
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
+#### IAM Roles (Least Privilege) — CloudFormation
 
-// balance-query Lambda Role
-const balanceQueryRole = {
-  policies: [
-    // Solo CloudWatch Logs (datos mock inline)
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
+```yaml
+# Webhook_Receiver Role — minimalista por diseño
+WebhookReceiverRole:
+  Type: AWS::IAM::Role
+  Properties:
+    AssumeRolePolicyDocument:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action: sts:AssumeRole
+    ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+    Policies:
+      - PolicyName: webhook-receiver-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt InboundMessagesQueue.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref TwilioSecretArn
 
-// transfer-breb Lambda Role
-const transferBrebRole = {
-  policies: [
-    // Solo CloudWatch Logs (datos mock inline)
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
-
-// statement-generator Lambda Role
-const statementGeneratorRole = {
-  policies: [
-    // S3: statement bucket (write only — Gateway handles download)
-    { effect: "Allow", actions: ["s3:PutObject"], resources: [`${statementBucket.bucketArn}/*`] },
-    // CloudWatch Logs
-    { effect: "Allow", actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], resources: ["*"] },
-  ],
-};
-
-// Bedrock Agent Role
-const bedrockAgentRole = {
-  policies: [
-    // Invoke foundation model
-    { effect: "Allow", actions: ["bedrock:InvokeModel"], resources: [modelArn] },
-    // Invoke Action Group Lambdas
-    { effect: "Allow", actions: ["lambda:InvokeFunction"], resources: [
-      balanceQueryLambda.functionArn,
-      transferBrebLambda.functionArn,
-      statementGeneratorLambda.functionArn,
-    ]},
-    // Apply Guardrails
-    { effect: "Allow", actions: ["bedrock:ApplyGuardrail"], resources: [guardrailArn] },
-  ],
-};
+# Message_Processor Role — el trabajo pesado
+MessageProcessorRole:
+  Type: AWS::IAM::Role
+  Properties:
+    AssumeRolePolicyDocument:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action: sts:AssumeRole
+    ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+    Policies:
+      - PolicyName: message-processor-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+              Resource: !GetAtt InboundMessagesQueue.Arn
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem]
+              Resource: !GetAtt ConsentTable.Arn
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt AuthSessionTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource: !GetAtt OtpStoreTable.Arn
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt StrandsAgentFunction.Arn
+            - Effect: Allow
+              Action: [states:SendTaskSuccess, states:SendTaskFailure]
+              Resource: !Ref TransferBrebStateMachineArn
+            - Effect: Allow
+              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
+              Resource: "*"
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+              Resource: !Sub "${AudioTempBucket.Arn}/*"
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${StatementBucket.Arn}/*"
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref TwilioSecretArn
 ```
+
+> Roles análogos (CloudFormation `AWS::IAM::Role`) para: `Auth_Service` (DynamoDB Auth_Session PutItem), `balance-query` (solo Logs + VPC), `transfer-breb-validate/execute` (solo Logs + VPC, mock inline), `statement-generator` (S3 PutObject + SQS SendMessage a email-queue), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + S3 GetObject + SQS consume), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), y el rol del state machine (Lambda InvokeFunction de las tasks + SQS SendMessage). Todos incluyen `AWSLambdaVPCAccessExecutionRole` para correr en subnets privadas.
 
 ## Data Models
 
@@ -1999,137 +1761,98 @@ const bedrockAgentRole = {
 
 ### Mock_Core Data (Inline en Action Group Lambdas)
 
-```typescript
-// Shared mock data structure across Action Groups
+```python
+from typing import TypedDict, Literal
 
-interface MockClient {
-  phoneNumber: string;        // E.164
-  name: string;
-  documentId: string;
-  products: MockProduct[];
-  transactions: MockTransaction[];
-}
+# Estructura de datos mock compartida por las Action Group Lambdas (Layer compartido)
+class MockProduct(TypedDict):
+    account_id: str
+    account_number: str
+    product_type: Literal["fondo_inversion", "cuenta_corriente"]
+    product_name: str
+    currency: Literal["COP"]
+    available_balance: float
+    total_balance: float
+    cutoff_date: str            # ISO 8601 date
 
-interface MockProduct {
-  accountId: string;
-  accountNumber: string;      // Número de cuenta visible
-  productType: "fondo_inversion" | "cuenta_corriente";
-  productName: string;
-  currency: "COP";
-  availableBalance: number;
-  totalBalance: number;
-  cutoffDate: string;         // ISO 8601 date
-}
+class MockTransaction(TypedDict):
+    transaction_id: str
+    account_id: str
+    date: str                   # ISO 8601 datetime
+    description: str            # Max 100 chars
+    amount: float
+    currency: Literal["COP"]
+    type: Literal["credit", "debit"]
 
-interface MockTransaction {
-  transactionId: string;
-  accountId: string;
-  date: string;               // ISO 8601 datetime
-  description: string;        // Max 100 chars
-  amount: number;
-  currency: "COP";
-  type: "credit" | "debit";
-}
+class MockClient(TypedDict):
+    phone_number: str           # E.164
+    name: str
+    email: str
+    document_id: str
+    products: list[MockProduct]
+    transactions: list[MockTransaction]
 
-interface TransferReceipt {
-  transactionId: string;
-  sourceAccount: string;
-  destinationAccount: string;
-  amount: number;
-  currency: "COP";
-  concept: string;
-  executedAt: string;
-  status: "COMPLETED" | "FAILED";
-}
 
-// Datos mock
-const MOCK_CLIENTS: MockClient[] = [
-  {
-    phoneNumber: "+573001234567",
-    name: "Carlos Rodríguez",
-    documentId: "1234567890",
-    products: [
-      {
-        accountId: "ACC-001",
-        accountNumber: "2001234567",
-        productType: "fondo_inversion",
-        productName: "Fondo BTG Pactual Liquidez",
-        currency: "COP",
-        availableBalance: 12_500_000.00,
-        totalBalance: 12_500_000.00,
-        cutoffDate: "2024-12-15",
-      },
-      {
-        accountId: "ACC-002",
-        accountNumber: "1001234568",
-        productType: "cuenta_corriente",
-        productName: "Cuenta Corriente BTG",
-        currency: "COP",
-        availableBalance: 3_750_000.50,
-        totalBalance: 4_200_000.50,
-        cutoffDate: "2024-12-15",
-      },
-    ],
-    transactions: [
-      { transactionId: "TRX-001", accountId: "ACC-002", date: "2024-12-14T10:30:00Z", description: "Nómina Empresa XYZ", amount: 5_000_000, currency: "COP", type: "credit" },
-      { transactionId: "TRX-002", accountId: "ACC-002", date: "2024-12-13T15:45:00Z", description: "Pago servicios públicos", amount: -350_000, currency: "COP", type: "debit" },
-      { transactionId: "TRX-003", accountId: "ACC-002", date: "2024-12-12T09:00:00Z", description: "Transferencia a Fondo", amount: -2_000_000, currency: "COP", type: "debit" },
-      { transactionId: "TRX-004", accountId: "ACC-001", date: "2024-12-12T09:01:00Z", description: "Aporte desde Cuenta Corriente", amount: 2_000_000, currency: "COP", type: "credit" },
-      { transactionId: "TRX-005", accountId: "ACC-002", date: "2024-12-10T14:20:00Z", description: "Compra Rappi", amount: -85_000, currency: "COP", type: "debit" },
-    ],
-  },
-  {
-    phoneNumber: "+573009876543",
-    name: "María López",
-    documentId: "0987654321",
-    products: [
-      {
-        accountId: "ACC-003",
-        accountNumber: "2009876543",
-        productType: "fondo_inversion",
-        productName: "Fondo BTG Pactual Renta Fija",
-        currency: "COP",
-        availableBalance: 25_000_000.00,
-        totalBalance: 25_000_000.00,
-        cutoffDate: "2024-12-15",
-      },
-      {
-        accountId: "ACC-004",
-        accountNumber: "1009876544",
-        productType: "cuenta_corriente",
-        productName: "Cuenta Corriente BTG",
-        currency: "COP",
-        availableBalance: 8_750_000.50,
-        totalBalance: 8_750_000.50,
-        cutoffDate: "2024-12-15",
-      },
-    ],
-    transactions: [
-      { transactionId: "TRX-006", accountId: "ACC-004", date: "2024-12-14T08:00:00Z", description: "Transferencia recibida", amount: 3_000_000, currency: "COP", type: "credit" },
-      { transactionId: "TRX-007", accountId: "ACC-004", date: "2024-12-11T16:30:00Z", description: "Pago tarjeta de crédito", amount: -1_500_000, currency: "COP", type: "debit" },
-    ],
-  },
-  {
-    phoneNumber: "+573005551234",
-    name: "Juan García",
-    documentId: "1122334455",
-    products: [
-      {
-        accountId: "ACC-005",
-        accountNumber: "1005551234",
-        productType: "cuenta_corriente",
-        productName: "Cuenta Corriente BTG",
-        currency: "COP",
-        availableBalance: 1_200_000.00,
-        totalBalance: 1_200_000.00,
-        cutoffDate: "2024-12-15",
-      },
-    ],
-    transactions: [
-      { transactionId: "TRX-008", accountId: "ACC-005", date: "2024-12-13T11:00:00Z", description: "Depósito efectivo", amount: 500_000, currency: "COP", type: "credit" },
-    ],
-  },
-];
+MOCK_CLIENTS: list[MockClient] = [
+    {
+        "phone_number": "+573001234567",
+        "name": "Carlos Rodríguez",
+        "email": "carlos.rodriguez@example.com",
+        "document_id": "1234567890",
+        "products": [
+            {"account_id": "ACC-001", "account_number": "2001234567",
+             "product_type": "fondo_inversion", "product_name": "Fondo BTG Pactual Liquidez",
+             "currency": "COP", "available_balance": 12_500_000.00, "total_balance": 12_500_000.00,
+             "cutoff_date": "2024-12-15"},
+            {"account_id": "ACC-002", "account_number": "1001234568",
+             "product_type": "cuenta_corriente", "product_name": "Cuenta Corriente BTG",
+             "currency": "COP", "available_balance": 3_750_000.50, "total_balance": 4_200_000.50,
+             "cutoff_date": "2024-12-15"},
+        ],
+        "transactions": [
+            {"transaction_id": "TRX-001", "account_id": "ACC-002", "date": "2024-12-14T10:30:00Z", "description": "Nómina Empresa XYZ", "amount": 5_000_000, "currency": "COP", "type": "credit"},
+            {"transaction_id": "TRX-002", "account_id": "ACC-002", "date": "2024-12-13T15:45:00Z", "description": "Pago servicios públicos", "amount": -350_000, "currency": "COP", "type": "debit"},
+            {"transaction_id": "TRX-003", "account_id": "ACC-002", "date": "2024-12-12T09:00:00Z", "description": "Transferencia a Fondo", "amount": -2_000_000, "currency": "COP", "type": "debit"},
+            {"transaction_id": "TRX-004", "account_id": "ACC-001", "date": "2024-12-12T09:01:00Z", "description": "Aporte desde Cuenta Corriente", "amount": 2_000_000, "currency": "COP", "type": "credit"},
+            {"transaction_id": "TRX-005", "account_id": "ACC-002", "date": "2024-12-10T14:20:00Z", "description": "Compra Rappi", "amount": -85_000, "currency": "COP", "type": "debit"},
+        ],
+    },
+    {
+        "phone_number": "+573009876543",
+        "name": "María López",
+        "email": "maria.lopez@example.com",
+        "document_id": "0987654321",
+        "products": [
+            {"account_id": "ACC-003", "account_number": "2009876543",
+             "product_type": "fondo_inversion", "product_name": "Fondo BTG Pactual Renta Fija",
+             "currency": "COP", "available_balance": 25_000_000.00, "total_balance": 25_000_000.00,
+             "cutoff_date": "2024-12-15"},
+            {"account_id": "ACC-004", "account_number": "1009876544",
+             "product_type": "cuenta_corriente", "product_name": "Cuenta Corriente BTG",
+             "currency": "COP", "available_balance": 8_750_000.50, "total_balance": 8_750_000.50,
+             "cutoff_date": "2024-12-15"},
+        ],
+        "transactions": [
+            {"transaction_id": "TRX-006", "account_id": "ACC-004", "date": "2024-12-14T08:00:00Z", "description": "Transferencia recibida", "amount": 3_000_000, "currency": "COP", "type": "credit"},
+            {"transaction_id": "TRX-007", "account_id": "ACC-004", "date": "2024-12-11T16:30:00Z", "description": "Pago tarjeta de crédito", "amount": -1_500_000, "currency": "COP", "type": "debit"},
+        ],
+    },
+    {
+        "phone_number": "+573005551234",
+        "name": "Juan García",
+        "email": "juan.garcia@example.com",
+        "document_id": "1122334455",
+        "products": [
+            {"account_id": "ACC-005", "account_number": "1005551234",
+             "product_type": "cuenta_corriente", "product_name": "Cuenta Corriente BTG",
+             "currency": "COP", "available_balance": 1_200_000.00, "total_balance": 1_200_000.00,
+             "cutoff_date": "2024-12-15"},
+        ],
+        "transactions": [
+            {"transaction_id": "TRX-008", "account_id": "ACC-005", "date": "2024-12-13T11:00:00Z", "description": "Depósito efectivo", "amount": 500_000, "currency": "COP", "type": "credit"},
+        ],
+    },
+]
 ```
 
 ### S3 Buckets
@@ -2139,14 +1862,14 @@ const MOCK_CLIENTS: MockClient[] = [
 - **Purpose:** Almacenamiento temporal de archivos de audio para Amazon Transcribe
 - **Lifecycle:** Objetos eliminados automáticamente después de 1 día
 - **Encryption:** AWS managed key (`aws/s3`)
-- **Access:** Solo Message_Handler Lambda
+- **Access:** Solo Message_Processor Lambda
 
 #### Statement_Bucket
 
 - **Purpose:** Almacenamiento temporal de PDFs de extractos bancarios antes de envío como documento adjunto
 - **Lifecycle:** Objetos eliminados automáticamente después de 1 día (PDF se entrega inmediatamente como adjunto)
 - **Encryption:** AWS managed key (`aws/s3`)
-- **Access:** statement-generator Lambda (write) + Message_Handler Lambda (read/download)
+- **Access:** statement-generator Lambda (write) + Message_Processor Lambda (read/download)
 - **Block Public Access:** Enabled (all 4 settings)
 
 ### Secrets Manager Structure
@@ -2155,39 +1878,37 @@ const MOCK_CLIENTS: MockClient[] = [
 {
   "secretName": "btg-connectai/mvp-lite/config",
   "secretValue": {
-    "whatsappPhoneNumberId": "phone-number-id-xxxxx",
-    "bedrockAgentId": "AGENT_ID",
-    "bedrockAgentAliasId": "ALIAS_ID",
+    "twilioAccountSid": "ACxxxxxxxxxxxxxxxxx",
+    "twilioAuthToken": "xxxxxxxxxxxxxxxxxxxx",
+    "twilioWhatsAppNumber": "+14155238886",
+    "twilioTcTemplateSid": "HXxxxxxxxxxxxxxxxxx",
     "loginPageUrl": "https://d1234567.cloudfront.net",
     "authServiceUrl": "https://xyz123.lambda-url.us-east-1.on.aws"
   }
 }
 ```
 
-### Log Schema (Structured JSON via Powertools)
+### Log Schema (Structured JSON via aws-lambda-powertools)
 
-```typescript
-interface StructuredLog {
-  level: "INFO" | "WARN" | "ERROR";
-  message: string;
-  timestamp: string;
-  service: string; // "whatsapp-gateway" | "auth-service" | "balance-query" | "transfer-breb" | "statement-generator"
-  correlation_id: string;
-  request_id: string;
-  lambda_function: {
-    name: string;
-    memory_allocated: number;
-    arn: string;
-  };
-  // Custom fields
-  latency_ms?: number;
-  status_code?: number;
-  phone_number_masked?: string;  // "****4567"
-  whatsapp_message_id?: string;
-  action?: string;               // "dedup_check" | "consent_check" | "auth_check" | "transcribe" | "invoke_agent" | "send_response"
-  message_type?: string;         // "text" | "audio" | "interactive"
-  auth_event?: string;           // "login_success" | "login_failed" | "session_expired"
-}
+```python
+from typing import TypedDict, Literal, NotRequired
+
+class StructuredLog(TypedDict):
+    level: Literal["INFO", "WARNING", "ERROR"]
+    message: str
+    timestamp: str
+    service: str   # "webhook-receiver" | "message-processor" | "ai-agent" | "auth-service" | ...
+    correlation_id: str
+    function_request_id: str
+    # Campos custom
+    latency_ms: NotRequired[float]
+    status_code: NotRequired[int]
+    phone_number_masked: NotRequired[str]   # "****4567"
+    message_sid: NotRequired[str]            # Twilio MessageSid
+    execution_arn: NotRequired[str]          # Step Functions (transferencias)
+    action: NotRequired[str]                 # "consent_check" | "auth_check" | "transcribe" | "invoke_agent" | "otp_callback" | "send_response"
+    message_type: NotRequired[str]           # "text" | "audio" | "button"
+    auth_event: NotRequired[str]             # "login_success" | "login_failed" | "session_expired"
 ```
 
 ### Data Masking Rules
@@ -2206,19 +1927,19 @@ interface StructuredLog {
 
 ### Property 1: Message Splitting Round-Trip
 
-*For any* string of arbitrary length, splitting it into chunks of maximum 4096 characters and then concatenating those chunks SHALL produce the original string (minus leading whitespace on subsequent chunks), and every individual chunk SHALL have length ≤ 4096 characters.
+*For any* string of arbitrary length, splitting it into chunks of maximum 1600 characters (límite de Twilio WhatsApp) and then concatenating those chunks SHALL produce the original string (minus leading whitespace on subsequent chunks), and every individual chunk SHALL have length ≤ 1600 characters.
 
-**Validates: Requirements 3.6**
+**Validates: Requirements 3.10**
 
-### Property 2: Deduplication Idempotency
+### Property 2: SQS FIFO Deduplication (delegada al servicio)
 
-*For any* valid WhatsApp message ID string, calling the deduplication check function twice with the same ID SHALL return `false` (not duplicate) on the first call and `true` (duplicate) on the second call, regardless of the message ID format or content.
+La deduplicación de mensajes entrantes NO es código custom — la garantiza SQS FIFO. *For any* webhook reenviado por Twilio con el mismo `MessageSid`, el `Webhook_Receiver` lo publica con `MessageDeduplicationId = MessageSid`; SQS FIFO SHALL entregar el mensaje al `Message_Processor` exactamente una vez dentro de la ventana de deduplicación de 5 minutos. Esta propiedad se valida con un test de integración (no property-based unit test), enviando el mismo webhook dos veces y verificando una sola invocación del Processor.
 
 **Validates: Requirements 3.4**
 
 ### Property 3: Session ID Determinism
 
-*For any* valid E.164 phone number, the `deriveSessionId` function SHALL always produce the same session ID for the same phone number (deterministic), and two different phone numbers SHALL produce different session IDs (injective).
+*For any* valid E.164 phone number, the `derive_session_id` function SHALL always produce the same session ID for the same phone number (deterministic), and two different phone numbers SHALL produce different session IDs (injective).
 
 **Validates: Requirements 11.1**
 
@@ -2308,83 +2029,86 @@ interface StructuredLog {
 
 | Error Scenario | Component | User-Facing Response | Log Action |
 |---------------|-----------|---------------------|------------|
-| Non-text/audio message | Message_Handler | "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta." | INFO log with message type |
-| Duplicate message | Message_Handler | None (silently discarded) | INFO log with message ID |
-| Consent_Store unavailable | Message_Handler | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with DDB error |
-| T&C rejected | Message_Handler | "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje." | INFO log |
-| Audio transcription failed | Message_Handler | "No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto." | ERROR log with transcription error |
-| Auth_Session expired | Message_Handler | "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar." + login button | INFO log |
-| Auth_Session not found | Message_Handler | "🔐 Para ejecutar operaciones bancarias necesitas autenticarte." + login button | INFO log |
+| Non-text/audio message | Message_Processor | "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta." | INFO log with message type |
+| Duplicate message (Twilio retry) | SQS FIFO | None (descartado automáticamente por MessageDeduplicationId) | Visible en métrica SQS, sin invocación del Processor |
+| Consent_Store unavailable | Message_Processor | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with DDB error |
+| T&C rejected | Message_Processor | "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje." | INFO log |
+| Audio transcription failed | Message_Processor | "No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto." | ERROR log with transcription error |
+| Auth_Session expired | Message_Processor | "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar." + login button | INFO log |
+| Auth_Session not found | Message_Processor | "🔐 Para ejecutar operaciones bancarias necesitas autenticarte." + login button | INFO log |
 | Invalid credentials | Auth_Service | Login_Page shows: "Credenciales incorrectas. Verifica tu usuario y contraseña." | WARN log with masked username |
-| Bedrock Agent timeout (>15s) | Message_Handler | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with latency |
-| Bedrock Agent error | Message_Handler | "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo." | ERROR log with error details |
-| Guardrails block (input) | Bedrock Agent | Guardrail's configured blocked input message | WARN log with block reason |
-| Guardrails block (output) | Bedrock Agent | Guardrail's configured blocked output message | WARN log with block reason |
+| Strands Agent timeout (>60s) | Message_Processor | "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos." | ERROR log with latency; SQS reintenta el mensaje |
+| Strands Agent error | Message_Processor | "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo." | ERROR log with error details |
+| Guardrails block (input) | Strands Agent | Guardrail's configured blocked input message | WARN log with block reason |
+| Guardrails block (output) | Strands Agent | Guardrail's configured blocked output message | WARN log with block reason |
 | Client not found in Mock_Core | Action Groups | Agent formats: "No encontré información de cuenta asociada a tu número." | INFO log with masked phone |
 | Insufficient funds | transfer-breb | Agent formats: "No tienes fondos suficientes en la cuenta origen para esta transferencia." | INFO log |
 | Invalid destination account | transfer-breb | Agent formats: "La cuenta destino no fue encontrada. Verifica el número e intenta de nuevo." | INFO log |
 | Future cutoff date | statement-generator | Agent formats: "La fecha de corte debe ser una fecha pasada. Por favor indica una fecha anterior a hoy." | INFO log |
 | PDF generation failure | statement-generator | Agent formats: "No pude generar el extracto. Por favor intenta de nuevo." | ERROR log |
-| DynamoDB write failure (dedup) | Message_Handler | Process message anyway (dedup is best-effort) | ERROR log, continue processing |
-| DynamoDB read failure (auth) | Message_Handler | "⚠️ Servicio temporalmente no disponible." | ERROR log |
+| DynamoDB read failure (auth/otp) | Message_Processor | "⚠️ Servicio temporalmente no disponible." | ERROR log; SQS reintenta |
 | Secrets Manager failure | All Lambdas | "Servicio temporalmente no disponible." | ERROR log with secret name |
-| EUMS SendMessage failure | Message_Handler | None (cannot reach user) | ERROR log with EUMS error |
+| Twilio messages.create failure | Message_Processor | None (cannot reach user) | ERROR log; SQS reintenta el mensaje completo |
 
 ### Retry Strategy
 
 | Operation | Retries | Backoff | Notes |
 |-----------|---------|---------|-------|
-| DynamoDB PutItem (dedup) | 0 | N/A | Best effort — process anyway on failure |
-| DynamoDB GetItem (consent/auth) | 1 | 100ms | Critical path — retry once |
-| Bedrock InvokeAgent | 0 | N/A | Timeout at 15s, no retry |
-| Amazon Transcribe | 0 | N/A | Polling with 10s max wait |
-| EUMS SendWhatsAppMessage | 2 | Exponential (100ms, 200ms) | Important for delivery |
+| SQS SendMessage (Webhook_Receiver) | 2 | boto3 default | Si falla, Twilio reintenta el webhook; SQS FIFO descarta el duplicado |
+| DynamoDB GetItem (consent/auth/otp) | 1 | 100ms | Critical path — retry once |
+| Strands Agent invoke (Lambda) | 0 | N/A | Timeout at 60s, no retry (SQS reintenta el mensaje completo) |
+| Amazon Transcribe | 0 | N/A | Polling con 30s max wait |
+| Twilio messages.create | 2 | Exponential (100ms, 200ms) | Important for delivery |
 | S3 PutObject (PDF) | 1 | 100ms | Retry once for transient errors |
-| Secrets Manager GetSecret | 1 | 100ms | Cached after first call |
+| Secrets Manager GetSecret | 1 | 100ms | Cached en cold start |
+| SQS message processing (Message_Processor) | 3 | Visibility timeout 130s | maxReceiveCount=3 → DLQ |
 
 ### Error Response Templates (Spanish)
 
-```typescript
-const ERROR_MESSAGES = {
-  unsupportedFormat: "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta.",
-  transcriptionFailed: "🎙️ No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto.",
-  serviceUnavailable: "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos.",
-  genericError: "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo.",
-  consentRequired: "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje.",
-  authRequired: "🔐 Para ejecutar operaciones bancarias necesitas autenticarte.",
-  authExpired: "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar.",
-  authSuccess: "✅ ¡Autenticación exitosa! Procesando tu solicitud...",
-  welcomeMessage: "👋 ¡Bienvenido a BTG ConnectAI! Estos son los servicios disponibles:\n\n" +
-    "💰 *Consulta de saldos* — Fondos de Inversión y Cuenta Corriente\n" +
-    "💸 *Transferencias BRE-B* — Entre cuentas\n" +
-    "📄 *Extractos bancarios* — Generación de PDF\n\n" +
-    "Puedes solicitarme cualquier servicio en lenguaje natural. ¡Escríbeme o envíame una nota de voz!",
-} as const;
+```python
+ERROR_MESSAGES = {
+    "unsupported_format": "👋 Solo acepto mensajes de texto y notas de voz. Escríbeme o envíame un audio con tu consulta.",
+    "transcription_failed": "🎙️ No pude procesar tu nota de voz. Por favor intenta enviarla de nuevo o escríbeme tu consulta como texto.",
+    "service_unavailable": "⚠️ Nuestro servicio está temporalmente no disponible. Por favor intenta de nuevo en unos minutos.",
+    "generic_error": "Lo siento, ocurrió un error procesando tu solicitud. Por favor intenta de nuevo.",
+    "consent_required": "Para usar nuestros servicios es necesario aceptar los Términos y Condiciones. Cuando estés listo, envíanos un mensaje.",
+    "auth_required": "🔐 Para ejecutar operaciones bancarias necesitas autenticarte.",
+    "auth_expired": "🔐 Tu sesión ha expirado. Necesitas autenticarte de nuevo para continuar.",
+    "auth_success": "✅ ¡Autenticación exitosa! Procesando tu solicitud...",
+    "welcome_message": (
+        "👋 ¡Bienvenido a BTG ConnectAI! Estos son los servicios disponibles:\n\n"
+        "💰 *Consulta de saldos* — Fondos de Inversión y Cuenta Corriente\n"
+        "💸 *Transferencias BRE-B* — Entre cuentas\n"
+        "📄 *Extractos bancarios* — Generación de PDF\n\n"
+        "Puedes solicitarme cualquier servicio en lenguaje natural. ¡Escríbeme o envíame una nota de voz!"
+    ),
+}
 ```
 
 ### Timeout Configuration
 
 | Component | Timeout | Rationale |
 |-----------|---------|-----------|
-| Message_Handler Lambda | 60s | Accommodates transcription (10s) + agent (15s) + EUMS send |
+| Webhook_Receiver Lambda | 10s | Solo valida firma + encola; resuelve <1s |
+| Message_Processor Lambda | 120s | Transcripción (30s) + Strands agent (60s) + envío Twilio |
 | Auth_Service Lambda | 10s | Simple credential check + DDB write |
 | balance-query Lambda | 15s | Mock data instant, buffer for cold start |
-| transfer-breb Lambda | 15s | Mock data instant, buffer for cold start |
+| transfer-breb-validate/execute Lambda | 15s | Mock data instant, buffer for cold start |
 | statement-generator Lambda | 30s | PDF generation + S3 upload |
-| Transcription polling | 10s | Max wait for Amazon Transcribe |
-| Bedrock Agent response | 15s | Max wait before timeout error |
+| Transcription polling | 30s | Max wait para Amazon Transcribe (async, sin presión) |
+| Strands Agent invoke | 60s | Max wait antes de timeout |
+| inbound-messages-queue visibility | 130s | Apenas > timeout del Processor (120s) |
 
 ## Testing Strategy
 
 ### Property-Based Testing (PBT)
 
-**Library:** [fast-check](https://github.com/dubzzz/fast-check) (TypeScript)  
-**Minimum iterations:** 100 per property  
+**Library:** [hypothesis](https://hypothesis.readthedocs.io/) (Python)  
+**Minimum iterations:** 100 per property (`@settings(max_examples=100)`)  
 **Tag format:** `Feature: btg-connect-ai-mvp-lite, Property {number}: {title}`
 
-Properties to implement as PBT:
-1. Message splitting round-trip
-2. Deduplication idempotency
+Properties to implement as PBT (con hypothesis):
+1. Message splitting round-trip (≤ 1600 chars)
 3. Session ID determinism
 4. Data masking correctness
 5. Consent gate logic
@@ -2394,19 +2118,21 @@ Properties to implement as PBT:
 9. Balance query correctness
 10. Unknown client error
 11. Transfer receipt validity
-12. Insufficient funds rejection
+12. Insufficient funds rejection (raises `InsufficientFundsError`)
 13. Future date rejection
 14. Statement generation with S3 reference
 15. COP currency formatting
 16. Unsupported format rejection
 
+> Property 2 (deduplicación) NO es PBT — la garantiza SQS FIFO y se valida con test de integración.
+
 ### Unit Tests (Example-Based)
 
 | Test | Component | What it verifies |
 |------|-----------|-----------------|
-| T&C interactive message format | Message_Handler | Correct WhatsApp interactive payload structure |
-| Welcome message content | Message_Handler | All 3 services listed in welcome |
-| Login button message format | Message_Handler | Correct interactive button payload |
+| T&C interactive message format | Message_Processor | Correct WhatsApp interactive payload structure |
+| Welcome message content | Message_Processor | All 3 services listed in welcome |
+| Login button message format | Message_Processor | Correct interactive button payload |
 | Auth_Service with each test user | Auth_Service | Each of 3 users can authenticate |
 | Transfer cancellation | transfer-breb | No state change on cancel |
 | Empty statement generation | statement-generator | PDF generated with "no transactions" note |
@@ -2426,26 +2152,33 @@ Properties to implement as PBT:
 | Guardrails blocking | Out-of-domain request → blocked response |
 | Session memory | Multi-turn conversation with context |
 
-### CDK Snapshot Tests
+### CloudFormation Template Validation
 
-| Test | What it verifies |
-|------|-----------------|
-| No VpcConfig on any Lambda | All Lambdas serverless without VPC |
-| DynamoDB encryption settings | AWS managed keys configured |
-| S3 bucket policies | Block public access enabled |
-| IAM policy scoping | Least privilege per Lambda |
-| CloudWatch alarm configuration | 10% error threshold, 5min window |
-| Lambda runtime | All Lambdas use Node.js 24.x |
+| Test | Tool | What it verifies |
+|------|------|-----------------|
+| Template lint | `cfn-lint` | Sintaxis y best practices de todos los templates YAML |
+| VpcConfig en todas las Lambdas | `cfn-lint` custom rule / pytest sobre template | Todas las Lambdas tienen `VpcConfig` apuntando a subnets privadas IA-Builder |
+| DynamoDB encryption | pytest sobre template | AWS managed keys configuradas |
+| S3 Block Public Access | pytest sobre template | Los 4 settings habilitados en cada bucket |
+| IAM policy scoping | `cfn-nag` / `checkov` | Least privilege por Lambda, sin wildcards peligrosos |
+| CloudWatch alarms | pytest sobre template | Threshold 10% error, ventana 5min |
+| Lambda runtime | pytest sobre template | Todas las Lambdas usan `python3.13` |
+| SQS FIFO dedup | pytest sobre template | inbound-queue es `.fifo` con dedup por MessageDeduplicationId |
 
 ### Test Execution
 
 ```bash
-# Unit + Property tests
-npx vitest --run
+# Unit + Property tests (pytest + hypothesis)
+pytest src/tests/unit src/tests/property -v
 
-# CDK snapshot tests
-cd infra && npx jest --run
+# Validación de templates CloudFormation
+cfn-lint cloudformation/templates/connectai/*.yaml cloudformation/stacks/sandbox/*.yaml
+checkov -d cloudformation/   # security scanning (IAM, encryption, public access)
 
-# Integration tests (requires deployed stack)
-npx vitest --run --config vitest.integration.config.ts
+# Validar definición del state machine
+aws stepfunctions validate-state-machine-definition \
+  --definition file://cloudformation/state-machines/transfer-breb.asl.json
+
+# Integration tests (requiere stack desplegado en sandbox)
+pytest src/tests/integration -v --stack-name BTGConnectAI-sandbox
 ```

@@ -2,530 +2,435 @@
 
 ## Overview
 
-Implementación incremental de un asistente bancario conversacional para WhatsApp usando Twilio (sandbox), Amazon API Gateway, Strands Agent SDK (Python 3.12) sobre Amazon Bedrock (Claude Haiku 3.5), y funciones Lambda Node.js 24.x para negocio. Las Lambdas corren en subnets privadas de la VPC `IA-Builder-sandbox-networking` con salida a internet via NAT Gateway.
+Implementación incremental de un asistente bancario conversacional para WhatsApp usando Twilio (sandbox), Amazon API Gateway, Strands Agent SDK sobre Amazon Bedrock (Claude Haiku 3.5). **Stack 100% Python 3.13** para todas las Lambdas. IaC con **CloudFormation puro (YAML)** siguiendo el patrón del repo `infra`. Las Lambdas corren en subnets privadas de la VPC `IA-Builder-sandbox-networking` con salida a internet via NAT Gateway.
 
 **Patrones arquitectónicos clave:**
 
-- **AWS Step Functions** orquesta la transferencia BRE-B como state machine (`TransferBrebStateMachine`) usando `waitForTaskToken` para el callback del OTP — esto resuelve la espera asíncrona del input del usuario sin bloquear Lambdas.
-- **Amazon SQS** desacopla las notificaciones (email, SMS post-operación) del flujo principal: productores publican eventos fire-and-forget, consumidores procesan en batch con reintentos automáticos y DLQ.
+- **Async Webhook Pattern**: `Webhook_Receiver` (sync, responde 200 a Twilio en <1s) → SQS FIFO → `Message_Processor` (async). Twilio nunca experimenta timeouts.
+- **SQS FIFO** con dedup nativa (`MessageDeduplicationId = MessageSid`) — elimina la tabla Dedup custom — y orden por cliente (`MessageGroupId = phoneNumber`).
+- **AWS Step Functions** orquesta la transferencia BRE-B (`TransferBrebStateMachine`) usando `waitForTaskToken` para el callback del OTP — sin bloquear Lambdas.
+- **Amazon SQS** desacopla las notificaciones (email, SMS post-operación): productores fire-and-forget, consumidores en batch con DLQ.
+
+**Convenciones de empaquetado (CloudFormation, sin CDK/SAM):**
+
+- Código Lambda en `src/lambdas/<nombre>/handler.py`; se zipea y sube a S3; el template referencia `Code: {S3Bucket, S3Key}`.
+- Dependencias compartidas (`twilio`, `aws-lambda-powertools`, `strands-agents`, código `src/shared/`) en un **Lambda Layer** común.
+- Tests con **pytest** (unit/integration) y **hypothesis** (property-based).
 
 ## Tasks
 
-- [ ] 1. Set up project structure, shared utilities, and CDK foundation
-  - [ ] 1.1 Initialize project structure with TypeScript and Python configuration
-    - Create directory structure: `infra/bin/`, `infra/lib/stacks/`, `infra/lib/constructs/`, `infra/lib/state-machines/`, `infra/lib/config/`, `src/lambdas/`, `src/shared/`, `src/login-page/`, `src/tests/unit/`, `src/tests/property/`
-    - Initialize `package.json` with dependencies: aws-cdk-lib, constructs, @aws-sdk/client-dynamodb, @aws-sdk/client-s3, @aws-sdk/client-transcribe, @aws-sdk/client-pinpoint, @aws-sdk/client-ses, @aws-sdk/client-sqs, @aws-sdk/client-sfn, @aws-sdk/client-lambda, @aws-lambda-powertools/logger, @aws-lambda-powertools/metrics, @aws-lambda-powertools/batch, twilio, uuid, pdfkit
-    - Configure `tsconfig.json` for Node.js 24.x with strict mode
-    - Configure `cdk.json` with app entry point
-    - Add vitest as test framework with `vitest.config.ts`
-    - Add fast-check for property-based testing
-    - Create `src/lambdas/ai-agent/requirements.txt` with Python dependencies: strands-agents, boto3, aws-lambda-powertools
+- [ ] 1. Set up project structure, shared layer, and CloudFormation foundation
+  - [ ] 1.1 Initialize project structure
+    - Create directory structure: `cloudformation/templates/connectai/`, `cloudformation/stacks/sandbox/`, `cloudformation/state-machines/`, `.github/workflows/`, `src/lambdas/`, `src/shared/`, `src/login-page/`, `src/tests/unit/`, `src/tests/property/`, `src/tests/integration/`
+    - Create `src/requirements.txt` (runtime): `twilio`, `aws-lambda-powertools[parser]`, `strands-agents`, `fpdf2` (o `reportlab`)
+    - Create `src/requirements-dev.txt` (dev): `pytest`, `hypothesis`, `moto`, `boto3-stubs`, `cfn-lint`, `checkov`
+    - Create `pyproject.toml` con config de pytest, ruff/black y target Python 3.13
     - _Requirements: 15.4, 15.5_
 
-  - [ ] 1.2 Implement shared utilities (logger, masking, constants, types)
-    - Create `src/shared/logger.ts` — Lambda Powertools logger configuration with service name and structured JSON output
-    - Create `src/shared/masking.ts` — Data masking for phone numbers (last 4), account numbers (last 4), document IDs (last 4)
-    - Create `src/shared/constants.ts` — Shared constants (MAX_TWILIO_MESSAGE_LENGTH=1600, AUTH_SESSION_TTL=1800, DEDUP_TTL=600, OTP_TTL=300, TC_VERSION="1.0")
-    - Create `src/shared/types.ts` — Shared TypeScript interfaces: TwilioWebhookPayload, ConsentRecord, AuthSession, OTPRecord, ActionGroupRequest, ActionGroupResponse, MockClient, MockProduct, MockTransaction
-    - Create `src/shared/formatting.ts` — COP currency formatting ($X.XXX.XXX,YY)
+  - [ ] 1.2 Implement shared utilities (Lambda Layer)
+    - Create `src/shared/logger.py` — config de `aws_lambda_powertools.Logger` con service name y JSON estructurado
+    - Create `src/shared/masking.py` — masking de teléfono (últimos 4), cuenta (últimos 4), documento (últimos 4)
+    - Create `src/shared/constants.py` — constantes (`MAX_TWILIO_MESSAGE_LENGTH=1600`, `AUTH_SESSION_TTL=1800`, `OTP_TTL=300`, `TC_VERSION="1.0"`)
+    - Create `src/shared/types.py` — `TypedDict`s compartidos: `TwilioWebhookPayload`, `ConsentRecord`, `AuthSession`, `OTPRecord`, `MockClient`, `MockProduct`, `MockTransaction`, `EmailNotificationEvent`, `SmsNotificationEvent`
+    - Create `src/shared/formatting.py` — formato de moneda COP ($X.XXX.XXX,YY)
+    - Empaquetar `src/shared/` + deps de `requirements.txt` como Lambda Layer (`layer/python/`)
     - _Requirements: 13.1, 14.4, 10.5_
 
-  - [ ]* 1.3 Write property tests for shared utilities
-    - **Property 4: Data Masking Correctness** — For any string ≥ 4 chars, masking retains only last 4 visible
-    - **Property 15: COP Currency Formatting** — For any non-negative number, produces $X.XXX.XXX,YY pattern
+  - [ ]* 1.3 Write property tests for shared utilities (hypothesis)
+    - **Property 4: Data Masking Correctness** — Para cualquier string ≥ 4 chars, masking deja solo últimos 4 visibles
+    - **Property 15: COP Currency Formatting** — Para cualquier número no-negativo, produce patrón $X.XXX.XXX,YY
     - _Validates: Requirements 14.4, 10.5_
 
-  - [ ]* 1.4 Write unit tests for shared utilities
+  - [ ]* 1.4 Write unit tests for shared utilities (pytest)
     - Test masking edge cases (strings < 4 chars, empty strings)
-    - Test COP formatting with 0, integers, large numbers, decimals
+    - Test COP formatting con 0, enteros, números grandes, decimales
     - _Requirements: 14.4, 10.5_
 
-- [ ] 2. Implement CDK infrastructure stack (DynamoDB, S3, Secrets)
-  - [ ] 2.1 Create DynamoDB tables construct
-    - Create `infra/lib/constructs/dynamodb-tables.ts`
-    - Consent_Store table: pk (String), PAY_PER_REQUEST, AWS managed encryption
-    - Auth_Session table: pk (String), TTL on `ttl`, PAY_PER_REQUEST, AWS managed encryption
-    - OTP_Store table: pk (String, phoneNumber), TTL on `ttl` (5 min), PAY_PER_REQUEST, AWS managed encryption (incluye campos `code`, `taskToken`, `executionArn`, `attempts`, `transferContext`)
-    - **NOTA**: la tabla Dedup custom NO se crea — la dedup de mensajes entrantes la maneja SQS FIFO con `MessageDeduplicationId`
+- [ ] 2. Implement data, storage, queues & security CloudFormation templates
+  - [ ] 2.1 Create DynamoDB tables template
+    - Create `cloudformation/templates/connectai/data.yaml`
+    - Consent_Store: `pk` (String), PAY_PER_REQUEST, SSE AWS managed
+    - Auth_Session: `pk` (String), TTL en `ttl`, PAY_PER_REQUEST, SSE
+    - OTP_Store: `pk` (String, phoneNumber), TTL en `ttl` (5 min), PAY_PER_REQUEST, SSE (campos `code`, `taskToken`, `executionArn`, `attempts`, `transferContext`)
+    - **NOTA**: NO se crea tabla Dedup — la dedup la maneja SQS FIFO con `MessageDeduplicationId`
     - _Requirements: 1.5, 5.3, 6.1, 14.1, 16.1_
 
-  - [ ] 2.2 Create S3 buckets construct
-    - Audio_Temp_Bucket: 1-day lifecycle rule, AWS managed encryption, block public access
-    - Statement_Bucket: 1-day lifecycle rule, AWS managed encryption, block public access
-    - Login_Page_Bucket: static website hosting, public read for assets
+  - [ ] 2.2 Create S3 buckets template
+    - Create `cloudformation/templates/connectai/storage.yaml`
+    - Audio_Temp_Bucket: lifecycle 1 día, SSE, BlockPublicAccess (4 settings)
+    - Statement_Bucket: lifecycle 1 día, SSE, BlockPublicAccess
+    - Login_Page_Bucket: static website hosting + bucket policy de lectura pública para assets
+    - Bucket para artefactos de deploy (código Lambda zipeado) si no se reusa el de `infra`
     - _Requirements: 9.3, 14.1, 14.7_
 
-  - [ ] 2.3 Create Secrets Manager and SNS alarms construct
-    - Create `infra/lib/constructs/security.ts`
-    - Secrets Manager secret: twilioAccountSid, twilioAuthToken, twilioWhatsAppNumber, loginPageUrl, authServiceUrl
-    - SNS topic for CloudWatch alarms only (no message routing)
+  - [ ] 2.3 Create Secrets Manager & SNS alarms template
+    - Create `cloudformation/templates/connectai/secrets.yaml`
+    - `AWS::SecretsManager::Secret`: twilioAccountSid, twilioAuthToken, twilioWhatsAppNumber, twilioTcTemplateSid, loginPageUrl, authServiceUrl
+    - `AWS::SNS::Topic` para alarmas de CloudWatch
     - _Requirements: 14.5, 15.7, 13.4_
 
-  - [ ] 2.4 Create SQS notification queues construct
-    - Create `infra/lib/constructs/notification-queues.ts`
-    - `email-notification-queue` + `email-dlq` (maxReceiveCount=3, visibilityTimeout=60s, retention=4d, receiveWait=20s, encryption=SQS_MANAGED)
-    - `sms-notification-queue` + `sms-dlq` (mismas configuraciones)
-    - CloudWatch alarm: `ApproximateNumberOfMessagesVisible > 0` en cada DLQ → SNS alarm topic
-    - Export queue URLs y ARNs para uso en otros constructs
+  - [ ] 2.4 Create notification queues template (SQS)
+    - Create `cloudformation/templates/connectai/queues.yaml` (parte 1)
+    - `email-notification-queue` + `email-dlq` (maxReceiveCount=3, visibilityTimeout=60s, retention=4d, receiveWait=20s, SSE-SQS)
+    - `sms-notification-queue` + `sms-dlq` (misma config)
+    - `AWS::CloudWatch::Alarm`: `ApproximateNumberOfMessagesVisible > 0` en cada DLQ → SNS alarm topic
+    - Outputs con URLs y ARNs (Export para nested stacks)
     - _Requirements: 17.1, 17.6_
 
-  - [ ] 2.5 Create VPC and Security Group construct
-    - Create `infra/lib/constructs/vpc-config.ts`
-    - Import VPC via `ec2.Vpc.fromLookup` or `Fn.importValue('IA-Builder-sandbox-networking-VpcId')`
-    - Import private subnet IDs via `Fn.importValue('IA-Builder-sandbox-networking-PrivateSubnetIds')`
-    - Create Lambda Security Group: no inbound rules, outbound TCP 443 to 0.0.0.0/0
-    - Export `vpcConfig` object (vpc, subnets, securityGroups) for use in all Lambda constructs
-    - _Requirements: 15.1, 15.2_
+  - [ ] 2.5 Create Lambda Security Group template (importa networking)
+    - Create `cloudformation/templates/connectai/security-group.yaml`
+    - Importar `VpcId` vía `Fn::ImportValue: IA-Builder-sandbox-networking-VpcId`
+    - `AWS::EC2::SecurityGroup` para Lambdas: sin reglas de ingress, egress TCP 443 a 0.0.0.0/0
+    - Las subnets privadas se importan vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds` (split con `Fn::Split`)
+    - Output: SecurityGroupId + SubnetIds para uso en los templates de Lambdas
+    - _Requirements: 15.1, 15.2, 15.7_
 
-  - [ ] 2.6 Create Inbound Messages Queue construct (SQS FIFO)
-    - Create `infra/lib/constructs/inbound-messages-queue.ts`
-    - SQS FIFO queue `inbound-messages-queue.fifo`:
-      - `contentBasedDeduplication: false` (dedup explícita por `MessageDeduplicationId`)
-      - `deduplicationScope: messageGroup` (dedup independiente por phoneNumber)
-      - `fifoThroughputLimit: perMessageGroupId` (mayor throughput)
-      - `visibilityTimeout: 130s` (apenas más que el timeout del Processor)
-      - `messageRetentionPeriod: 1 día`
-      - `receiveWaitTime: 20s` (long polling)
-      - `encryption: SQS_MANAGED`
-    - DLQ `inbound-messages-dlq.fifo` con `maxReceiveCount: 3`
-    - CloudWatch alarm: `ApproximateNumberOfMessagesVisible > 0` en DLQ → SNS alarm topic
-    - CloudWatch alarm: `ApproximateAgeOfOldestMessage > 60s` en la cola activa → indica Processor saturado
-    - Export queue URL y ARN
+  - [ ] 2.6 Create Inbound Messages Queue (SQS FIFO)
+    - Create `cloudformation/templates/connectai/queues.yaml` (parte 2) o `inbound-queue.yaml`
+    - `AWS::SQS::Queue` `inbound-messages-queue.fifo`:
+      - `FifoQueue: true`, `ContentBasedDeduplication: false`, `DeduplicationScope: messageGroup`, `FifoThroughputLimit: perMessageGroupId`
+      - `VisibilityTimeout: 130`, `MessageRetentionPeriod: 86400` (1 día), `ReceiveMessageWaitTimeSeconds: 20`, `SqsManagedSseEnabled: true`
+    - DLQ `inbound-messages-dlq.fifo` con `RedrivePolicy maxReceiveCount: 3`
+    - Alarmas: DLQ `MessagesVisible > 0`; `ApproximateAgeOfOldestMessage > 60s` en la cola activa
     - _Requirements: 3.3, 3.5, 3.9, 15.8_
 
-- [ ] 3. Checkpoint — Ensure infrastructure constructs compile
-  - Ensure all tests pass, ask the user if questions arise.
+- [ ] 3. Checkpoint — `cfn-lint` pasa en los templates base
+  - `cfn-lint cloudformation/templates/connectai/*.yaml`. Ask the user if questions arise.
 
 - [ ] 4. Implement Webhook_Receiver Lambda (sync, behind API Gateway)
   - [ ] 4.1 Implement Twilio signature validation
-    - Create `src/lambdas/webhook-receiver/twilio-signature.ts`
-    - `validateTwilioSignature(authToken, signature, url, params)` — usa `twilio.validateRequest` para verificar el header `X-Twilio-Signature`
-    - Si la firma no coincide, el handler debe responder 403 sin encolar
+    - Create `src/lambdas/webhook_receiver/twilio_signature.py`
+    - `validate_twilio_signature(auth_token, signature, url, params)` — usa `twilio.request_validator.RequestValidator`
+    - Si la firma no coincide, el handler responde 403 sin encolar
     - _Requirements: 3.2_
 
   - [ ] 4.2 Implement form-urlencoded parser
-    - Create `src/lambdas/webhook-receiver/parser.ts`
-    - `parseFormUrlencoded(body, isBase64)` — Decodifica el body (Twilio envía `application/x-www-form-urlencoded`)
-    - Extrae todos los campos relevantes: `MessageSid`, `From`, `To`, `Body`, `NumMedia`, `MediaUrl0`, `MediaContentType0`, `ButtonPayload`, `ProfileName`
+    - Create `src/lambdas/webhook_receiver/parser.py`
+    - `parse_form_urlencoded(body, is_base64)` — usa `urllib.parse.parse_qs`
+    - Extrae `MessageSid`, `From`, `To`, `Body`, `NumMedia`, `MediaUrl0`, `MediaContentType0`, `ButtonPayload`, `ProfileName`
     - _Requirements: 3.1_
 
   - [ ] 4.3 Implement SQS enqueue logic
-    - Create `src/lambdas/webhook-receiver/enqueue.ts`
-    - `enqueueMessage(payload, correlationId)` — SendMessage a `inbound-messages-queue.fifo` con:
-      - `MessageGroupId: payload.From` (orden por cliente)
-      - `MessageDeduplicationId: payload.MessageSid` (dedup gratis)
-      - `MessageBody`: JSON.stringify({...payload, correlationId, receivedAt: ISO 8601})
+    - Create `src/lambdas/webhook_receiver/enqueue.py`
+    - `enqueue_message(payload, correlation_id)` — boto3 `sqs.send_message` con `MessageGroupId=From`, `MessageDeduplicationId=MessageSid`, body JSON con `correlationId` y `receivedAt`
     - _Requirements: 3.3, 3.4_
 
   - [ ] 4.4 Implement Webhook_Receiver main handler
-    - Create `src/lambdas/webhook-receiver/index.ts`
-    - Handler signature: `APIGatewayProxyHandlerV2`
-    - Generar `correlationId` (UUID v4) ANTES de cualquier operación, propagarlo en logger
-    - Pipeline: validar firma Twilio → parsear body → enqueue a SQS → return 200 OK
-    - Si validación de firma falla → 403; si SQS falla → 5xx (Twilio reintentará y SQS FIFO descartará el duplicado)
-    - Target latency: <1s en p99
+    - Create `src/lambdas/webhook_receiver/handler.py`
+    - Decorador `@logger.inject_lambda_context`; genera `correlation_id` (UUID v4) antes de todo
+    - Pipeline: validar firma → parsear body → enqueue → `{"statusCode": 200, "body": ""}`
+    - Firma inválida → 403; fallo SQS → 5xx (Twilio reintenta, SQS FIFO descarta duplicado)
+    - Target latency: <1s p99
     - _Requirements: 3.1, 3.2, 3.3, 13.2_
 
-  - [ ]* 4.5 Write unit tests for Webhook_Receiver
-    - Valid Twilio signature is accepted, invalid returns 403
-    - Form-urlencoded parser handles all field types correctly
-    - SQS SendMessage called with correct MessageGroupId and DeduplicationId
-    - 200 response is returned in <1s (synthetic latency test)
+  - [ ]* 4.5 Write unit tests for Webhook_Receiver (pytest + moto)
+    - Firma válida aceptada, inválida → 403
+    - Parser maneja todos los campos
+    - `send_message` llamado con MessageGroupId y DeduplicationId correctos
     - _Requirements: 3.1, 3.2, 3.3_
 
 - [ ] 5. Implement Message_Processor Lambda (async, SQS-triggered)
   - [ ] 5.1 Implement consent flow module
-    - Create `src/lambdas/message-processor/consent.ts`
-    - `getConsent(phoneNumber)` — GetItem from Consent_Store
-    - `storeConsent(phoneNumber, status)` — PutItem with timestamp and tcVersion
-    - `handleConsentFlow(payload, consent, phoneNumber)` — ButtonPayload='accept_tc'/'reject_tc' handling; first message sends T&C via Twilio REST API
-    - `sendTermsAndConditionsMessage(phoneNumber)` — Mensaje con botones accept/reject via Twilio Content Templates
+    - Create `src/lambdas/message_processor/consent.py`
+    - `get_consent`, `store_consent`, `handle_consent_flow` (ButtonPayload accept_tc/reject_tc), `send_terms_and_conditions_message` (Twilio Content Template)
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
 
-  - [ ]* 5.2 Write property test for consent gate
-    - **Property 5: Existing Consent Skips T&C** — Phone with accepted consent returns accepted=true
+  - [ ]* 5.2 Write property test for consent gate (hypothesis)
+    - **Property 5: Existing Consent Skips T&C**
     - _Validates: Requirement 1.4_
 
   - [ ] 5.3 Implement auth session module
-    - Create `src/lambdas/message-processor/auth.ts`
-    - `getAuthSession(phoneNumber)` — GetItem from Auth_Session table
-    - `isExpired(session)` — TTL check
-    - `storePendingRequest(phoneNumber, inputText)` — Store original request for post-auth processing
-    - `sendLoginLink(phoneNumber)` — Generate callback token, build Login_Page URL, send via Twilio REST API
-    - `deriveSessionId(phoneNumber)` — Deterministic session ID for Strands Agent memory
+    - Create `src/lambdas/message_processor/auth.py`
+    - `get_auth_session`, `is_expired`, `store_pending_request`, `send_login_link` (Twilio REST), `derive_session_id` (determinista)
     - _Requirements: 5.1, 5.6, 5.8, 6.1, 6.2, 11.1_
 
-  - [ ]* 5.4 Write property tests for auth and session
-    - **Property 3: Session ID Determinism** — Same phone always produces same session ID
-    - **Property 6: No Session Triggers Login** — No active session triggers login flow
-    - **Property 7: Active Session Allows Actions** — Active session with future TTL allows actions
+  - [ ]* 5.4 Write property tests for auth and session (hypothesis)
+    - **Property 3: Session ID Determinism**, **Property 6: No Session → Login**, **Property 7: Active Session → Proceed**
     - _Validates: Requirements 11.1, 5.1, 5.8, 6.1_
 
   - [ ] 5.5 Implement audio transcription module
-    - Create `src/lambdas/message-processor/transcription.ts`
-    - `transcribeAudio(twilioMediaUrl, phoneNumber)` — Download audio from Twilio Media URL (with Basic Auth using Twilio credentials), upload to S3 temp, start Transcribe job (es-CO, OGG), poll result (max 30s — sin presión de tiempo gracias al async), cleanup
+    - Create `src/lambdas/message_processor/transcription.py`
+    - `transcribe_audio(twilio_media_url, phone_number)` — descarga audio de Twilio Media URL (Basic Auth con creds Twilio), sube a S3 temp, `transcribe.start_transcription_job` (es-CO, OGG), polling (max 30s), cleanup
     - _Requirements: 2.2, 2.3, 2.6_
 
   - [ ] 5.6 Implement Twilio messaging module
-    - Create `src/lambdas/message-processor/messaging.ts`
-    - `sendTwilioMessage(to, body)` — Send text message via Twilio REST API. Split si > 1600 chars
-    - `splitMessage(text, maxLength)` — Split at newlines/spaces, never exceed maxLength
-    - `sendWelcomeMessage(phoneNumber)` — Welcome message listando servicios disponibles
-    - `sendTwilioDocument(phoneNumber, s3Bucket, s3Key)` — Genera presigned URL (5min) y envía mensaje con `mediaUrl` vía Twilio
+    - Create `src/lambdas/message_processor/messaging.py`
+    - `send_twilio_message` (split > 1600), `split_message`, `send_welcome_message`, `send_twilio_document` (presigned URL 5min + `media_url`)
     - _Requirements: 3.7, 3.10, 4.1, 4.2, 9.4_
 
-  - [ ]* 5.7 Write property test for message splitting
-    - **Property 1: Message Splitting Round-Trip** — Split + join produces original, every chunk ≤ 1600 chars
+  - [ ]* 5.7 Write property test for message splitting (hypothesis)
+    - **Property 1: Message Splitting Round-Trip** — chunks ≤ 1600 chars
     - _Validates: Requirement 3.10_
 
-  - [ ] 5.8 Implement OTP callback handler (priority routing)
-    - Create `src/lambdas/message-processor/otp-callback.ts`
-    - Cuando hay registro activo en `OTP_Store` para el phoneNumber, ese flujo toma prioridad sobre el del Strands Agent
-    - Ver Task 9 para implementación detallada
+  - [ ] 5.8 Implement OTP callback handler (priority routing) — ver Task 9
+    - Create `src/lambdas/message_processor/otp_callback.py`
+    - Si hay registro activo en `OTP_Store`, este flujo tiene prioridad sobre el Strands Agent
     - _Requirements: 16.4, 16.5, 16.6, 16.7_
 
   - [ ] 5.9 Implement Message_Processor main handler
-    - Create `src/lambdas/message-processor/index.ts`
-    - Handler signature: `SQSHandler` con `SQSBatchResponse` para `reportBatchItemFailures`
-    - Pipeline por mensaje del batch (siempre 1 por config):
-      - Parsear `record.body` → `TwilioWebhookPayload` con `correlationId`
-      - Setear logger correlationId desde el mensaje (NO regenerar — viene del Webhook_Receiver)
-      - OTP callback check (si hay OTP pendiente, manejar y continuar)
-      - Consent check → handle si falta
-      - Determinar tipo (text/audio/button/unsupported)
-      - Auth check → enviar login link si falta sesión
-      - Invocar Strands_Agent
-      - Si la respuesta incluye S3 key de PDF → `sendTwilioDocument`
-      - Enviar respuesta de texto vía Twilio
-    - Errores: push a `batchItemFailures` para reintento SQS sin afectar otros mensajes
+    - Create `src/lambdas/message_processor/handler.py`
+    - Usar `aws_lambda_powertools.utilities.batch.process_partial_response` con `BatchProcessor(EventType.SQS)`
+    - `record_handler` por mensaje: parse body → set `correlation_id` del mensaje (NO regenerar) → OTP callback check → consent → tipo (text/audio/button/unsupported) → auth → invoke Strands_Agent → enviar respuesta (texto + PDF si aplica) vía Twilio
+    - Errores levantan excepción → Powertools reporta como `batchItemFailure` para reintento SQS individual
     - _Requirements: 2.1, 2.4, 2.5, 3.5, 3.6, 3.9, 5.1, 13.1, 13.2_
 
-  - [ ]* 5.10 Write property test for unsupported message format
-    - **Property 16: Unsupported Format Rejection** — Mensajes que no son text/audio/button retornan unsupported error
+  - [ ]* 5.10 Write property test for unsupported message format (hypothesis)
+    - **Property 16: Unsupported Format Rejection**
     - _Validates: Requirement 2.5_
 
-  - [ ]* 5.11 Write unit tests for Message_Processor modules
-    - Test consent flow: first message sends T&C, accept_tc stores consent
-    - Test auth: expired session, valid session, no session triggers login link
-    - Test message routing: text, audio (NumMedia>0), button (ButtonPayload), unsupported
-    - Test OTP callback priority: cuando hay OTP pendiente, NO se invoca al Strands Agent
-    - Test partial batch failure: solo el mensaje fallido se reporta a SQS
+  - [ ]* 5.11 Write unit tests for Message_Processor (pytest + moto)
+    - Consent flow, auth (expirada/válida/ausente), routing (text/audio/button/unsupported)
+    - OTP callback priority: con OTP pendiente NO se invoca el Strands Agent
+    - Partial batch failure: solo el mensaje fallido se reporta
     - _Requirements: 1.1, 1.2, 1.3, 2.5, 3.5, 5.1, 6.5, 16.4_
 
-  - [ ] 5.12 Checkpoint — Ensure Webhook_Receiver + Message_Processor tests pass
+  - [ ] 5.12 Checkpoint — Webhook_Receiver + Message_Processor tests pasan
     - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 6. Implement Auth_Service Lambda and Login_Page
   - [ ] 6.1 Implement Auth_Service Lambda
-    - Create `src/lambdas/auth-service/index.ts` — Handler for POST /authenticate (API Gateway Function URL)
-    - Create `src/lambdas/auth-service/users.ts` — Hardcoded test users (carlos.rodriguez, maria.lopez, juan.garcia) with credentials, phoneNumber, name, documentId
-    - Create `src/lambdas/auth-service/types.ts` — AuthenticateRequest, AuthenticateResponse interfaces
-    - Logic: validate callback token → find user by username+password → verify phone matches → PutItem Auth_Session (TTL 30min) → return success/failure
-    - Add CORS headers for Login_Page origin
+    - Create `src/lambdas/auth_service/handler.py` — POST /authenticate (Function URL)
+    - Create `src/lambdas/auth_service/users.py` — usuarios de prueba hardcodeados (carlos.rodriguez, maria.lopez, juan.garcia) con credenciales, phone_number, name, document_id, email
+    - Logic: validar callback token → buscar user por username+password → verificar phone → `put_item` Auth_Session (TTL 30min) → success/failure
+    - CORS headers para Login_Page origin
     - _Requirements: 5.2, 5.3, 5.5, 5.7, 6.1_
 
-  - [ ]* 6.2 Write property tests for Auth_Service
-    - **Property 8: Invalid Credentials Rejection** — Wrong username/password returns success=false, no session created
+  - [ ]* 6.2 Write property tests for Auth_Service (hypothesis)
+    - **Property 8: Invalid Credentials Rejection**
     - _Validates: Requirement 5.5_
 
-  - [ ]* 6.3 Write unit tests for Auth_Service
-    - Valid credentials create session with correct TTL
-    - Invalid username returns error; valid credentials wrong phone returns error
-    - Invalid callback token returns error
+  - [ ]* 6.3 Write unit tests for Auth_Service (pytest)
+    - Credenciales válidas crean sesión con TTL correcto; username inválido/phone incorrecto/token inválido → error
     - _Requirements: 5.3, 5.5, 5.7_
 
   - [ ] 6.4 Implement Login_Page (S3 static site)
-    - Create `src/login-page/index.html` — Login form, BTG Pactual branding, responsive
-    - Create `src/login-page/styles.css` — BTG colors, mobile-first
-    - Create `src/login-page/app.js` — Extract phone/token from URL params, POST to Auth_Service, show success/error
+    - Create `src/login-page/index.html` — formulario de login, branding BTG, responsive
+    - Create `src/login-page/styles.css` — colores BTG, mobile-first
+    - Create `src/login-page/app.js` — **JavaScript de navegador** (no Lambda): extrae phone/token de URL params, POST a Auth_Service, muestra success/error
     - _Requirements: 5.2_
 
-- [ ] 7. Implement Action Group Lambdas (Node.js 24)
+- [ ] 7. Implement Action Group / Tool Lambdas (Python 3.13)
   - [ ] 7.1 Implement balance-query Lambda
-    - Create `src/lambdas/balance-query/index.ts` — Handler receiving JSON from Strands Agent (via Lambda invoke), routing to getBalance
-    - Create `src/lambdas/balance-query/mock-data.ts` — Mock_Core data: 3 clients with fondos de inversión + cuentas corrientes
-    - Create `src/lambdas/balance-query/types.ts` — BalanceRequest, BalanceResponse, ProductBalance
-    - Logic: find client by phoneNumber → filter by productType if given → return all if no filter → 404 if not found
+    - Create `src/lambdas/balance_query/handler.py` — recibe JSON del Strands Agent (Lambda invoke), rutea a `get_balance`
+    - Create `src/lambdas/balance_query/mock_data.py` — Mock_Core: 3 clientes con fondos + cuentas corrientes
+    - Logic: buscar cliente por phone → filtrar por product_type → todos si no hay filtro → error si no existe
     - _Requirements: 7.1, 7.2, 7.3, 7.4_
 
-  - [ ]* 7.2 Write property tests for balance-query
-    - **Property 9: Balance Query Correctness** — Existing client returns all products with correct fields
-    - **Property 10: Unknown Client Error** — Non-existent phone returns error
+  - [ ]* 7.2 Write property tests for balance-query (hypothesis)
+    - **Property 9: Balance Query Correctness**, **Property 10: Unknown Client Error**
     - _Validates: Requirements 7.1-7.4_
 
-  - [ ] 7.3 Implement transfer-breb Lambdas (split en 3: initiator, validator, executor)
-    - Create `src/lambdas/transfer-breb-initiator/index.ts` — Tool del Strands Agent. Recibe los datos de la transferencia, invoca `StartExecution` sobre `TransferBrebStateMachine` con `name = correlationId` (idempotencia), retorna `{executionArn, status: "STARTED"}` al agent inmediatamente
-    - Create `src/lambdas/transfer-breb-validate/index.ts` — Estado `ValidateTransfer` del state machine. Recibe params, valida contra Mock_Core (cuenta origen existe + pertenece al cliente + saldo suficiente + cuenta destino existe). Throw `InsufficientFundsError` o `InvalidDestinationError` según corresponda. Sin estos errores, retorna `{valid: true, sourceAccount, destAccount, availableBalance}`
-    - Create `src/lambdas/transfer-breb-execute/index.ts` — Estado `ExecuteTransfer` del state machine. Actualiza saldos en Mock_Core, genera comprobante `TransferReceipt` con transactionId único, retorna `{receipt}` para que el state machine lo propague al estado `PublishNotifications`
-    - Create `src/lambdas/transfer-breb-shared/mock-data.ts` — Mock_Core compartido por validator y executor
-    - Create `src/lambdas/transfer-breb-shared/types.ts` — TransferRequest, TransferReceipt, errores custom (`InsufficientFundsError extends Error`)
+  - [ ] 7.3 Implement transfer-breb Lambdas (initiator, validate, execute)
+    - Create `src/lambdas/transfer_breb/initiator.py` — Tool del Strands Agent. `stepfunctions.start_execution` sobre `TransferBrebStateMachine` con `name = correlationId` (idempotencia), retorna `{executionArn, status: "STARTED"}` inmediatamente
+    - Create `src/lambdas/transfer_breb/validate.py` — estado `ValidateTransfer`. Valida contra Mock_Core; lanza `InsufficientFundsError` / `InvalidDestinationError`; sino retorna `{valid: True, ...}`
+    - Create `src/lambdas/transfer_breb/execute.py` — estado `ExecuteTransfer`. Actualiza saldos Mock_Core, genera `receipt` con transactionId único
+    - Create `src/lambdas/transfer_breb/mock_data.py` — Mock_Core compartido (o importado del Layer)
+    - Errores custom en `src/shared/errors.py` (`InsufficientFundsError(Exception)`, etc.)
     - _Requirements: 8.3, 8.4, 8.10, 8.11, 8.12, 18.7_
 
-  - [ ]* 7.4 Write property tests for transfer-breb validate/execute
-    - **Property 11: Valid Transfer Produces Receipt** — Valid params produce receipt with all required fields
-    - **Property 12: Insufficient Funds Rejection** — amount > availableBalance throws `InsufficientFundsError`, balance unchanged
-    - **Property 19: Idempotent StartExecution** — Same `correlationId` invoked twice creates only one execution (StateMachine `name` collision rejected by AWS)
+  - [ ]* 7.4 Write property tests for transfer-breb validate/execute (hypothesis)
+    - **Property 11: Valid Transfer Produces Receipt**
+    - **Property 12: Insufficient Funds Rejection** — amount > available_balance lanza `InsufficientFundsError`, balance sin cambios
+    - **Property 19: Idempotent StartExecution** — mismo `correlationId` → una sola ejecución (colisión de `name` rechazada por AWS)
     - _Validates: Requirements 8.3, 8.10, 18.7_
 
   - [ ] 7.5 Implement statement-generator Lambda
-    - Create `src/lambdas/statement-generator/index.ts` — Handler from Strands Agent
-    - Create `src/lambdas/statement-generator/pdf-generator.ts` — PDF with pdfkit (client name, masked account, period, transactions, final balance)
-    - Create `src/lambdas/statement-generator/mock-data.ts`
-    - Create `src/lambdas/statement-generator/types.ts`
-    - Logic: validate cutoff date (past) → get client data → generate PDF → PutObject S3 → **publicar evento `statement_delivery` a `email-notification-queue`** vía SQS SendMessage (fire-and-forget) → retornar `{s3Bucket, s3Key, fileName}` al Strands Agent para envío inmediato por WhatsApp
+    - Create `src/lambdas/statement_generator/handler.py` — recibe del Strands Agent
+    - Create `src/lambdas/statement_generator/pdf_generator.py` — PDF con `fpdf2`/`reportlab` (nombre, cuenta enmascarada, período, movimientos, saldo final)
+    - Create `src/lambdas/statement_generator/mock_data.py`
+    - Logic: validar fecha (pasada) → datos cliente → generar PDF → `put_object` S3 → **publicar `statement_delivery` a `email-notification-queue`** (fire-and-forget) → retornar `{s3Bucket, s3Key, fileName}`
     - _Requirements: 9.1, 9.2, 9.3, 9.5, 9.6, 17.3_
 
-  - [ ]* 7.6 Write property tests for statement-generator
-    - **Property 13: Future Date Rejection** — Today or future date returns error
-    - **Property 14: Valid Statement Returns S3 Reference** — Past date + existing client produces {s3Bucket, s3Key, fileName}
+  - [ ]* 7.6 Write property tests for statement-generator (hypothesis)
+    - **Property 13: Future Date Rejection**, **Property 14: Valid Statement Returns S3 Reference**
     - _Validates: Requirements 9.2, 9.3, 14.7_
 
-  - [ ]* 7.7 Write unit tests for Action Group Lambdas
-    - balance-query: all products, filtered, client not found
-    - transfer-breb: valid, insufficient funds, invalid destination
-    - statement-generator: valid, future date, empty transactions
+  - [ ]* 7.7 Write unit tests for Action Group Lambdas (pytest)
+    - balance-query (todos/filtrado/no encontrado), transfer (válido/fondos insuficientes/destino inválido), statement (válido/fecha futura/sin movimientos)
     - _Requirements: 7.1-7.4, 8.4, 8.7, 8.8, 9.2, 9.3_
 
 - [ ] 8. Implement OTP_Service Lambda (Task Token Pattern)
   - [ ] 8.1 Implement OTP generate-and-wait
-    - Create `src/lambdas/otp-service/index.ts` — Handler invocado por Step Functions con `arn:aws:states:::lambda:invoke.waitForTaskToken`
-    - Recibe payload `{operation: "generate-and-wait", phoneNumber, transferAmount, destinationAccount, taskToken}`
-    - Generate 6-digit code, PutItem en `OTP_Store` `{pk: phoneNumber, code, taskToken, executionArn, attempts: 0, transferContext, ttl: now+300s}`
-    - Send SMS via AWS Pinpoint con mensaje claro: monto + cuenta destino enmascarada + código
-    - Return `{ok: true}` — la Lambda termina, pero Step Functions queda esperando el callback con el taskToken
+    - Create `src/lambdas/otp_service/handler.py` — invocada por Step Functions con `lambda:invoke.waitForTaskToken`
+    - Recibe `{operation: "generate-and-wait", phoneNumber, transferAmount, destinationAccount, taskToken}`
+    - Genera código 6 dígitos, `put_item` en `OTP_Store` `{pk, code, taskToken, executionArn, attempts: 0, transferContext, ttl: now+300}`
+    - Envía SMS vía Pinpoint (`pinpoint.send_messages`) con monto + cuenta destino enmascarada + código
+    - Retorna `{"ok": True}` — la Lambda termina; Step Functions queda esperando el taskToken
     - _Requirements: 16.1, 16.2, 16.3_
 
-  - [ ]* 8.2 Write unit tests for OTP_Service
-    - Generates 6-digit numeric code
-    - PutItem includes taskToken and executionArn
-    - Pinpoint SMS includes amount and masked destination
+  - [ ]* 8.2 Write unit tests for OTP_Service (pytest + moto)
+    - Genera código numérico de 6 dígitos; put_item incluye taskToken y executionArn; SMS incluye monto + destino enmascarado
     - _Requirements: 16.1, 16.2_
 
 - [ ] 9. Implement OTP Callback in Message_Processor
   - [ ] 9.1 Implement OTP callback handler
-    - Create `src/lambdas/message-processor/otp-callback.ts`
-    - When `Message_Processor` consume un mensaje de SQS y existe registro en `OTP_Store` para ese `phoneNumber` con TTL activo, prioriza este flujo sobre el normal del Strands Agent
-    - `validateAndCallback(phoneNumber, code)`:
-      - GetItem `OTP_Store`. Si no existe o expiró → ignorar (Step Functions manejará timeout)
-      - Si `code === stored.code` → `sfnClient.send(new SendTaskSuccessCommand({taskToken: stored.taskToken, output: JSON.stringify({valid: true})}))` + DeleteItem en `OTP_Store`
-      - Si `code !== stored.code` y `attempts < 2` → UpdateItem `attempts += 1` + enviar mensaje "Código incorrecto" via Twilio
-      - Si `attempts === 2` (tercer intento fallido) → `sfnClient.send(new SendTaskFailureCommand({taskToken, error: "OTPBlockedError", cause: "..."}))` + DeleteItem
-    - Solo proceder con el flujo normal del agent cuando NO hay OTP pendiente
+    - Create `src/lambdas/message_processor/otp_callback.py`
+    - Cuando el Message_Processor consume un mensaje y existe `OTP_Store` activo para el phone, prioriza este flujo
+    - `validate_and_callback(phone_number, code)`:
+      - `get_item` OTP_Store; si no existe/expiró → ignorar (Step Functions maneja timeout)
+      - código correcto → `stepfunctions.send_task_success(taskToken, output={"valid": True})` + `delete_item`
+      - incorrecto y `attempts < 2` → `update_item` attempts+1 + mensaje "Código incorrecto" vía Twilio
+      - tercer intento fallido → `stepfunctions.send_task_failure(taskToken, error="OTPBlockedError")` + `delete_item`
     - _Requirements: 16.4, 16.5, 16.6, 16.7_
 
-  - [ ]* 9.2 Write property tests for OTP Callback
-    - **Property 17: OTP Expiry** — OTP con TTL vencido es ignorado (no callback ni delete)
-    - **Property 18: Brute Force Block** — Después de 3 intentos fallidos consecutivos, se invoca `SendTaskFailure` con `OTPBlockedError`
+  - [ ]* 9.2 Write property tests for OTP Callback (hypothesis)
+    - **Property 17: OTP Expiry** — OTP con TTL vencido es ignorado
+    - **Property 18: Brute Force Block** — 3 intentos fallidos → `send_task_failure` con `OTPBlockedError`
     - _Validates: Requirements 16.6, 16.7_
 
-  - [ ]* 9.3 Write unit tests for OTP Callback
-    - Valid code calls SendTaskSuccess and deletes record
-    - Invalid code increments attempts and sends retry message
-    - Third invalid call triggers SendTaskFailure
-    - Expired OTP record is ignored
+  - [ ]* 9.3 Write unit tests for OTP Callback (pytest + moto)
+    - Código válido → send_task_success + delete; inválido → attempts++ + retry msg; tercer fallo → send_task_failure; expirado → ignorado
     - _Requirements: 16.4-16.7_
 
 - [ ] 10. Implement TransferBrebStateMachine (Step Functions)
   - [ ] 10.1 Define state machine in ASL
-    - Create `infra/lib/state-machines/transfer-breb.asl.json` con la definición Amazon States Language completa
-    - Estados: `ValidateTransfer` → `GenerateOTP` (`waitForTaskToken`, HeartbeatSeconds=300) → `ValidateOTP` (Choice) → `ExecuteTransfer` → `PublishNotifications` (Parallel: SQS sendMessage a email-queue y sms-queue) → `NotifyUserSuccess`
+    - Create `cloudformation/state-machines/transfer-breb.asl.json` con la definición Amazon States Language
+    - Estados: `ValidateTransfer` → `GenerateOTP` (`waitForTaskToken`, HeartbeatSeconds=300) → `ValidateOTP` (Choice) → `ExecuteTransfer` → `PublishNotifications` (Parallel: SQS sendMessage a email + sms) → `NotifyUserSuccess`
     - Estados de error: `NotifyValidationFailed`, `NotifyOTPExpired`, `NotifyOTPBlocked`, `NotifyTransferFailed`
-    - Retry policies en estados Task: `BackoffRate: 2.0, IntervalSeconds: 2, MaxAttempts: 2` para `Lambda.ServiceException`, `Lambda.AWSLambdaException`, `Lambda.SdkClientException`
-    - Catch handlers para errores de dominio (`InsufficientFundsError`, `InvalidDestinationError`, `OTPBlockedError`, `States.Timeout`)
+    - Retry en Tasks: `BackoffRate: 2.0, IntervalSeconds: 2, MaxAttempts: 2` para `Lambda.ServiceException`, `Lambda.AWSLambdaException`, `Lambda.SdkClientException`
+    - Catch para errores de dominio (`InsufficientFundsError`, `InvalidDestinationError`, `OTPBlockedError`, `States.Timeout`)
     - _Requirements: 18.1, 18.2, 18.3, 18.4_
 
-  - [ ] 10.2 Implement message-handler-notify Lambda (estados de notificación del state machine)
-    - Create `src/lambdas/message-handler-notify/index.ts` — Lambda invocada desde los estados terminales del state machine (success y todos los failure paths)
-    - Recibe `{phoneNumber, messageType: "transfer_success" | "validation_failed" | "otp_expired" | "otp_blocked" | "transfer_failed", receipt?, error?}`
-    - Construye el mensaje apropiado en español colombiano natural y lo envía via Twilio REST API
-    - Para `transfer_success` incluye el comprobante con disclaimer "información referencial"
+  - [ ] 10.2 Implement message-handler-notify Lambda
+    - Create `src/lambdas/message_handler_notify/handler.py` — invocada desde los estados terminales del state machine
+    - Recibe `{phoneNumber, messageType, receipt?, error?}` y envía el mensaje apropiado en español vía Twilio REST
+    - `transfer_success` incluye comprobante con disclaimer "información referencial"
     - _Requirements: 8.4, 8.7, 8.8, 8.9, 8.10, 8.11_
 
 - [ ] 11. Implement Email_Service Lambda (SQS Triggered)
   - [ ] 11.1 Implement SQS-triggered email service
-    - Create `src/lambdas/email-service/index.ts` — Handler signature `SQSHandler` con event source mapping en `email-notification-queue`
-    - Usar `@aws-lambda-powertools/batch` con `BatchProcessor(EventType.SQS)` para `reportBatchItemFailures` — fallos individuales no afectan al batch completo
-    - Por cada mensaje, parsear el `EmailNotificationEvent` y rutear por `type`:
-      - `transfer_confirmation` → `sendTransferConfirmation(to, receipt)` via SES `SendEmail` con HTML template
-      - `statement_delivery` → `sendStatementEmail(to, s3Bucket, s3Key, fileName)` — descarga PDF de S3, envía via `SendRawEmail` (MIME con adjunto)
-    - Aplicar masking a campos sensibles antes de incluirlos en el cuerpo del email
-    - Errores propagados al BatchProcessor para que SQS reintente solo los mensajes fallidos
+    - Create `src/lambdas/email_service/handler.py` — `process_partial_response` con `BatchProcessor(EventType.SQS)` sobre `email-notification-queue`
+    - Por mensaje, rutear por `type`:
+      - `transfer_confirmation` → `send_transfer_confirmation(to, receipt)` vía SES `send_email` (HTML template)
+      - `statement_delivery` → `send_statement_email(...)` — descarga PDF de S3, `send_raw_email` (MIME con adjunto)
+    - Masking de campos sensibles antes de incluirlos
+    - Excepción por mensaje → reintento SQS individual
     - _Requirements: 17.2, 17.3, 17.4, 17.5, 17.7_
 
-  - [ ]* 11.2 Write unit tests for Email_Service
-    - Transfer confirmation sends correct fields with masking
-    - Statement email attaches PDF correctly via SendRawEmail
-    - Partial batch failure: only failed messages reported to SQS for retry
+  - [ ]* 11.2 Write unit tests for Email_Service (pytest + moto)
+    - transfer_confirmation con masking; statement adjunta PDF vía send_raw_email; partial batch failure
     - _Requirements: 17.4, 17.7_
 
 - [ ] 12. Implement SMS_Service Lambda (SQS Triggered)
   - [ ] 12.1 Implement SQS-triggered SMS service
-    - Create `src/lambdas/sms-service/index.ts` — Handler signature `SQSHandler` con event source mapping en `sms-notification-queue`
-    - Usar `BatchProcessor` igual que Email_Service
-    - Procesar `transfer_confirmation` event: enviar SMS via Pinpoint con monto + destino enmascarado
-    - NOTA: este servicio es independiente del OTP_Service (que es síncrono dentro del workflow). Este es solo para SMS post-operación de confirmación
+    - Create `src/lambdas/sms_service/handler.py` — `BatchProcessor` sobre `sms-notification-queue`
+    - Procesar `transfer_confirmation`: SMS vía Pinpoint con monto + destino enmascarado
+    - NOTA: independiente del OTP_Service (que es síncrono en el workflow); este es solo confirmación post-operación
     - _Requirements: 17.2, 17.8_
 
-- [ ] 13. Implement Strands_Agent Lambda (Python 3.12)
+- [ ] 13. Implement Strands_Agent Lambda (Python 3.13)
   - [ ] 13.1 Implement Strands Agent with tools
-    - Create `src/lambdas/ai-agent/handler.py` — Lambda handler receiving `{sessionId, inputText, phoneNumber, correlationId}` from Message_Handler
-    - Create `src/lambdas/ai-agent/tools.py` — Define Strands tools using `@tool` decorator:
-      - `query_balance(phone_number, product_type=None)` → invoke `balance-query` Lambda via boto3
-      - `initiate_transfer_breb(source_account, destination_account, amount, concept, phone_number)` → invoke `transfer-breb-initiator` Lambda (que dispara Step Functions). Retorna immediatamente con `executionArn` y mensaje "Te envié un código OTP por SMS para confirmar la operación"
-      - `generate_statement(phone_number, account_id, cutoff_date)` → invoke `statement-generator` Lambda
-    - Create `src/lambdas/ai-agent/agent.py` — Configure Strands Agent with Claude Haiku 3.5 via Bedrock, system prompt in Spanish, Bedrock Guardrails applied, session memory using sessionId
-    - Create `src/lambdas/ai-agent/prompts.py` — System prompt: banking assistant rules, COP formatting, Colombian Spanish, disclaimer template, instruction to NOT wait for OTP synchronously (Strands tools return immediately, Step Functions maneja el resto)
+    - Create `src/lambdas/ai_agent/handler.py` — recibe `{sessionId, inputText, phoneNumber, correlationId}` del Message_Processor
+    - Create `src/lambdas/ai_agent/tools.py` — tools con `@tool`:
+      - `query_balance(phone_number, product_type=None)` → invoke `balance-query`
+      - `initiate_transfer_breb(...)` → invoke `transfer-breb-initiator` (dispara Step Functions); retorna inmediatamente con executionArn + "Te envié un código OTP por SMS"
+      - `generate_statement(phone_number, account_id, cutoff_date)` → invoke `statement-generator`
+    - Create `src/lambdas/ai_agent/agent.py` — Strands Agent con Claude Haiku 3.5 (Bedrock), Guardrails aplicados, memoria de sesión por sessionId
+    - Create `src/lambdas/ai_agent/prompts.py` — system prompt: reglas, formato COP, español colombiano, disclaimer, instrucción de NO esperar OTP síncronamente
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 11.1, 11.2, 12.1, 12.2, 12.3_
 
   - [ ]* 13.2 Write unit tests for Strands_Agent (pytest)
-    - Test tool routing: banking request invokes correct tool
-    - Test transfer tool returns immediately with executionArn (no wait for OTP)
-    - Test out-of-domain: non-banking request returns declination
-    - Test guardrails: blocked topics never return content
+    - Routing de tools; transfer retorna inmediato con executionArn; fuera de dominio declina; guardrails bloquean
     - _Requirements: 10.3, 12.2, 12.6_
 
-- [ ] 14. Checkpoint — Ensure all Lambda tests pass
-  - Ensure all tests pass (vitest + pytest), ask the user if questions arise.
+- [ ] 14. Checkpoint — Todas las Lambdas + tests pasan
+  - Ejecutar `pytest`. Ask the user if questions arise.
 
-- [ ] 15. Implement CDK Lambda constructs and wiring
-  - [ ] 15.1 Create Webhook_Receiver Lambda construct (sync, behind API Gateway)
-    - Create `infra/lib/constructs/webhook-receiver.ts`
-    - Lambda: Node.js 24.x, **256MB**, **10s timeout** (resuelve <1s), VPC config (private subnets + Lambda SG)
-    - Trigger: API Gateway HTTP API, route `POST /webhook/twilio`
-    - IAM minimalista:
-      - `sqs:SendMessage` sobre `inbound-messages-queue.fifo`
-      - `secretsmanager:GetSecretValue` sobre el secreto Twilio (solo para validar firma con `TWILIO_AUTH_TOKEN`)
-      - CloudWatch Logs
-    - Environment variables: `INBOUND_QUEUE_URL`, `TWILIO_SECRET_ARN`
-    - Considerar **Provisioned Concurrency** para producción (no requerido en hackathon)
-    - _Requirements: 3.1, 3.2, 3.3, 15.1, 15.9_
+- [ ] 15. Implement compute & wiring CloudFormation templates
+  - [ ] 15.1 Create ingestion Lambdas template (Webhook_Receiver + Message_Processor)
+    - Create `cloudformation/templates/connectai/lambdas-ingestion.yaml`
+    - **WebhookReceiverFunction**: `Runtime: python3.13`, MemorySize 256, Timeout 10, `VpcConfig` (subnets privadas + SG importados), `Code: {S3Bucket, S3Key}`, `Layers: [SharedLayer]`. IAM: `sqs:SendMessage` (inbound) + `secretsmanager:GetSecretValue` (Twilio). Env: `INBOUND_QUEUE_URL`, `TWILIO_SECRET_ARN`
+    - **MessageProcessorFunction**: `Runtime: python3.13`, MemorySize 512, Timeout 120, VpcConfig. IAM: SQS consume (inbound) + DynamoDB (consent/auth/otp) + Lambda Invoke (ai-agent) + Step Functions SendTask* + Transcribe + S3 + Secrets
+    - `AWS::Lambda::EventSourceMapping` sobre `inbound-messages-queue.fifo`: `BatchSize: 1`, `FunctionResponseTypes: [ReportBatchItemFailures]`, `ScalingConfig.MaximumConcurrency: 10`
+    - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.6, 3.7, 3.9, 15.1, 15.2, 15.9, 15.10, 16.5, 16.7_
 
-  - [ ] 15.1B Create Message_Processor Lambda construct (async, SQS-triggered)
-    - Create `infra/lib/constructs/message-processor.ts`
-    - Lambda: Node.js 24.x, 512MB, **120s timeout**, VPC config
-    - Trigger: **SQS Event Source Mapping** sobre `inbound-messages-queue.fifo` con:
-      - `batchSize: 1`
-      - `reportBatchItemFailures: true`
-      - `maximumConcurrency: 10` (limita concurrency por orden FIFO)
-    - IAM:
-      - SQS ReceiveMessage+DeleteMessage+ChangeMessageVisibility+GetQueueAttributes sobre `inbound-messages-queue.fifo`
-      - DynamoDB (Consent_Store read+write, Auth_Session read, OTP_Store read+update+delete)
-      - Lambda InvokeFunction sobre Strands_Agent
-      - **Step Functions SendTaskSuccess+SendTaskFailure sobre TransferBrebStateMachine ARN**
-      - S3 GetObject (Statement_Bucket), S3 PutObject+GetObject+DeleteObject (Audio_Temp_Bucket)
-      - Transcribe StartTranscriptionJob+GetTranscriptionJob
-      - Secrets Manager GetSecretValue (Twilio creds para REST API)
-      - CloudWatch Logs
-    - Environment variables: table names, bucket names, ai-agent Lambda ARN, Twilio secret ARN, TransferBrebStateMachine ARN
-    - _Requirements: 3.5, 3.6, 3.7, 3.9, 15.1, 15.2, 15.10, 16.5, 16.7_
-
-  - [ ] 15.2 Create Auth_Service Lambda construct
-    - Create `infra/lib/constructs/auth-service.ts`
-    - Lambda: Node.js 24.x, 128MB, 10s timeout, VPC config
-    - Trigger: Lambda Function URL with CORS
-    - IAM: DynamoDB Auth_Session PutItem, CloudWatch Logs
+  - [ ] 15.2 Create Auth_Service Lambda template
+    - Create `cloudformation/templates/connectai/lambda-auth.yaml`
+    - `Runtime: python3.13`, 128MB, 10s, VpcConfig, Function URL con CORS; IAM: DynamoDB Auth_Session PutItem
     - _Requirements: 5.3, 14.3, 15.1_
 
-  - [ ] 15.3 Create Action Group + Step Functions task Lambda constructs
-    - `infra/lib/constructs/balance-query.ts` — Node.js 24.x, 128MB, 15s timeout, VPC config, IAM: CloudWatch Logs
-    - `infra/lib/constructs/transfer-breb-initiator.ts` — Node.js 24.x, 128MB, 10s timeout, VPC config, IAM: **Step Functions StartExecution on TransferBrebStateMachine ARN**, CloudWatch Logs
-    - `infra/lib/constructs/transfer-breb-validate.ts` — Node.js 24.x, 128MB, 10s timeout, VPC config, IAM: CloudWatch Logs (invocada solo por Step Functions, sin acceso externo)
-    - `infra/lib/constructs/transfer-breb-execute.ts` — Node.js 24.x, 128MB, 15s timeout, VPC config, IAM: CloudWatch Logs (Mock_Core en memoria; en producción agregar acceso al core real)
-    - `infra/lib/constructs/statement-generator.ts` — Node.js 24.x, 256MB, 30s timeout, VPC config, IAM: S3 Statement_Bucket PutObject, **SQS SendMessage on email-notification-queue**, CloudWatch Logs
-    - `infra/lib/constructs/message-handler-notify.ts` — Node.js 24.x, 128MB, 10s timeout, VPC config, IAM: Secrets Manager GetSecretValue (Twilio creds), CloudWatch Logs
+  - [ ] 15.3 Create action group / state-machine task Lambdas template
+    - Create `cloudformation/templates/connectai/lambdas-actions.yaml`
+    - `balance-query` (128MB/15s, IAM solo Logs), `transfer-breb-initiator` (128MB/10s, IAM Step Functions StartExecution), `transfer-breb-validate` (128MB/10s, solo Logs), `transfer-breb-execute` (128MB/15s, solo Logs), `statement-generator` (256MB/30s, IAM S3 PutObject + SQS SendMessage email), `message-handler-notify` (128MB/10s, IAM Secrets Twilio). Todas `python3.13` + VpcConfig + Layer
     - _Requirements: 14.3, 15.1, 17.3, 18.7_
 
-  - [ ] 15.4 Create OTP_Service Lambda construct
-    - Create `infra/lib/constructs/otp-service.ts`
-    - Lambda: Node.js 24.x, 128MB, 10s timeout, VPC config
-    - IAM: DynamoDB OTP_Store PutItem, Pinpoint SendMessages, CloudWatch Logs
-    - Lambda invocada únicamente por Step Functions con `waitForTaskToken` (no es invocada por Message_Handler ni por API Gateway)
+  - [ ] 15.4 Create OTP_Service Lambda template
+    - Create `cloudformation/templates/connectai/lambda-otp.yaml`
+    - `python3.13`, 128MB, 10s, VpcConfig; IAM: DynamoDB OTP_Store PutItem + Pinpoint SendMessages. Invocada solo por Step Functions (waitForTaskToken)
     - _Requirements: 16.1, 16.2, 16.3_
 
-  - [ ] 15.5 Create Email_Service Lambda construct (SQS triggered)
-    - Create `infra/lib/constructs/email-service.ts`
-    - Lambda: Node.js 24.x, 256MB, 30s timeout, VPC config
-    - Trigger: **SQS Event Source Mapping** sobre `email-notification-queue` con `batchSize: 10`, `maxBatchingWindow: 5s`, `reportBatchItemFailures: true`
-    - IAM: SES SendEmail+SendRawEmail, S3 Statement_Bucket GetObject, SQS ReceiveMessage+DeleteMessage+ChangeMessageVisibility on email-notification-queue, CloudWatch Logs
-    - _Requirements: 17.3, 17.4_
+  - [ ] 15.5 Create Email_Service & SMS_Service Lambda templates (SQS triggered)
+    - Create `cloudformation/templates/connectai/lambdas-notify.yaml`
+    - **EmailService**: `python3.13`, 256MB, 30s, VpcConfig; EventSourceMapping sobre `email-notification-queue` (`BatchSize: 10`, `MaximumBatchingWindowInSeconds: 5`, `FunctionResponseTypes: [ReportBatchItemFailures]`); IAM: SES Send*, S3 GetObject, SQS consume
+    - **SmsService**: `python3.13`, 128MB, 15s, VpcConfig; EventSourceMapping sobre `sms-notification-queue`; IAM: Pinpoint SendMessages, SQS consume
+    - _Requirements: 17.2, 17.3, 17.4, 17.8_
 
-  - [ ] 15.6 Create SMS_Service Lambda construct (SQS triggered)
-    - Create `infra/lib/constructs/sms-service.ts`
-    - Lambda: Node.js 24.x, 128MB, 15s timeout, VPC config
-    - Trigger: SQS Event Source Mapping sobre `sms-notification-queue` con `batchSize: 10`, `reportBatchItemFailures: true`
-    - IAM: Pinpoint SendMessages, SQS ReceiveMessage+DeleteMessage on sms-notification-queue, CloudWatch Logs
-    - _Requirements: 17.2, 17.8_
-
-  - [ ] 15.7 Create Strands_Agent Lambda construct
-    - Create `infra/lib/constructs/ai-agent.ts`
-    - Lambda: Python 3.12, 512MB, 60s timeout, VPC config
-    - IAM: Bedrock InvokeModel (Claude Haiku 3.5), Bedrock ApplyGuardrail, Lambda InvokeFunction (balance-query, transfer-breb-initiator, statement-generator), CloudWatch Logs
-    - Bedrock Guardrails resource: content filtering (HATE, VIOLENCE, MISCONDUCT, PROMPT_ATTACK), topic policies (investment-advice DENY, non-banking DENY), blocked messages in Spanish
+  - [ ] 15.6 Create Strands_Agent Lambda + Guardrails template
+    - Create `cloudformation/templates/connectai/lambda-ai-agent.yaml` y `guardrails.yaml`
+    - **AiAgentFunction**: `python3.13`, 512MB, 60s, VpcConfig; IAM: Bedrock InvokeModel + ApplyGuardrail + Lambda Invoke (tools)
+    - `AWS::Bedrock::Guardrail`: content filtering (HATE, VIOLENCE, MISCONDUCT, PROMPT_ATTACK), topic policies (investment-advice DENY, non-banking DENY, competitor-info DENY), blocked messages en español
     - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.5, 14.3_
 
-  - [ ] 15.8 Create TransferBrebStateMachine construct
-    - Create `infra/lib/constructs/transfer-breb-state-machine.ts`
-    - Cargar ASL definition desde `infra/lib/state-machines/transfer-breb.asl.json`
-    - Sustituir placeholders (`${EmailNotificationQueueUrl}`, `${SmsNotificationQueueUrl}`, ARNs de Lambdas) usando `DefinitionBody.fromString` o `StateMachine.fromDefinitionSubstitutions`
-    - Tipo: `StateMachineType.STANDARD`
-    - Logging: CloudWatch Logs LogLevel.ALL, retention 90 días
-    - IAM Role del state machine: InvokeFunction sobre las Lambdas de tasks, SQS SendMessage sobre las dos colas
+  - [ ] 15.7 Create State Machine template
+    - Create `cloudformation/templates/connectai/state-machine.yaml`
+    - `AWS::StepFunctions::StateMachine` tipo STANDARD; `DefinitionS3Location` o `DefinitionString` con `DefinitionSubstitutions` (ARNs de Lambdas, URLs de colas)
+    - Logging CloudWatch `LogLevel: ALL`, retention 90 días; IAM role: Lambda Invoke (tasks) + SQS SendMessage (colas)
     - _Requirements: 18.1, 18.2, 18.3, 18.4, 18.5, 18.6_
 
-  - [ ] 15.9 Create main CDK stack wiring all constructs
-    - Create `infra/lib/stacks/btg-connectai-stack.ts` — Instantiate all constructs en orden de dependencias: vpc-config → dynamodb-tables → s3 → secrets → notification-queues → state-machine → lambdas → api-gateway → observability
-    - Create `infra/bin/app.ts` — CDK App entry point
-    - Create `infra/lib/config/environment.ts` — Region us-east-1, account, VPC stack name
-    - Verify all Lambdas have VpcConfig pointing to IA-Builder private subnets
+  - [ ] 15.8 Create API Gateway template
+    - Create `cloudformation/templates/connectai/api-gateway.yaml`
+    - `AWS::ApiGatewayV2::Api` (HTTP API) + `AWS::ApiGatewayV2::Route` `POST /webhook/twilio` → integración Lambda proxy con WebhookReceiverFunction + `AWS::Lambda::Permission`
+    - _Requirements: 3.1, 15.5_
+
+  - [ ] 15.9 Create root composite stack
+    - Create `cloudformation/stacks/sandbox/connectai.yaml` — `AWS::CloudFormation::Stack` anidados en orden de dependencias: security-group → data/storage/queues/secrets → guardrails → lambdas-actions/otp/ai-agent → state-machine → lambdas-ingestion/notify → api-gateway → observability
+    - Parámetros: `ProjectName=BTGConnectAI`, `Environment=sandbox`, `TemplatesBucket`, `LambdaArtifactsBucket`, `LambdaCodeKey` (git-sha)
+    - Importa networking vía `Fn::ImportValue` (VpcId, PrivateSubnetIds)
     - _Requirements: 15.1, 15.4, 15.5_
 
-- [ ] 16. Implement Observability stack
-  - [ ] 16.1 Create observability construct
-    - Create `infra/lib/constructs/observability.ts`
-    - CloudWatch Dashboard widgets:
-      - Lambdas: invocations, errors, latency p50/p90 para cada Lambda (Webhook_Receiver, Message_Processor, Auth_Service, Strands_Agent, OTP_Service, Email_Service, SMS_Service, balance-query, transfer-breb-initiator, transfer-breb-validate, transfer-breb-execute, statement-generator, message-handler-notify)
-      - **Webhook_Receiver latency**: widget dedicado mostrando p50/p95/p99 con threshold visual a 1000ms (SLO)
-      - **Step Functions**: ExecutionsStarted, ExecutionsSucceeded, ExecutionsFailed, ExecutionTime p50/p95 sobre `TransferBrebStateMachine`
-      - **SQS**: ApproximateNumberOfMessagesVisible y ApproximateAgeOfOldestMessage para cada cola (inbound-messages, email-notification, sms-notification) y todos los DLQ
-    - Alarmas:
-      - **Webhook_Receiver latency p99 > 1000ms** en 5min → SNS alarm topic (rompe SLO de respuesta async)
-      - Error rate > 10% en 5min por Lambda → SNS alarm topic
-      - `ExecutionsFailed > 5 en 5min` sobre TransferBrebStateMachine → SNS alarm topic
-      - `ApproximateNumberOfMessagesVisible > 0` en cualquier DLQ (inbound-messages-dlq, email-dlq, sms-dlq) → SNS alarm topic
-      - `ApproximateAgeOfOldestMessage > 60s` en `inbound-messages-queue.fifo` → Processor saturado o caído
-      - `ApproximateAgeOfOldestMessage > 300s` en email/sms queues → consumer atrasado
-    - CloudWatch Logs retention: 7 días para Lambda log groups, 90 días para state machine
+  - [ ] 15.10 Create CI/CD workflow
+    - Create `.github/workflows/cfn-deploy.yml` (mismo patrón que `infra`): OIDC, build Layer + zip Lambdas → S3, `cfn-lint`, sync templates a S3, `aws cloudformation deploy --capabilities CAPABILITY_NAMED_IAM`
+    - _Requirements: 15.4_
+
+- [ ] 16. Implement Observability template
+  - [ ] 16.1 Create observability template
+    - Create `cloudformation/templates/connectai/observability.yaml`
+    - `AWS::CloudWatch::Dashboard`: invocations/errors/latency p50/p90 por Lambda (Webhook_Receiver, Message_Processor, Auth_Service, Strands_Agent, OTP_Service, Email_Service, SMS_Service, balance-query, transfer-breb-validate, transfer-breb-execute, statement-generator, message-handler-notify); widget de Webhook_Receiver p99 con threshold 1000ms; métricas Step Functions y SQS
+    - `AWS::CloudWatch::Alarm`:
+      - Webhook_Receiver latency p99 > 1000ms (rompe SLO async)
+      - error rate > 10% en 5min por Lambda (math expression)
+      - `ExecutionsFailed > 5` en 5min sobre TransferBrebStateMachine
+      - DLQ `MessagesVisible > 0` (inbound-messages-dlq, email-dlq, sms-dlq)
+      - `ApproximateAgeOfOldestMessage > 60s` en inbound-queue
+    - `AWS::Logs::LogGroup` retention: 7 días Lambdas, 90 días state machine
     - _Requirements: 3.3, 3.9, 13.1, 13.3, 13.4, 17.6, 18.5, 18.6_
 
-- [ ] 17. Final checkpoint — CDK synth and full test suite
-  - Run full test suite (vitest + pytest)
-  - Run `cdk synth` — validate CloudFormation template
-  - Verify all Lambdas have VpcConfig defined y pointing to IA-Builder-sandbox-networking subnets
-  - Verify TransferBrebStateMachine ASL definition validates con `cdk-validation-pipeline`
-  - Verify `inbound-messages-queue.fifo` exists con `MessageGroupId` y `MessageDeduplicationId` correctos en mensajes de prueba
-  - Verify Webhook_Receiver, Email_Service y SMS_Service tienen SQS Event Source Mappings configurados con `reportBatchItemFailures: true` (Message_Processor) y permisos correctos
-  - Verify NO existe tabla DynamoDB Dedup (debe estar reemplazada por SQS FIFO dedup)
-  - Configure Twilio Sandbox webhook URL al endpoint API Gateway (POST /webhook/twilio)
-  - Smoke test end-to-end: enviar mensaje desde WhatsApp → confirmar respuesta de Twilio 200 en <1s → verificar mensaje aparece en SQS → verificar Processor lo procesa → respuesta llega al cliente
+- [ ] 17. Final checkpoint — validación y deploy
+  - `pytest src/tests` (unit + property) en verde
+  - `cfn-lint cloudformation/**/*.yaml` y `checkov -d cloudformation/` sin findings críticos
+  - `aws stepfunctions validate-state-machine-definition --definition file://cloudformation/state-machines/transfer-breb.asl.json`
+  - Verificar que todos los `AWS::Lambda::Function` tienen `Runtime: python3.13` y `VpcConfig` con subnets privadas IA-Builder
+  - Verificar que `inbound-messages-queue.fifo` existe con dedup por `MessageDeduplicationId`; NO existe tabla DynamoDB Dedup
+  - Verificar EventSourceMappings (Message_Processor, Email_Service, SMS_Service) con `FunctionResponseTypes: [ReportBatchItemFailures]`
+  - `aws cloudformation deploy` del stack raíz en sandbox; configurar webhook URL del API Gateway en Twilio Sandbox
+  - Smoke test E2E: WhatsApp → 200 de Twilio en <1s → mensaje en SQS → Processor lo procesa → respuesta al cliente
   - Ask the user if questions arise.
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for faster MVP delivery
-- Each task references specific requirements for traceability
-- Checkpoints ensure incremental validation before proceeding
-- Property tests validate universal correctness (fast-check for Node.js, hypothesis for Python)
-- Unit tests validate specific examples and edge cases
-- Node.js 24.x for all business Lambdas; Python 3.12 exclusively for Strands_Agent
-- All Lambdas deployed in VPC private subnets (10.0.11.0/24, 10.0.12.0/24) via NAT Gateway
-- Mock data inline in Action Group Lambdas — no external database for banking data
-- Twilio credentials stored in Secrets Manager, never hardcoded
-- **Async Webhook Pattern**: `Webhook_Receiver` Lambda síncrono responde 200 a Twilio en <1s y publica a SQS FIFO; `Message_Processor` consume async sin presión de tiempo. Twilio NUNCA experimenta timeouts del lado del backend
-- **SQS FIFO con dedup nativa** (`MessageDeduplicationId = MessageSid`): elimina la tabla Dedup custom. Twilio retries son descartados automáticamente en ventana de 5 min
-- **Order guarantee per cliente** vía `MessageGroupId = phoneNumber`: dos mensajes seguidos del mismo cliente se procesan en orden, pero distintos clientes se procesan en paralelo
-- **Step Functions Standard Workflow** orquesta transferencias BRE-B con patrón `waitForTaskToken` — Lambdas NUNCA esperan al usuario, el state machine maneja la suspensión
-- **SQS-based async notifications** — Email_Service y SMS_Service son fire-and-forget, productores no esperan respuesta. DLQ después de 3 fallos
-- Para el MVP en modo mock, el happy path es prioritario. Los caminos de error del state machine (`NotifyOTPExpired`, `NotifyTransferFailed`, etc.) deben estar implementados pero no exhaustivamente probados — son red de seguridad
+- Tasks marcadas con `*` son opcionales y pueden saltarse para un MVP más rápido
+- Cada task referencia requisitos específicos para trazabilidad
+- Los checkpoints aseguran validación incremental
+- **Stack 100% Python 3.13** en todas las Lambdas; tests con **pytest** + **hypothesis** (property-based)
+- **CloudFormation puro (YAML)** — sin CDK ni SAM; nested stacks + GitHub Actions OIDC, igual que el repo `infra`
+- Código Lambda zipeado a S3 + dependencias compartidas en Lambda Layer
+- Todas las Lambdas en subnets privadas (10.0.11.0/24, 10.0.12.0/24) via NAT Gateway
+- Mock data inline en las Action Group Lambdas — sin base de datos para datos bancarios
+- Credenciales Twilio en Secrets Manager, nunca hardcodeadas
+- **Async Webhook Pattern**: Webhook_Receiver responde 200 en <1s; Message_Processor consume async. Twilio nunca timeoutea
+- **SQS FIFO dedup nativa** elimina la tabla Dedup; orden por cliente vía MessageGroupId
+- **Step Functions** orquesta transferencias con `waitForTaskToken`; **SQS** desacopla notificaciones fire-and-forget con DLQ
+- Para el MVP mock, el happy path es prioritario; los caminos de error del state machine se implementan pero no se prueban exhaustivamente
 
 ## Task Dependency Graph
 
@@ -541,8 +446,8 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     { "id": 6, "tasks": ["6.2", "6.3", "7.2", "7.4", "7.6", "7.7", "8.1", "9.1"] },
     { "id": 7, "tasks": ["8.2", "9.2", "9.3", "10.1", "10.2", "11.1", "12.1"] },
     { "id": 8, "tasks": ["11.2", "13.1"] },
-    { "id": 9, "tasks": ["13.2", "15.1", "15.1B", "15.2", "15.3", "15.4", "15.5", "15.6", "15.7", "15.8"] },
-    { "id": 10, "tasks": ["15.9", "16.1"] }
+    { "id": 9, "tasks": ["13.2", "15.1", "15.2", "15.3", "15.4", "15.5", "15.6", "15.7", "15.8"] },
+    { "id": 10, "tasks": ["15.9", "15.10", "16.1"] }
   ]
 }
 ```

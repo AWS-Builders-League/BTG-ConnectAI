@@ -14,8 +14,8 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 **Arquitectura técnica:**
 
 - Serverless (Lambda, DynamoDB, S3) — Lambdas adjuntadas a subnets privadas de la VPC IA-Builder (us-east-1) con salida a internet via NAT Gateway
-- Node.js 24.x (TypeScript) para Lambdas de negocio — Python 3.12 para la Lambda del Conversational_Agent (Strands Agent SDK)
-- AWS CDK (TypeScript) para IaC
+- **Python 3.13 para todas las Lambdas** (negocio y Conversational_Agent con Strands Agent SDK)
+- **CloudFormation puro (YAML)** para IaC — templates anidados siguiendo el patrón del repo `infra` (no se usa CDK ni SAM). Empaquetado de Lambdas vía ZIP a S3 + GitHub Actions con OIDC
 - Twilio (WhatsApp Sandbox) como canal de mensajería
 - Amazon API Gateway (HTTP API) expuesto públicamente para recibir webhooks de Twilio
 - **Async Webhook Pattern**: `Webhook_Receiver` Lambda síncrono responde 200 a Twilio en <1s y publica a SQS FIFO (`inbound-messages-queue.fifo`); `Message_Processor` Lambda async procesa los mensajes triggered por SQS. SQS FIFO da dedup automático por `MessageSid` (elimina tabla Dedup custom) y orden por `phoneNumber`
@@ -39,15 +39,15 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 ## Glossary
 
-- **Conversational_Agent**: Lambda Python 3.12 que implementa el agente conversacional usando Strands Agent SDK sobre Amazon Bedrock Agent Core (Claude Haiku 3.5). Interpreta mensajes en español, mantiene memoria de sesión, decide qué herramientas invocar y formula respuestas.
-- **Webhook_Receiver**: Lambda Node.js 24.x (TypeScript) síncrona detrás de API Gateway. Su única responsabilidad es responder 200 a Twilio en <1s: valida la firma X-Twilio-Signature, parsea el payload, y publica el mensaje a `InboundMessagesQueue` (SQS FIFO). Sin acceso a DynamoDB, Bedrock, Transcribe ni Twilio REST API.
-- **Message_Processor**: Lambda Node.js 24.x (TypeScript) asíncrona, disparada por SQS Event Source Mapping sobre `InboundMessagesQueue`. Hace todo el trabajo pesado del flujo de un mensaje: consent check, transcripción de audio, auth check, OTP callback, invocación al Conversational_Agent, y envío de respuesta vía Twilio REST API.
+- **Conversational_Agent**: Lambda Python 3.13 que implementa el agente conversacional usando Strands Agent SDK sobre Amazon Bedrock Agent Core (Claude Haiku 3.5). Interpreta mensajes en español, mantiene memoria de sesión, decide qué herramientas invocar y formula respuestas.
+- **Webhook_Receiver**: Lambda Python 3.13 síncrona detrás de API Gateway. Su única responsabilidad es responder 200 a Twilio en <1s: valida la firma X-Twilio-Signature, parsea el payload, y publica el mensaje a `InboundMessagesQueue` (SQS FIFO). Sin acceso a DynamoDB, Bedrock, Transcribe ni Twilio REST API.
+- **Message_Processor**: Lambda Python 3.13 asíncrona, disparada por SQS Event Source Mapping sobre `InboundMessagesQueue`. Hace todo el trabajo pesado del flujo de un mensaje: consent check, transcripción de audio, auth check, OTP callback, invocación al Conversational_Agent, y envío de respuesta vía Twilio REST API.
 - **InboundMessagesQueue**: SQS FIFO (`inbound-messages-queue.fifo`) con `MessageGroupId = phoneNumber` (garantiza orden por cliente) y `MessageDeduplicationId = MessageSid` (dedup automática de reintentos de Twilio en ventana de 5 min). DLQ asociado: `inbound-messages-dlq`. Reemplaza la tabla `Dedup` custom del diseño anterior.
 - **Twilio_Webhook_API**: Amazon API Gateway (HTTP API) público expuesto a Twilio. Recibe los webhooks POST de mensajes entrantes de WhatsApp y los entrega al Webhook_Receiver.
-- **Action_Group**: Lambdas Node.js 24.x que el Conversational_Agent puede invocar para ejecutar acciones bancarias. Incluye: `transfer-breb`, `balance-query`, `statement-generator`.
-- **OTP_Service**: Lambda Node.js 24.x invocada por Step Functions con el patrón `waitForTaskToken`. Genera un código OTP de 6 dígitos, lo persiste en DynamoDB junto con el token de Step Functions, y lo envía via AWS Pinpoint (SMS). La Lambda retorna inmediatamente; el state machine queda pausado esperando que Message_Processor invoque `SendTaskSuccess` con el código validado.
-- **Email_Service**: Lambda Node.js 24.x **disparada por SQS** (Event Source Mapping con `email-notification-queue`, batch size 10). Consume eventos `transfer_confirmation` y `statement_delivery` y los envía via Amazon SES. Fallos van automáticamente a DLQ después de 3 reintentos.
-- **SMS_Service**: Lambda Node.js 24.x disparada por SQS (`sms-notification-queue`). Consume eventos de notificación SMS post-operación (no confundir con OTP_Service, que es síncrono dentro del workflow).
+- **Action_Group**: Lambdas Python 3.13 que el Conversational_Agent puede invocar para ejecutar acciones bancarias. Incluye: `transfer-breb`, `balance-query`, `statement-generator`.
+- **OTP_Service**: Lambda Python 3.13 invocada por Step Functions con el patrón `waitForTaskToken`. Genera un código OTP de 6 dígitos, lo persiste en DynamoDB junto con el token de Step Functions, y lo envía via AWS Pinpoint (SMS). La Lambda retorna inmediatamente; el state machine queda pausado esperando que Message_Processor invoque `SendTaskSuccess` con el código validado.
+- **Email_Service**: Lambda Python 3.13 **disparada por SQS** (Event Source Mapping con `email-notification-queue`, batch size 10). Consume eventos `transfer_confirmation` y `statement_delivery` y los envía via Amazon SES. Fallos van automáticamente a DLQ después de 3 reintentos.
+- **SMS_Service**: Lambda Python 3.13 disparada por SQS (`sms-notification-queue`). Consume eventos de notificación SMS post-operación (no confundir con OTP_Service, que es síncrono dentro del workflow).
 - **TransferBrebStateMachine**: AWS Step Functions Standard Workflow que orquesta el ciclo completo de transferencia BRE-B: ValidateTransfer → GenerateOTP (waitForTaskToken) → ValidateOTP → ExecuteTransfer → PublishNotifications (Parallel: SQS email + SQS SMS) → NotifyUserSuccess. Maneja nativamente timeouts, reintentos y compensación.
 - **EmailNotificationQueue**: Cola SQS de notificaciones por email. Productores (Step Functions, statement-generator) publican eventos; Email_Service los procesa en batch. DLQ `email-dlq` después de 3 fallos.
 - **SmsNotificationQueue**: Cola SQS análoga para SMS de confirmación post-operación.
@@ -259,16 +259,17 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 #### Criterios de Aceptación
 
-1. THE system SHALL configurar todas las funciones Lambda con `VpcConfig` adjuntándolas a las subnets privadas (`PrivateSubnet1Id`, `PrivateSubnet2Id`) de la VPC `IA-Builder-sandbox-networking`, importando los IDs vía CDK `Fn.importValue('IA-Builder-sandbox-networking-PrivateSubnetIds')`
+1. THE system SHALL configurar todas las funciones Lambda con `VpcConfig` adjuntándolas a las subnets privadas (`PrivateSubnet1Id`, `PrivateSubnet2Id`) de la VPC `IA-Builder-sandbox-networking`, importando los IDs en los templates de CloudFormation vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds`
 2. THE system SHALL crear un Security Group dedicado para las Lambdas de aplicación con: cero reglas de ingress de red (el tráfico de entrada llega por invocación AWS, no por red) y egress TCP 443 (HTTPS) a 0.0.0.0/0 para salida a servicios AWS y Twilio
 3. THE system SHALL usar IAM roles y policies como mecanismo de control de acceso entre las Lambdas y los servicios AWS consumidos (DynamoDB, S3, Secrets Manager, CloudWatch Logs, Amazon Bedrock, Amazon Transcribe, Pinpoint, SES)
-4. THE system SHALL desplegarse usando AWS CDK (TypeScript) con las Lambdas de negocio en runtime Node.js 24.x y la Lambda del Conversational_Agent en Python 3.12, en la región us-east-1
+4. THE system SHALL desplegarse usando templates de CloudFormation (YAML) con todas las Lambdas en runtime Python 3.13, en la región us-east-1, siguiendo el patrón de nested stacks del repo `infra` (templates en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`)
 5. THE system SHALL exponer un Amazon API Gateway (HTTP API) público con una ruta POST `/webhook/twilio` que reciba los webhooks de Twilio y active el Webhook_Receiver. La URL del endpoint SHALL configurarse como webhook en la cuenta Twilio Sandbox
 6. THE system SHALL almacenar las credenciales de Twilio (Account SID, Auth Token, número de origen) en AWS Secrets Manager y no hardcodearlas en el código
-7. WHEN se despliega la infraestructura, THE system SHALL importar el `VpcId` del stack de red vía `Fn.importValue('IA-Builder-sandbox-networking-VpcId')` para crear el Security Group de Lambdas en la VPC correcta
-8. THE system SHALL crear una cola SQS FIFO `inbound-messages-queue.fifo` con `ContentBasedDeduplication=false` (la dedup se hace explícitamente por `MessageDeduplicationId`), `VisibilityTimeout=130s`, `MessageRetentionPeriod=1d`, encryption SSE-SQS, DLQ `inbound-messages-dlq.fifo` y `maxReceiveCount=3`
-9. THE Webhook_Receiver Lambda SHALL configurarse con timeout máximo de 10 segundos (en la práctica resuelve en <1s) y memory 256MB. NO requiere acceso a DynamoDB, Bedrock, Transcribe, S3 ni Twilio REST API — solo SQS SendMessage y Secrets Manager GetSecretValue
-10. THE Message_Processor Lambda SHALL configurarse con SQS Event Source Mapping sobre `inbound-messages-queue.fifo` con `batchSize=1`, `reportBatchItemFailures=true`, timeout 120s y memory 512MB
+7. WHEN se despliega la infraestructura, THE system SHALL importar el `VpcId` del stack de red vía `Fn::ImportValue: IA-Builder-sandbox-networking-VpcId` para crear el Security Group de Lambdas en la VPC correcta
+8. THE system SHALL empaquetar el código de cada Lambda Python (con sus dependencias pip) como ZIP, subirlo a S3, y referenciarlo en el template vía `Code: { S3Bucket, S3Key }`. Las dependencias compartidas (boto3 viene en runtime; aws-lambda-powertools, twilio, strands-agents) SHALL empaquetarse vía Lambda Layers donde sea conveniente
+9. THE system SHALL crear una cola SQS FIFO `inbound-messages-queue.fifo` con `ContentBasedDeduplication=false` (la dedup se hace explícitamente por `MessageDeduplicationId`), `VisibilityTimeout=130s`, `MessageRetentionPeriod=1d`, encryption SSE-SQS, DLQ `inbound-messages-dlq.fifo` y `maxReceiveCount=3`
+10. THE Webhook_Receiver Lambda SHALL configurarse con timeout máximo de 10 segundos (en la práctica resuelve en <1s) y memory 256MB. NO requiere acceso a DynamoDB, Bedrock, Transcribe, S3 ni Twilio REST API — solo SQS SendMessage y Secrets Manager GetSecretValue
+11. THE Message_Processor Lambda SHALL configurarse con SQS Event Source Mapping sobre `inbound-messages-queue.fifo` con `batchSize=1`, `reportBatchItemFailures=true`, timeout 120s y memory 512MB
 
 ### Requisito 16: Autorización OTP con Patrón Task Token
 

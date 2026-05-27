@@ -20,87 +20,65 @@ El asistente responde siempre en español colombiano natural, formatea montos en
 5. Solicita una transferencia → recibe un OTP por SMS para autorizar la operación
 6. Ingresa el OTP → la transferencia se ejecuta y recibe confirmación por WhatsApp y email
 
-## Ambiente de despliegue
-
-El proyecto se despliega en la cuenta AWS sandbox en la región **us-east-1**, dentro de la VPC `IA-Builder-sandbox-networking` (CIDR 10.0.0.0/16). Todas las funciones Lambda corren en las **subnets privadas** (10.0.11.0/24 · us-east-1a y 10.0.12.0/24 · us-east-1b), sin exposición directa a internet. El tráfico saliente hacia servicios externos (Twilio, Bedrock, Transcribe) pasa por un **NAT Gateway** ubicado en la subnet pública. El único punto de entrada público es el **API Gateway** que recibe los webhooks de Twilio.
-
-## Patrón async — cómo escala el sistema
-
-El flujo de mensajes está diseñado para que **Twilio nunca espere** al backend más de un segundo:
-
-```text
-Twilio → API Gateway → Webhook_Receiver (responde 200 OK en <1s)
-                            ↓
-                       SQS FIFO inbound-messages-queue
-                       MessageGroupId = phoneNumber  (orden por cliente)
-                       MessageDeduplicationId = MessageSid  (dedup gratis)
-                            ↓
-                       Message_Processor (sin presión de tiempo)
-                            ├─ Transcribe audio si aplica
-                            ├─ Strands Agent (Bedrock)
-                            └─ Twilio REST API (respuesta al cliente)
-```
-
-Beneficios reales: spikes de tráfico se absorben en la cola, los retries de Twilio se descartan automáticamente, audio que tarda 15s en transcribir no rompe nada, y mañana podemos agregar consumidores (analytics, auditoría) sin tocar el Receiver.
-
 ## Tecnología
 
-| Capa | Servicio |
-| ---- | ------- |
-| Canal de mensajería | Twilio (WhatsApp Sandbox) |
-| Punto de entrada | Amazon API Gateway (HTTP API público, expuesto a Twilio) |
-| Motor de IA | Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) |
-| Orquestación de transacciones | AWS Step Functions (transferencias BRE-B con OTP) |
-| Bus de eventos asíncronos | Amazon SQS (notificaciones de email y SMS con DLQ) |
-| Transcripción de voz | Amazon Transcribe (español colombiano) |
-| OTP transaccional | AWS Pinpoint (SMS) |
-| Notificaciones email | Amazon SES |
-| Funciones serverless | AWS Lambda — Node.js 24.x (negocio) · Python 3.12 (IA) |
-| Base de datos | DynamoDB (sesiones, consentimiento, deduplicación, OTP) |
-| Documentos PDF | S3 (generación y entrega de extractos) |
-| Observabilidad | CloudWatch + Lambda Powertools |
-| Infraestructura como código | AWS CDK (TypeScript) |
+A grandes rasgos, esto es lo que habilita cada capacidad del asistente:
+
+| Capacidad | Servicio |
+| --------- | -------- |
+| Conversación por WhatsApp | Twilio |
+| Inteligencia conversacional | Amazon Bedrock (Claude Haiku 3.5) con Strands Agent |
+| Notas de voz | Amazon Transcribe (español colombiano) |
+| Código OTP por SMS | AWS Pinpoint |
+| Correos de confirmación | Amazon SES |
+| Datos y documentos | DynamoDB y S3 |
+| Cómputo | AWS Lambda (Python) |
+
+El sistema es 100% serverless y se despliega en AWS. Los detalles técnicos de arquitectura, red e infraestructura están documentados en [.kiro/specs/](.kiro/specs/).
 
 ## Estructura del proyecto
 
 ```text
-├── infra/                          # Infraestructura CDK
-│   ├── bin/app.ts
-│   └── lib/
-│       ├── stacks/
-│       ├── constructs/
-│       └── config/
+├── cloudformation/                 # IaC — CloudFormation puro (YAML)
+│   ├── templates/connectai/        # Templates anidados (data, queues, lambdas, state-machine, etc.)
+│   ├── stacks/sandbox/             # Stack raíz compuesto
+│   └── state-machines/             # Definición ASL del TransferBrebStateMachine
 ├── src/
-│   ├── lambdas/
-│   │   ├── webhook-receiver/       # Sync, detrás de API Gateway — responde 200 a Twilio
-│   │   ├── message-processor/      # Async, SQS-triggered — hace el trabajo pesado
-│   │   ├── ai-agent/               # Strands Agent (Python 3.12) — motor conversacional
-│   │   ├── auth-service/           # Autenticación vía enlace web (mock para el demo)
-│   │   ├── otp-service/            # Generación de OTP (Pinpoint SMS) con task token
-│   │   ├── email-service/          # SQS-triggered — envío vía SES
-│   │   ├── sms-service/            # SQS-triggered — SMS de confirmación vía Pinpoint
-│   │   ├── balance-query/          # Tool: consulta de saldos
-│   │   ├── transfer-breb-initiator/   # Tool: dispara TransferBrebStateMachine
-│   │   ├── transfer-breb-validate/    # Task de Step Functions
-│   │   ├── transfer-breb-execute/     # Task de Step Functions
-│   │   ├── statement-generator/    # Tool: extracto PDF, publica a SQS email
-│   │   └── message-handler-notify/ # Lambda llamada por Step Functions para responder al cliente
-│   ├── shared/                     # Utilidades compartidas (Node.js)
-│   └── login-page/                 # Página de login (sitio estático en S3)
+│   ├── lambdas/                    # Todas en Python 3.13
+│   │   ├── webhook_receiver/       # Sync, detrás de API Gateway — responde 200 a Twilio
+│   │   ├── message_processor/      # Async, SQS-triggered — hace el trabajo pesado
+│   │   ├── ai_agent/               # Strands Agent — motor conversacional
+│   │   ├── auth_service/           # Autenticación vía enlace web (mock para el demo)
+│   │   ├── otp_service/            # Generación de OTP (Pinpoint SMS) con task token
+│   │   ├── email_service/          # SQS-triggered — envío vía SES
+│   │   ├── sms_service/            # SQS-triggered — SMS de confirmación vía Pinpoint
+│   │   ├── balance_query/          # Tool: consulta de saldos
+│   │   ├── transfer_breb/          # initiator + validate + execute (Step Functions)
+│   │   ├── statement_generator/    # Tool: extracto PDF, publica a SQS email
+│   │   └── message_handler_notify/ # Lambda llamada por Step Functions para responder al cliente
+│   ├── shared/                     # Utilidades compartidas (Lambda Layer)
+│   ├── login-page/                 # Página de login (sitio estático en S3, browser JS)
+│   ├── tests/                      # pytest (unit/property/integration)
+│   └── requirements.txt
+├── .github/workflows/cfn-deploy.yml  # CI/CD: build + zip Lambdas → S3 + cloudformation deploy
 └── .kiro/specs/                    # Documentos de especificación
 ```
 
 ## Instalación y despliegue
 
 ```bash
-# Instalar dependencias
-npm install
+# Dependencias de desarrollo
+pip install -r src/requirements-dev.txt
 
-# Compilar
-npm run build
+# Validar templates
+cfn-lint cloudformation/**/*.yaml
 
-# Desplegar (primera vez: npx cdk bootstrap primero)
-cd infra && npx cdk deploy
+# Desplegar (vía GitHub Actions con OIDC, o manualmente):
+aws cloudformation deploy \
+  --stack-name BTGConnectAI-sandbox \
+  --template-file cloudformation/stacks/sandbox/connectai.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
 ```
 
 Después del despliegue, configurar la URL del API Gateway (`POST /webhook/twilio`) como webhook en la consola de Twilio Sandbox.
@@ -108,11 +86,12 @@ Después del despliegue, configurar la URL del API Gateway (`POST /webhook/twili
 ## Pruebas
 
 ```bash
-# Tests unitarios y de propiedades
-npx vitest --run
+# Tests unitarios y de propiedades (pytest + hypothesis)
+pytest src/tests/unit src/tests/property -v
 
-# Tests de snapshot CDK
-cd infra && npx jest --run
+# Validación de infraestructura
+cfn-lint cloudformation/**/*.yaml
+checkov -d cloudformation/
 ```
 
 ## Usuarios de prueba
@@ -140,13 +119,12 @@ Este es un demo para hackathon: los datos bancarios son simulados y la autentica
 
 | Extensión | Qué implica |
 | --------- | ----------- |
-| Core bancario real | Lambdas ya en subnets privadas + NAT Gateway ya desplegado. Agregar conectividad privada al core bancario (PrivateLink o VPN) |
-| Canal WhatsApp productivo | Migrar de Twilio Sandbox a número de WhatsApp Business aprobado (Twilio o AWS EUMS) |
-| Autenticación real | Integración con el proveedor de identidad corporativo (OAuth2/OIDC) |
+| Core bancario real | Conectar el asistente al core bancario de BTG en lugar de los datos simulados |
+| Canal WhatsApp productivo | Migrar del sandbox de Twilio a un número de WhatsApp Business aprobado |
+| Autenticación real | Integración con el proveedor de identidad corporativo del banco |
 | Servicios adicionales | Pagos, apertura de productos, consulta de TRM |
-| Auditoría regulatoria | Pipeline de retención 7 años (Kinesis → S3) |
-| Cifrado gestionado | Llaves propias (CMK) con rotación anual |
-| Observabilidad avanzada | Trazabilidad distribuida con X-Ray |
+| Auditoría regulatoria | Retención de operaciones a largo plazo para cumplimiento |
+| Seguridad reforzada | Llaves de cifrado propias y trazabilidad avanzada |
 
 ---
 
