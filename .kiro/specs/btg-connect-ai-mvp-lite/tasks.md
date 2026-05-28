@@ -82,9 +82,8 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     - Importar `VpcId`, `PrivateSubnetIds`, `PrivateRouteTableId` vía `Fn::ImportValue` (split de subnets con `Fn::Split`)
     - `AWS::EC2::SecurityGroup` `BankingLambdaSG`: sin reglas de ingress; egress TCP 443 (hacia los VPC Endpoints)
     - **VPC Endpoints** (las subnets privadas NO tienen ruta 0.0.0.0/0):
-      - Gateway Endpoint S3 (`com.amazonaws.us-east-1.s3`) asociado al PrivateRouteTable — gratis
+      - Gateway Endpoint S3 (`com.amazonaws.us-east-1.s3`) asociado al PrivateRouteTable — gratis (usado por `statement_generator` para PutObject del PDF)
       - Gateway Endpoint DynamoDB (`...dynamodb`) asociado al PrivateRouteTable — gratis (para EXT-1)
-      - Interface Endpoint SQS (`...sqs`) en las subnets privadas + SG, `PrivateDnsEnabled: true` — requerido por `statement_generator`
     - Output: `BankingLambdaSGId` + `PrivateSubnetIds` para los templates de Lambdas en VPC
     - NOTA: el NAT Gateway NO se usa (`EnableNatGateway=false` en el stack de red); CloudWatch Logs no requiere endpoint
     - _Requirements: 15.1, 15.3, 15.4, 15.9_
@@ -242,7 +241,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     - Create `src/lambdas/statement_generator/handler.py` — recibe del Strands Agent
     - Create `src/lambdas/statement_generator/pdf_generator.py` — PDF con `fpdf2`/`reportlab` (nombre, cuenta enmascarada, período, movimientos, saldo final)
     - Create `src/lambdas/statement_generator/mock_data.py`
-    - Logic: validar fecha (pasada) → datos cliente → generar PDF → `put_object` S3 → **publicar `statement_delivery` a `email-notification-queue`** (fire-and-forget) → retornar `{s3Bucket, s3Key, fileName}`
+    - Logic: validar fecha (pasada) → datos cliente → generar PDF → `put_object` S3 → retornar `{s3Bucket, s3Key, fileName}` para que `Message_Processor` lo entregue al cliente vía WhatsApp (Twilio Media). NO publica a `email-notification-queue` — el extracto se entrega solo por WhatsApp.
     - _Requirements: 9.1, 9.2, 9.3, 9.5, 9.6, 17.3_
 
   - [ ]* 7.6 Write property tests for statement-generator (hypothesis)
@@ -306,13 +305,12 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
     - Create `src/lambdas/email_service/handler.py` — `process_partial_response` con `BatchProcessor(EventType.SQS)` sobre `email-notification-queue`
     - Por mensaje, rutear por `type`:
       - `transfer_confirmation` → `send_transfer_confirmation(to, receipt)` vía SES `send_email` (HTML template)
-      - `statement_delivery` → `send_statement_email(...)` — descarga PDF de S3, `send_raw_email` (MIME con adjunto)
     - Masking de campos sensibles antes de incluirlos
     - Excepción por mensaje → reintento SQS individual
     - _Requirements: 17.2, 17.3, 17.4, 17.5, 17.7_
 
   - [ ]* 11.2 Write unit tests for Email_Service (pytest + moto)
-    - transfer_confirmation con masking; statement adjunta PDF vía send_raw_email; partial batch failure
+    - transfer_confirmation con masking; partial batch failure
     - _Requirements: 17.4, 17.7_
 
 - [ ] 12. Implement SMS_Service Lambda (SQS Triggered)
@@ -359,7 +357,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
       - `balance-query` (128MB/15s, IAM solo Logs)
       - `transfer-breb-validate` (128MB/10s, solo Logs)
       - `transfer-breb-execute` (128MB/15s, solo Logs)
-      - `statement-generator` (256MB/30s, IAM S3 PutObject + SQS SendMessage email; usa Gateway+Interface Endpoints)
+      - `statement-generator` (256MB/30s, IAM S3 PutObject; usa Gateway Endpoint S3. NO publica a SQS — el extracto se entrega por WhatsApp)
     - **FUERA de VPC** (`python3.13` + Layer, sin VpcConfig):
       - `transfer-breb-initiator` (128MB/10s, IAM Step Functions StartExecution)
       - `message-handler-notify` (128MB/10s, IAM Secrets Twilio)
@@ -372,7 +370,7 @@ Implementación incremental de un asistente bancario conversacional para WhatsAp
 
   - [ ] 15.5 Create Email_Service & SMS_Service Lambda templates (SQS triggered)
     - Create `cloudformation/templates/connectai/lambdas-notify.yaml`
-    - **EmailService**: `python3.13`, 256MB, 30s, **SIN VpcConfig**; EventSourceMapping sobre `email-notification-queue` (`BatchSize: 10`, `MaximumBatchingWindowInSeconds: 5`, `FunctionResponseTypes: [ReportBatchItemFailures]`); IAM: SES Send*, S3 GetObject, SQS consume
+    - **EmailService**: `python3.13`, 256MB, 30s, **SIN VpcConfig**; EventSourceMapping sobre `email-notification-queue` (`BatchSize: 10`, `MaximumBatchingWindowInSeconds: 5`, `FunctionResponseTypes: [ReportBatchItemFailures]`); IAM: SES Send*, SQS consume (procesa solo `transfer_confirmation`)
     - **SmsService**: `python3.13`, 128MB, 15s, **SIN VpcConfig**; EventSourceMapping sobre `sms-notification-queue`; IAM: Pinpoint SendMessages, SQS consume
     - _Requirements: 17.2, 17.3, 17.4, 17.8_
 

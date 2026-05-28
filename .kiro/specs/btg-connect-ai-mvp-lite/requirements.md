@@ -46,10 +46,10 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 - **Twilio_Webhook_API**: Amazon API Gateway (HTTP API) público expuesto a Twilio. Recibe los webhooks POST de mensajes entrantes de WhatsApp y los entrega al Webhook_Receiver.
 - **Action_Group**: Lambdas Python 3.13 que el Conversational_Agent puede invocar para ejecutar acciones bancarias. Incluye: `transfer-breb`, `balance-query`, `statement-generator`.
 - **OTP_Service**: Lambda Python 3.13 invocada por Step Functions con el patrón `waitForTaskToken`. Genera un código OTP de 6 dígitos, lo persiste en DynamoDB junto con el token de Step Functions, y lo envía via AWS Pinpoint (SMS). La Lambda retorna inmediatamente; el state machine queda pausado esperando que Message_Processor invoque `SendTaskSuccess` con el código validado.
-- **Email_Service**: Lambda Python 3.13 **disparada por SQS** (Event Source Mapping con `email-notification-queue`, batch size 10). Consume eventos `transfer_confirmation` y `statement_delivery` y los envía via Amazon SES. Fallos van automáticamente a DLQ después de 3 reintentos.
+- **Email_Service**: Lambda Python 3.13 **disparada por SQS** (Event Source Mapping con `email-notification-queue`, batch size 10). Consume eventos `transfer_confirmation` y los envía via Amazon SES. Fallos van automáticamente a DLQ después de 3 reintentos.
 - **SMS_Service**: Lambda Python 3.13 disparada por SQS (`sms-notification-queue`). Consume eventos de notificación SMS post-operación (no confundir con OTP_Service, que es síncrono dentro del workflow).
 - **TransferBrebStateMachine**: AWS Step Functions Standard Workflow que orquesta el ciclo completo de transferencia BRE-B: ValidateTransfer → GenerateOTP (waitForTaskToken) → ValidateOTP → ExecuteTransfer → PublishNotifications (Parallel: SQS email + SQS SMS) → NotifyUserSuccess. Maneja nativamente timeouts, reintentos y compensación.
-- **EmailNotificationQueue**: Cola SQS de notificaciones por email. Productores (Step Functions, statement-generator) publican eventos; Email_Service los procesa en batch. DLQ `email-dlq` después de 3 fallos.
+- **EmailNotificationQueue**: Cola SQS de notificaciones por email. Productor: Step Functions (evento `transfer_confirmation`); Email_Service procesa en batch. DLQ `email-dlq` después de 3 fallos.
 - **SmsNotificationQueue**: Cola SQS análoga para SMS de confirmación post-operación.
 - **Bank_Client**: Cliente de BTG Pactual que interactúa con el sistema vía WhatsApp.
 - **Consent_Store**: Tabla DynamoDB que almacena el estado de aceptación de Términos y Condiciones por número telefónico.
@@ -266,7 +266,7 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 1. THE system SHALL configurar con `VpcConfig` (subnets privadas + Security Group dedicado) ÚNICAMENTE las Lambdas del dominio bancario: `balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`, importando los subnet IDs vía `Fn::ImportValue: IA-Builder-sandbox-networking-PrivateSubnetIds`
 2. THE system SHALL desplegar las Lambdas de canal/orquestación/notificaciones SIN `VpcConfig` (red managed de Lambda), accediendo a internet (Twilio) y a APIs AWS públicas con control de acceso por IAM. Esto elimina la necesidad del NAT Gateway
-3. THE system SHALL proveer acceso a servicios AWS desde las Lambdas en VPC mediante VPC Endpoints: Gateway Endpoints para S3 y DynamoDB (sin costo), e Interface Endpoint para SQS (requerido por `statement_generator` para publicar a `email-notification-queue`). Las subnets privadas NO SHALL tener ruta `0.0.0.0/0` (cero salida a internet)
+3. THE system SHALL proveer acceso a servicios AWS desde las Lambdas en VPC mediante VPC Endpoints: Gateway Endpoints para S3 y DynamoDB (sin costo). El `statement_generator` usa el Gateway Endpoint S3 para `PutObject` del PDF; el extracto se entrega al Bank_Client por WhatsApp (no por email). Las subnets privadas NO SHALL tener ruta `0.0.0.0/0` (cero salida a internet)
 4. THE system SHALL crear un Security Group dedicado para las Lambdas en VPC con: cero reglas de ingress de red y egress TCP 443 (HTTPS) hacia los VPC Endpoints. CloudWatch Logs NO requiere endpoint (Lambda envía logs por la plataforma, no por la ENI)
 5. THE system SHALL usar IAM roles y policies como mecanismo principal de control de acceso entre las Lambdas y los servicios AWS consumidos
 6. THE system SHALL desplegarse usando templates de CloudFormation (YAML) con todas las Lambdas en runtime Python 3.13, en la región us-east-1, siguiendo el patrón de nested stacks del repo `infra` (templates en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`)
@@ -296,18 +296,18 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 ### Requisito 17: Notificaciones Asíncronas Event-Driven
 
-**Historia de Usuario:** Como Bank_Client, quiero recibir confirmaciones de operaciones por correo electrónico (y opcionalmente SMS), para tener un registro formal fuera del chat de WhatsApp. Como platform engineer, quiero que estos envíos NUNCA bloqueen el flujo transaccional principal.
+**Historia de Usuario:** Como Bank_Client, quiero recibir confirmaciones de operaciones por correo electrónico y SMS post-transferencia, para tener un registro formal fuera del chat de WhatsApp. Como platform engineer, quiero que estos envíos NUNCA bloqueen el flujo transaccional principal.
 
 #### Criterios de Aceptación
 
 1. THE system SHALL exponer dos colas SQS dedicadas: `email-notification-queue` y `sms-notification-queue`, cada una con DLQ asociado (`email-dlq`, `sms-dlq`), `maxReceiveCount: 3`, `visibilityTimeout: 60s`, `messageRetentionPeriod: 4 días`, encryption SSE-SQS
 2. WHEN el state machine `TransferBrebStateMachine` ejecuta el estado `PublishNotifications`, THE Step Functions SHALL publicar en paralelo a `email-notification-queue` (evento `transfer_confirmation` con receipt completo) y a `sms-notification-queue` (evento con monto y destino enmascarado) usando el integration directo `arn:aws:states:::sqs:sendMessage`
-3. WHEN el `statement-generator` Lambda termina la generación del PDF, THE Lambda SHALL publicar evento `statement_delivery` a `email-notification-queue` con `{s3Bucket, s3Key, fileName, clientEmail}` y retornar inmediatamente sin esperar respuesta del envío de email
-4. THE Email_Service Lambda SHALL configurarse con SQS Event Source Mapping sobre `email-notification-queue` con `batchSize: 10`, `maxBatchingWindow: 5s`, `reportBatchItemFailures: true`, de modo que mensajes que fallen sean reintentados individualmente sin bloquear el batch completo
-5. THE Email_Service SHALL usar Amazon SES como servicio de envío, con dominio remitente verificado y template HTML con identidad BTG Pactual
-6. IF un mensaje de SQS falla en `maxReceiveCount` intentos, THEN SQS SHALL moverlo automáticamente al DLQ correspondiente; THE system SHALL emitir alarma CloudWatch cuando `ApproximateNumberOfMessagesVisible` en cualquier DLQ supere 0
-7. THE Email_Service SHALL enmascarar datos sensibles en el cuerpo del email (números de cuenta: solo últimos 4 dígitos) siguiendo la misma política de data masking que aplica en los logs
-8. IF el envío de email o SMS falla, THEN bajo NINGUNA circunstancia el fallo SHALL propagarse al flujo principal de WhatsApp; el Bank_Client ya recibió la confirmación por el chat
+3. THE Email_Service Lambda SHALL configurarse con SQS Event Source Mapping sobre `email-notification-queue` con `batchSize: 10`, `maxBatchingWindow: 5s`, `reportBatchItemFailures: true`, de modo que mensajes que fallen sean reintentados individualmente sin bloquear el batch completo
+4. THE Email_Service SHALL usar Amazon SES como servicio de envío, con dominio remitente verificado y template HTML con identidad BTG Pactual
+5. IF un mensaje de SQS falla en `maxReceiveCount` intentos, THEN SQS SHALL moverlo automáticamente al DLQ correspondiente; THE system SHALL emitir alarma CloudWatch cuando `ApproximateNumberOfMessagesVisible` en cualquier DLQ supere 0
+6. THE Email_Service SHALL enmascarar datos sensibles en el cuerpo del email (números de cuenta: solo últimos 4 dígitos) siguiendo la misma política de data masking que aplica en los logs
+7. IF el envío de email o SMS falla, THEN bajo NINGUNA circunstancia el fallo SHALL propagarse al flujo principal de WhatsApp; el Bank_Client ya recibió la confirmación por el chat
+8. THE extracto bancario en PDF NO SHALL enviarse por email; el único canal de entrega del extracto es WhatsApp como documento adjunto vía Twilio Media (ver Requisito 9)
 
 ### Requisito 18: Orquestación de Transacciones Distribuidas con Step Functions
 

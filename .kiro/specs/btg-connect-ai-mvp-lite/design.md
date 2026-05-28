@@ -288,7 +288,7 @@ graph TB
 ### Principios Arquitectónicos
 
 1. **Estrategia de red híbrida (VPC solo donde aporta)**: VPC no es seguridad por defecto en serverless — el control de acceso real es IAM. Por eso solo las Lambdas del **dominio bancario** (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) corren en subnets privadas de `IA-Builder-sandbox-networking`. Son las que en EXT-1 se conectarán al core privado. El resto (canal, orquestación, IA, notificaciones, auth) corre **fuera de VPC** en la red managed de Lambda. **No hay NAT Gateway** (`EnableNatGateway=false`).
-2. **Cero salida a internet para el dominio bancario**: Las Lambdas en VPC NO tienen ruta `0.0.0.0/0` — alcanzan servicios AWS solo vía **VPC Endpoints** (Gateway gratis para S3/DynamoDB; Interface para SQS). Esto elimina cualquier ruta de exfiltración: aunque una Lambda bancaria se comprometa, no puede sacar datos a internet. Security Group sin ingress de red, egress 443 solo hacia los endpoints. CloudWatch Logs no requiere endpoint (la plataforma de Lambda los envía, no la ENI).
+2. **Cero salida a internet para el dominio bancario**: Las Lambdas en VPC NO tienen ruta `0.0.0.0/0` — alcanzan servicios AWS solo vía **VPC Endpoints Gateway** (gratis para S3/DynamoDB). Esto elimina cualquier ruta de exfiltración: aunque una Lambda bancaria se comprometa, no puede sacar datos a internet. Security Group sin ingress de red, egress 443 solo hacia los endpoints. CloudWatch Logs no requiere endpoint (la plataforma de Lambda los envía, no la ENI).
 3. **Runtime único Python 3.13**: Todas las Lambdas (Webhook_Receiver, Message_Processor, Action Groups, OTP_Service, notificadores, Strands_Agent) corren en Python 3.13. Stack 100% Python por decisión de equipo. boto3 para AWS, `aws-lambda-powertools` para logging/tracing, `twilio` SDK para mensajería.
 4. **Twilio como canal**: Twilio Sandbox recibe y envía mensajes WhatsApp. API Gateway expone el webhook público. Credenciales Twilio en Secrets Manager.
 4a. **Async Webhook Pattern**: Separación estricta `Webhook_Receiver` (sync, latencia <1s, solo valida firma y encola) + `Message_Processor` (async, SQS-triggered, hace todo el trabajo pesado). Twilio nunca espera transcripción ni invocación de Bedrock; recibe 200 OK inmediato. Spike de tráfico es absorbido por la cola, no por throttling de Lambda.
@@ -872,7 +872,7 @@ def execute_transfer(params: dict) -> dict:
 
 ### 7. Action_Group Lambda: statement-generator
 
-**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3, publicar evento `statement_delivery` a `email-notification-queue`, y retornar la referencia (S3 key) para que el Message_Processor descargue y envíe el PDF vía Twilio.
+**Responsabilidad:** Generar extractos bancarios en PDF, almacenarlos en S3, y retornar la referencia (S3 key) para que el Message_Processor descargue y envíe el PDF al cliente vía WhatsApp (Twilio Media). El extracto NO se envía por email.
 
 **Runtime:** Python 3.13  
 **Memory:** 256 MB  
@@ -909,26 +909,11 @@ def generate_statement(params: dict) -> dict:
         "final_balance": calculate_balance(transactions),
     })
 
-    # 4. Subir a S3
+    # 4. Subir a S3 (vía Gateway Endpoint S3, sin salida a internet)
     s3_key = f"statements/{phone_number}/{account_id}/{cutoff_date}-{uuid.uuid4()}.pdf"
     s3.put_object(Bucket=STATEMENT_BUCKET, Key=s3_key, Body=pdf_bytes, ContentType="application/pdf")
 
-    # 5. Publicar evento a email-notification-queue (fire-and-forget)
-    sqs.send_message(
-        QueueUrl=EMAIL_NOTIFICATION_QUEUE_URL,
-        MessageBody=json.dumps({
-            "type": "statement_delivery",
-            "correlationId": params.get("correlationId"),
-            "to": client["email"],
-            "payload": {
-                "s3Bucket": STATEMENT_BUCKET, "s3Key": s3_key,
-                "fileName": f"extracto_{account_id}_{cutoff_date}.pdf",
-                "clientName": client["name"],
-            },
-        }),
-    )
-
-    # 6. Retornar referencia S3 para que el Message_Processor envíe el PDF vía Twilio
+    # 5. Retornar referencia S3 para que el Message_Processor envíe el PDF vía Twilio (WhatsApp)
     return {
         "success": True,
         "s3Bucket": STATEMENT_BUCKET,
@@ -936,6 +921,8 @@ def generate_statement(params: dict) -> dict:
         "fileName": f"extracto_{account_id}_{cutoff_date}.pdf",
     }
 ```
+
+> **Nota:** El extracto se entrega exclusivamente por WhatsApp como documento adjunto. El `Message_Processor` recibe el `{s3Bucket, s3Key, fileName}`, genera una presigned URL de S3 (5 min de vigencia) y la pasa a Twilio en `media_url`. No hay publicación a `email-notification-queue` desde este Lambda.
 
 
 ### 8. Strands_Agent Lambda (Conversational_Agent)
@@ -1370,10 +1357,10 @@ from typing import TypedDict, Literal
 
 # Evento publicado a email-notification-queue
 class EmailNotificationEvent(TypedDict):
-    type: Literal["transfer_confirmation", "statement_delivery"]
+    type: Literal["transfer_confirmation"]
     correlationId: str   # Para tracing
     to: str              # Email del cliente
-    payload: dict        # receipt+clientName | s3Bucket+s3Key+fileName+clientName+period
+    payload: dict        # receipt+clientName
 
 # Evento publicado a sms-notification-queue
 class SmsNotificationEvent(TypedDict):
@@ -1400,23 +1387,40 @@ EmailServiceEventSourceMapping:
 
 #### Productores publican via boto3
 
-```python
-# Desde statement-generator Lambda después de generar el PDF
-sqs.send_message(
-    QueueUrl=EMAIL_NOTIFICATION_QUEUE_URL,
-    MessageBody=json.dumps({
-        "type": "statement_delivery",
-        "correlationId": correlation_id,
-        "to": client_email,
-        "payload": {
-            "s3Bucket": STATEMENT_BUCKET, "s3Key": s3_key, "fileName": file_name,
-            "clientName": client["name"],
-            "period": {"start": period_start, "end": cutoff_date},
-        },
-    }),
-    MessageAttributes={"EventType": {"DataType": "String", "StringValue": "statement_delivery"}},
-)
-# Lambda termina inmediatamente — no espera al envío del email
+El único productor de `email-notification-queue` es Step Functions (estado `PublishNotifications`), que publica el evento `transfer_confirmation` por SDK integration directo. El `statement-generator` NO publica a esta cola — el extracto se entrega exclusivamente por WhatsApp (ver Requisito 9).
+
+```yaml
+# ASL del estado PublishNotifications dentro del TransferBrebStateMachine
+PublishNotifications:
+  Type: Parallel
+  Branches:
+    - StartAt: PublishEmail
+      States:
+        PublishEmail:
+          Type: Task
+          Resource: arn:aws:states:::sqs:sendMessage
+          Parameters:
+            QueueUrl.$: $.emailQueueUrl
+            MessageBody:
+              type: transfer_confirmation
+              correlationId.$: $.correlationId
+              to.$: $.client.email
+              payload.$: $.receipt
+          End: true
+    - StartAt: PublishSms
+      States:
+        PublishSms:
+          Type: Task
+          Resource: arn:aws:states:::sqs:sendMessage
+          Parameters:
+            QueueUrl.$: $.smsQueueUrl
+            MessageBody:
+              type: transfer_confirmation
+              correlationId.$: $.correlationId
+              phoneNumber.$: $.client.phoneNumber
+              amount.$: $.receipt.amount
+              destinationAccount.$: $.receipt.destinationAccountMasked
+          End: true
 ```
 
 #### Beneficios del patrón
@@ -1720,8 +1724,8 @@ MessageProcessorRole:
 
 > Roles análogos (CloudFormation `AWS::IAM::Role`) para el resto de Lambdas. La diferencia clave es el managed policy de ejecución según la ubicación de red:
 >
-> - **Fuera de VPC** → `AWSLambdaBasicExecutionRole`: `Auth_Service` (DynamoDB Auth_Session PutItem), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + S3 GetObject + SQS consume), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), `transfer-breb-initiator` (Step Functions StartExecution), `message-handler-notify` (Secrets Twilio)
-> - **Dentro de VPC** → `AWSLambdaVPCAccessExecutionRole` (dominio bancario, subnets privadas): `balance-query` (solo Logs, mock inline), `transfer-breb-validate/execute` (solo Logs, mock inline), `statement-generator` (S3 PutObject vía Gateway Endpoint + SQS SendMessage a email-queue vía Interface Endpoint)
+> - **Fuera de VPC** → `AWSLambdaBasicExecutionRole`: `Auth_Service` (DynamoDB Auth_Session PutItem), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + SQS consume; solo `transfer_confirmation`), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), `transfer-breb-initiator` (Step Functions StartExecution), `message-handler-notify` (Secrets Twilio)
+> - **Dentro de VPC** → `AWSLambdaVPCAccessExecutionRole` (dominio bancario, subnets privadas): `balance-query` (solo Logs, mock inline), `transfer-breb-validate/execute` (solo Logs, mock inline), `statement-generator` (S3 PutObject vía Gateway Endpoint — el extracto se entrega por WhatsApp, no por email)
 > - El rol del **state machine** (no es Lambda): Lambda InvokeFunction de las tasks + SQS SendMessage a las colas de notificación.
 
 ## Data Models
@@ -2162,7 +2166,7 @@ Properties to implement as PBT (con hypothesis):
 |------|------|-----------------|
 | Template lint | `cfn-lint` | Sintaxis y best practices de todos los templates YAML |
 | VpcConfig solo en dominio bancario | pytest sobre template | `balance-query`, `transfer-breb-validate/execute`, `statement-generator` tienen `VpcConfig` a subnets privadas; el resto NO tiene VpcConfig |
-| Sin NAT Gateway | pytest sobre template | No existe `AWS::EC2::NatGateway`; subnets privadas sin ruta 0.0.0.0/0; VPC Endpoints presentes (S3, DynamoDB, SQS) |
+| Sin NAT Gateway | pytest sobre template | No existe `AWS::EC2::NatGateway`; subnets privadas sin ruta 0.0.0.0/0; VPC Endpoints Gateway presentes (S3, DynamoDB) |
 | DynamoDB encryption | pytest sobre template | AWS managed keys configuradas |
 | S3 Block Public Access | pytest sobre template | Los 4 settings habilitados en cada bucket |
 | IAM policy scoping | `cfn-nag` / `checkov` | Least privilege por Lambda, sin wildcards peligrosos |

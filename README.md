@@ -6,7 +6,7 @@ Asistente bancario conversacional por WhatsApp para BTG Pactual Colombia. El cli
 
 - **Consultar saldos** — "¿Cuánto tengo en mi cuenta?" o "Muéstrame mis fondos"
 - **Transferir dinero** — "Quiero transferir 500 mil a la cuenta 1009876544" (con autorización OTP vía SMS)
-- **Generar extractos** — "Necesito mi extracto de noviembre" (llega como PDF adjunto en WhatsApp y por email)
+- **Generar extractos** — "Necesito mi extracto de noviembre" (llega como PDF adjunto en WhatsApp)
 - **Entender notas de voz** — El cliente puede hablar en lugar de escribir; el sistema transcribe automáticamente
 
 El asistente responde siempre en español colombiano natural, formatea montos en COP y declina cualquier consulta fuera del dominio bancario.
@@ -54,7 +54,7 @@ El sistema es 100% serverless y se despliega en AWS. Los detalles técnicos de a
 │   │   ├── sms_service/            # SQS-triggered — SMS de confirmación vía Pinpoint
 │   │   ├── balance_query/          # Tool: consulta de saldos
 │   │   ├── transfer_breb/          # initiator + validate + execute (Step Functions)
-│   │   ├── statement_generator/    # Tool: extracto PDF, publica a SQS email
+│   │   ├── statement_generator/    # Tool: extracto PDF a S3 (entregado por WhatsApp)
 │   │   └── message_handler_notify/ # Lambda llamada por Step Functions para responder al cliente
 │   ├── shared/                     # Utilidades compartidas (Lambda Layer)
 │   ├── login-page/                 # Página de login (sitio estático en S3, browser JS)
