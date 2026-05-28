@@ -2,7 +2,7 @@
 
 ## Introduction
 
-BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para BTG Pactual Colombia, impulsado por Amazon Bedrock Agent con Claude Haiku 3.5. A diferencia de un chatbot tradicional basado en menús, el sistema utiliza inteligencia artificial conversacional que entiende lenguaje natural (texto y audio) para ejecutar servicios bancarios.
+BTG ConnectAI MVP es un chatbot bancario conversacional por WhatsApp para BTG Pactual Colombia, impulsado por Amazon Bedrock Agent con Claude Haiku 3.5. A diferencia de un chatbot tradicional basado en menús, el sistema utiliza inteligencia artificial conversacional que entiende lenguaje natural (texto y audio) para ejecutar servicios bancarios.
 
 **Características diferenciadoras:**
 - **Entrada multimodal**: Soporta mensajes de texto Y notas de voz (audio), transcribiendo automáticamente el audio a texto
@@ -328,7 +328,7 @@ BTG ConnectAI MVP Lite es un chatbot bancario conversacional por WhatsApp para B
 
 ## Extensiones Futuras (Path de Escalamiento)
 
-Esta sección documenta el camino claro desde MVP Lite hacia producción.
+Esta sección documenta el camino claro desde MVP hacia producción.
 
 ### EXT-1: Integración con Core Bancario Real
 

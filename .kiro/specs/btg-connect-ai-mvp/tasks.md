@@ -1,4 +1,4 @@
-# Implementation Plan: BTG ConnectAI MVP Lite
+# Implementation Plan: BTG ConnectAI MVP
 
 ## Overview
 

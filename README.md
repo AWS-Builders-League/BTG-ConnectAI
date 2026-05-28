@@ -1,4 +1,4 @@
-# BTG ConnectAI MVP Lite
+# BTG ConnectAI MVP
 
 Asistente bancario conversacional por WhatsApp para BTG Pactual Colombia. El cliente habla en lenguaje natural — texto o nota de voz — y el asistente entiende y ejecuta operaciones bancarias sin menús ni opciones numeradas.
 

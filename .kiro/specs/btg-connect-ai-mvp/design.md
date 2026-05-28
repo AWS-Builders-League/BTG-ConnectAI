@@ -2,7 +2,7 @@
 
 ## Overview
 
-BTG ConnectAI MVP Lite es un asistente bancario conversacional serverless que conecta WhatsApp con Amazon Bedrock Agent para ejecutar servicios bancarios en español natural. El sistema soporta entrada multimodal (texto y audio), flujo de consentimiento regulatorio, autenticación vía enlace web, y tres servicios bancarios: consulta de saldos, transferencias BRE-B y generación de extractos PDF.
+BTG ConnectAI MVP es un asistente bancario conversacional serverless que conecta WhatsApp con Amazon Bedrock Agent para ejecutar servicios bancarios en español natural. El sistema soporta entrada multimodal (texto y audio), flujo de consentimiento regulatorio, autenticación vía enlace web, y tres servicios bancarios: consulta de saldos, transferencias BRE-B y generación de extractos PDF.
 
 ### Decisiones Arquitectónicas Clave
 
@@ -1884,7 +1884,7 @@ MOCK_CLIENTS: list[MockClient] = [
 
 ```json
 {
-  "secretName": "btg-connectai/mvp-lite/config",
+  "secretName": "btg-connectai/mvp/config",
   "secretValue": {
     "twilioAccountSid": "ACxxxxxxxxxxxxxxxxx",
     "twilioAuthToken": "xxxxxxxxxxxxxxxxxxxx",
@@ -2113,7 +2113,7 @@ ERROR_MESSAGES = {
 
 **Library:** [hypothesis](https://hypothesis.readthedocs.io/) (Python)  
 **Minimum iterations:** 100 per property (`@settings(max_examples=100)`)  
-**Tag format:** `Feature: btg-connect-ai-mvp-lite, Property {number}: {title}`
+**Tag format:** `Feature: btg-connect-ai-mvp, Property {number}: {title}`
 
 Properties to implement as PBT (con hypothesis):
 1. Message splitting round-trip (≤ 1600 chars)
