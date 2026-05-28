@@ -1,14 +1,14 @@
 <mxfile host="Electron">
   <diagram name="Página-1" id="9tNQLpC0g-9h6qISEmDN">
-    <mxGraphModel dx="3543" dy="2103" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+    <mxGraphModel dx="2362" dy="1402" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
         <mxCell id="KxTrzSP3e4wWvzfg9B_l-1" parent="1" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=12;fontStyle=0;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_cloud;strokeColor=#232F3E;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;fontColor=#232F3E;dashed=0;" value="AWS Cloud" vertex="1">
-          <mxGeometry height="1760" width="2460" x="355" y="360" as="geometry" />
+          <mxGeometry height="1760" width="2840" x="340" y="360" as="geometry" />
         </mxCell>
         <mxCell id="KxTrzSP3e4wWvzfg9B_l-2" parent="KxTrzSP3e4wWvzfg9B_l-1" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=12;fontStyle=0;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_region;strokeColor=#00A4A6;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;fontColor=#147EBA;dashed=1;" value="Region" vertex="1">
-          <mxGeometry height="1680" width="2380" x="40" y="40" as="geometry" />
+          <mxGeometry height="1680" width="2760" x="40" y="40" as="geometry" />
         </mxCell>
         <mxCell id="KxTrzSP3e4wWvzfg9B_l-3" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#E7157B;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.api_gateway;" value="&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;API Gateway&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;POST /webhook/twilio&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="78" width="78" x="60" y="300" as="geometry" />
@@ -155,6 +155,327 @@
         </mxCell>
         <mxCell id="KxTrzSP3e4wWvzfg9B_l-42" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;span style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Transfer BREB&lt;/b&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;font-size: 10px;&quot;&gt;&lt;b&gt;Initiator&lt;/b&gt;&lt;/span&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="78" width="78" x="1460" y="300" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-group" parent="KxTrzSP3e4wWvzfg9B_l-2" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=10;fontStyle=1;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_step_functions_workflow;strokeColor=#ED7100;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;spacingTop=5;dashed=0;fontColor=#ED7100;" value="TransferBrebStateMachine (Step Functions)" vertex="1">
+          <mxGeometry height="840" width="280" x="1680" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s1" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=9;fontStyle=1;" value="1) ValidateTransfer&lt;br&gt;&lt;i&gt;(Lambda VPC)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s2" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=9;fontStyle=1;" value="2) GenerateOTP&lt;br&gt;&lt;i&gt;(waitForTaskToken)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-pause" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;fontColor=#E65100;strokeColor=#ED7100;fontSize=9;fontStyle=1;dashed=1;dashPattern=5 5;" value="PAUSADO&lt;br&gt;&lt;i&gt;Esperando OTP (5 min, $0)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="50" width="200" x="40" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s3" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=9;fontStyle=1;" value="3) ValidateOTP&lt;br&gt;&lt;i&gt;(Choice)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s4" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD3522;fontColor=#ffffff;strokeColor=#DD3522;fontSize=9;fontStyle=1;" value="4) ExecuteTransfer&lt;br&gt;&lt;i&gt;(Lambda VPC)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="450" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s5" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E7157B;fontColor=#ffffff;strokeColor=#E7157B;fontSize=9;fontStyle=1;" value="5) PublishNotifications&lt;br&gt;&lt;i&gt;(Parallel: SQS email+sms)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="550" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-s6" parent="sfn-group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ED7100;fontColor=#ffffff;strokeColor=#ED7100;fontSize=9;fontStyle=1;" value="6) NotifyUserSuccess&lt;br&gt;&lt;i&gt;(Lambda → Twilio)&lt;/i&gt;" vertex="1">
+          <mxGeometry height="40" width="200" x="40" y="650" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-end" parent="sfn-group" style="ellipse;whiteSpace=wrap;html=1;fillColor=#232F3E;fontColor=#ffffff;strokeColor=#232F3E;fontSize=9;fontStyle=1;" value="FIN" vertex="1">
+          <mxGeometry height="30" width="60" x="110" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-err" parent="sfn-group" style="text;html=1;align=left;verticalAlign=top;resizable=0;points=[];strokeColor=none;fillColor=none;fontSize=8;fontColor=#B71C1C;" value="&lt;b&gt;Errores:&lt;/b&gt; ValidationFailed |&amp;nbsp;&lt;div&gt;OTPExpired |&amp;nbsp;&lt;/div&gt;&lt;div&gt;OTPBlocked | TransferFailed&lt;/div&gt;" vertex="1">
+          <mxGeometry height="30" width="250" x="15" y="790" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-e12" edge="1" parent="sfn-group" source="sfn-s1" style="rounded=0;html=1;strokeColor=#ED7100;" target="sfn-s2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-e2p" edge="1" parent="sfn-group" source="sfn-s2" style="rounded=0;html=1;strokeColor=#ED7100;dashed=1;" target="sfn-pause">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-ep3" edge="1" parent="sfn-group" source="sfn-pause" style="rounded=0;html=1;strokeColor=#ED7100;" target="sfn-s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-ep3-l" connectable="0" parent="sfn-ep3" style="edgeLabel;html=1;fontSize=8;fontColor=#E65100;" value="SendTaskSuccess" vertex="1">
+          <mxGeometry relative="1" x="0.2" as="geometry">
+            <mxPoint x="55" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sfn-e34" edge="1" parent="sfn-group" source="sfn-s3" style="rounded=0;html=1;strokeColor=#ED7100;" target="sfn-s4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-e34-l" connectable="0" parent="sfn-e34" style="edgeLabel;html=1;fontSize=8;fontColor=#388E3C;fontStyle=1;" value="OTP válido ✓" vertex="1">
+          <mxGeometry relative="1" x="-0.2" as="geometry">
+            <mxPoint x="40" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sfn-e45" edge="1" parent="sfn-group" source="sfn-s4" style="rounded=0;html=1;strokeColor=#ED7100;" target="sfn-s5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-e56" edge="1" parent="sfn-group" source="sfn-s5" style="rounded=0;html=1;strokeColor=#ED7100;" target="sfn-s6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn-e6e" edge="1" parent="sfn-group" source="sfn-s6" style="rounded=0;html=1;strokeColor=#232F3E;" target="sfn-end">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-init-sfn" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="KxTrzSP3e4wWvzfg9B_l-42" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ED7100;strokeWidth=2;" target="sfn-group">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1635" y="339" />
+              <mxPoint x="1635" y="339" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-init-sfn-l" connectable="0" parent="e-init-sfn" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontStyle=1;fontColor=#ED7100;" value="StartExecution" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-5" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sqs-email" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#E7157B;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sqs;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;SQS&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;email-notification&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(+DLQ)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="2105" y="691" as="geometry" />
+        </mxCell>
+        <mxCell id="sqs-sms" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#E7157B;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sqs;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;SQS&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;sms-notification&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(+DLQ)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1420" y="1090" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-email" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Email Service&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="2305" y="691" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-sms" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;SMS Service&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1422" y="922" as="geometry" />
+        </mxCell>
+        <mxCell id="pinpoint" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#DD344C;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.pinpoint;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;AWS Pinpoint&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(SMS)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1422" y="730" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-otp" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;OTP Service&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;i&gt;(waitForTaskToken)&lt;/i&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1422" y="521" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-notify" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;message_handler&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;notify&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="2081" y="890" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sfn-sqsemail" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E7157B;" target="sqs-email">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sfn-sqsemail-l" connectable="0" parent="e-sfn-sqsemail" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#E7157B;" value="PUBLICA" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-sqssms" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E7157B;entryX=1;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="sqs-sms">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1560" y="730" />
+              <mxPoint x="1560" y="1129" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-sqssms-l" connectable="0" parent="e-sfn-sqssms" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#E7157B;" value="PUBLICA" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sqsemail-lam" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sqs-email" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#E7157B;" target="lam-email">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sqsemail-lam-l" connectable="0" parent="e-sqsemail-lam" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#E7157B;" value="CONSUME (batch=10)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sqssms-lam" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sqs-sms" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#E7157B;" target="lam-sms">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sqssms-lam-l" connectable="0" parent="e-sqssms-lam" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#E7157B;" value="CONSUME (batch=10)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sms-pin" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="lam-sms" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#DD344C;" target="pinpoint">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sms-pin-l" connectable="0" parent="e-sms-pin" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#DD344C;" value="SendMessages" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-otp" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#ED7100;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" target="lam-otp">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1695" y="330" />
+              <mxPoint x="1695" y="450" />
+              <mxPoint x="1461" y="450" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-otp-l" connectable="0" parent="e-sfn-otp" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#ED7100;" value="$$.Task.Token" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-154" y="20" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-notify" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#ED7100;" target="lam-notify">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-sfn-notify-l" connectable="0" parent="e-sfn-notify" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#ED7100;" value="task: Notify → Twilio" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-otp-pin" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="lam-otp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#DD344C;" target="pinpoint">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-otp-pin-l" connectable="0" parent="e-otp-pin" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#DD344C;" value="SMS OTP" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-otp-ddb" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="lam-otp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C925D1;" target="KxTrzSP3e4wWvzfg9B_l-23">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-otp-ddb-l" connectable="0" parent="e-otp-ddb" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C925D1;" value="PutItem (code+taskToken)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="vpc-group" parent="KxTrzSP3e4wWvzfg9B_l-2" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=10;fontStyle=1;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_vpc2;strokeColor=#8C4FFF;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;spacingTop=5;dashed=0;fontColor=#8C4FFF;" value="VPC — IA-Builder-sandbox (10.0.0.0/16) | NAT: NO | Sin salida a internet" vertex="1">
+          <mxGeometry height="360" width="2280" x="60" y="1280" as="geometry" />
+        </mxCell>
+        <mxCell id="sg-banking" parent="vpc-group" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=9;fontStyle=1;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_security_group;grStroke=0;strokeColor=#DD3522;fillColor=#FFEBEE;verticalAlign=top;align=left;spacingLeft=30;spacingTop=5;dashed=0;fontColor=#DD3522;" value="BankingLambdaSG — Ingress: NINGUNO | Egress: TCP 443 → VPC Endpoints" vertex="1">
+          <mxGeometry height="233" width="2220" x="30" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-validate" parent="sg-banking" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;transfer_breb&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;validate&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;i&gt;(Mock Core)&lt;/i&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="80" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-execute" parent="sg-banking" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;transfer_breb&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;execute&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;i&gt;(Mock Core)&lt;/i&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1850" y="77.5" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-balance" parent="sg-banking" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;balance_query&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;i&gt;(tool: saldos)&lt;/i&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="357" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lam-statement" parent="sg-banking" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;statement&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;generator&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;&lt;i&gt;(tool: extracto PDF)&lt;/i&gt;&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="650" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="vpce-s3" parent="vpc-group" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=top;verticalAlign=bottom;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.endpoint;labelPosition=center;" value="&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;VPC Endpoint S3&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;(Gateway)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="48" width="48" x="995" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="vpce-sqs" parent="vpc-group" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=top;verticalAlign=bottom;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.endpoint;labelPosition=center;" value="&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;VPC Endpoint SQS&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;(Interface)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="48" width="48" x="1330" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="vpce-dynamo" parent="vpc-group" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=top;verticalAlign=bottom;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.endpoint;labelPosition=center;" value="&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;&lt;b&gt;VPC Endpoint DynamoDB&lt;/b&gt;&lt;/font&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 9px;&quot;&gt;(Gateway)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="48" width="48" x="1730" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="e-stmt-vpces3" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="lam-statement" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8C4FFF;strokeWidth=2;" target="vpce-s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-stmt-vpces3-l" connectable="0" parent="e-stmt-vpces3" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=8;fontColor=#8C4FFF;" value="TCP 443" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="68" y="-52" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-validate" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#DD3522;strokeWidth=2;" target="lam-validate">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1380" y="240" />
+              <mxPoint x="1380" y="800" />
+              <mxPoint x="510" y="800" />
+              <mxPoint x="510" y="1090" />
+              <mxPoint x="209" y="1090" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-sfn-validate-l" connectable="0" parent="e-sfn-validate" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#DD3522;" value="task: ValidateTransfer&lt;br&gt;(plano control → VPC)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-379" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-ai-balance" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="KxTrzSP3e4wWvzfg9B_l-33" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#DD3522;strokeWidth=2;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" target="lam-balance">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1219" y="880" />
+              <mxPoint x="769" y="880" />
+              <mxPoint x="769" y="1220" />
+              <mxPoint x="486" y="1220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-ai-balance-l" connectable="0" parent="e-ai-balance" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#DD3522;" value="tool: query_balance&lt;br&gt;(plano control → VPC)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s3-statements" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#7AA116;strokeColor=#ffffff;dashed=0;verticalLabelPosition=top;verticalAlign=bottom;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;labelPosition=center;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;S3&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Statement_Bucket&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(PDFs)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="1040" y="1100" as="geometry" />
+        </mxCell>
+        <mxCell id="s3-login" parent="KxTrzSP3e4wWvzfg9B_l-2" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#7AA116;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;S3&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Login_Page_Bucket&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(sitio estático)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="260" y="700" as="geometry" />
+        </mxCell>
+        <mxCell id="e-ai-statement" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="KxTrzSP3e4wWvzfg9B_l-33" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#DD3522;strokeWidth=2;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" target="lam-statement">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1219" y="1000" />
+              <mxPoint x="939" y="1000" />
+              <mxPoint x="939" y="1320" />
+              <mxPoint x="779" y="1320" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-ai-statement-l" connectable="0" parent="e-ai-statement" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#DD3522;" value="tool: statement&lt;br&gt;(plano control → VPC)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-stmt-vpcesqs" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="lam-statement" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8C4FFF;strokeWidth=2;" target="vpce-sqs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-stmt-vpcesqs-l" connectable="0" parent="e-stmt-vpcesqs" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=8;fontColor=#8C4FFF;" value="TCP 443" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-vpces3-s3" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="vpce-s3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#8C4FFF;" target="s3-statements">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-vpces3-s3-l" connectable="0" parent="e-vpces3-s3" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=8;fontColor=#8C4FFF;" value="PutObject (PDF)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-vpcesqs-sqs" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="vpce-sqs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#8C4FFF;" target="sqs-email">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1414" y="1240" />
+              <mxPoint x="2170" y="1240" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-vpcesqs-sqs-l" connectable="0" parent="e-vpcesqs-sqs" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=8;fontColor=#8C4FFF;" value="SendMessage&lt;br&gt;(statement_delivery)" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="117" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-auth-s3login" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="s3-login" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ED7100;" target="KxTrzSP3e4wWvzfg9B_l-39">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-auth-s3login-l" connectable="0" parent="e-auth-s3login" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#ED7100;" value="POST /authenticate" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="rP52Yh6hLhs62TOAdkpm-4" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-2" source="sfn-s4" style="edgeStyle=orthogonalEdgeStyle;shape=connector;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;dashed=1;strokeColor=#DD3522;strokeWidth=2;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;endArrow=classic;" target="lam-execute">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1980" y="630" />
+              <mxPoint x="1980" y="1450" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ses" parent="KxTrzSP3e4wWvzfg9B_l-1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;fillColor=#DD344C;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.simple_email_service;" value="&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Amazon SES&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;(Email)&lt;/font&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="78" width="78" x="2527" y="731" as="geometry" />
+        </mxCell>
+        <mxCell id="e-email-ses" edge="1" parent="KxTrzSP3e4wWvzfg9B_l-1" source="lam-email" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#DD344C;" target="ses">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-email-ses-l" connectable="0" parent="e-email-ses" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#DD344C;" value="SendEmail" vertex="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
         </mxCell>
         <mxCell id="KxTrzSP3e4wWvzfg9B_l-43" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;arcSize=20;" value="Twilio&lt;br&gt;(WhatsApp API)" vertex="1">
           <mxGeometry height="50" width="130" x="160" y="860" as="geometry" />
