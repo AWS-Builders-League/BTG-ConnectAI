@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "sonarqube": {
+      "command": "docker",
+      "args": [
+        "run", "--init", "--pull=always", "-i", "--rm",
+        "-v", "c:\\Users\\chevi\\Documents\\Proyectos\\BTG-ConnectAI:/app/mcp-workspace:rw",
+        "-e", "SONARQUBE_TOKEN",
+        "-e", "SONARQUBE_URL",
+        "-e", "SONARQUBE_PROJECT_KEY",
+        "mcp/sonarqube"
+      ],
+      "env": {
+        "SONARQUBE_TOKEN": "<YourSonarQubeUserToken>",
+        "SONARQUBE_URL": "<YourSonarQubeServerURL>",
+        "SONARQUBE_PROJECT_KEY": "<YourSonarQubeProjectKey>"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

@@ -1,1 +1,21 @@
+# IDE y herramientas
 .claude
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Ambiente
+.env
+
+# Build artifacts
+*.zip
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

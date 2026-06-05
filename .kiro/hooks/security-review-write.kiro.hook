@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Security Review on Lambda Write",
+  "description": "Antes de escribir archivos en src/lambdas, verifica que no se logueen datos sensibles sin enmascarar (teléfonos, cuentas, documentos) y que las credenciales se obtengan de Secrets Manager.",
+  "version": "1",
+  "when": {
+    "type": "preToolUse",
+    "toolTypes": [
+      "write"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Antes de escribir este archivo, verifica: 1) No se loguean datos sensibles sin masking (teléfonos, cuentas, documentos deben usar shared/masking.py). 2) Credenciales se obtienen de Secrets Manager, no hardcodeadas. 3) Se usa correlation_id propagado, no regenerado. Si todo está bien, procede con la escritura."
+  }
+}

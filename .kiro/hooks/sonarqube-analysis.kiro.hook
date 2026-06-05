@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "SonarQube Analysis on Save",
+  "description": "Ejecuta un análisis de SonarQube sobre el código Python editado para detectar code smells, bugs y vulnerabilidades automáticamente al guardar.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "src/**/*.py"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Usa la herramienta de SonarQube MCP para analizar el archivo Python que se acaba de editar. Reporta code smells, bugs o vulnerabilidades encontradas y sugiere correcciones."
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Lint CloudFormation on Save",
+  "description": "Ejecuta cfn-lint automáticamente cuando se edita un template CloudFormation YAML para detectar errores de sintaxis e infraestructura tempranamente.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "cloudformation/**/*.yaml"
+    ]
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "cfn-lint cloudformation/**/*.yaml"
+  }
+}

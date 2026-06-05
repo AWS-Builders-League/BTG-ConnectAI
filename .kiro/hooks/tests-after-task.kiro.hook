@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Run Tests After Task",
+  "description": "Ejecuta pytest automáticamente después de completar cada tarea del spec para validar que la implementación no introduce regresiones.",
+  "version": "1",
+  "when": {
+    "type": "postTaskExecution"
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "pytest src/tests/ -v --tb=short 2>nul || echo \"No tests found yet or tests failed\""
+  }
+}
