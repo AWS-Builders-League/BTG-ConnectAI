@@ -9,7 +9,11 @@ BTG ConnectAI MVP es un asistente bancario conversacional serverless que conecta
 | Decisión | Elección | Razón |
 | -------- | -------- | ----- |
 | Runtime (todas las Lambdas) | Python 3.13 | Decisión de equipo: stack 100% Python. Strands SDK nativo, boto3, aws-lambda-powertools |
-| IaC | CloudFormation puro (YAML) | Mismo patrón que el repo `infra` (networking). Nested stacks, deploy via GitHub Actions + OIDC. Sin CDK ni SAM |
+| IaC | CloudFormation puro (YAML) | Mismo patrón y convenciones del repo `infra`. Nested stacks, deploy via GitHub Actions + OIDC. Sin CDK ni SAM |
+| Ubicación de la IaC de recursos compartidos | Repo `infra` (IaC centralizada) | API Gateway, SQS (FIFO inbound + colas de notificación + DLQs), S3 (Statement, Audio_Temp, Login_Page, artefactos), DynamoDB (Consent_Store, Auth_Session, OTP_Store), Bedrock (Agent Core + Guardrails), red (Security Groups + VPC Endpoints), Secrets Manager, SNS de alarmas y observabilidad compartida viven en `infra`. Un solo dueño de la infraestructura base/compartida, gobernada por los lineamientos de `infra` |
+| Ubicación de la IaC de cómputo/orquestación | Repo `BTG-ConnectAI` | Solo define cada función Lambda (Webhook_Receiver, Message_Processor, Auth_Service, balance-query, transfer-breb-validate/execute/initiator, statement-generator, OTP_Service, Email_Service, SMS_Service, Strands_Agent) y la state machine `TransferBrebStateMachine`, más el código de aplicación. No contiene IaC de recursos compartidos |
+| Contrato entre repos (cross-stack) | CloudFormation `Outputs`/`Export` + SSM Parameter Store, consumidos por la app | `infra` exporta ARNs/URLs/IDs de los recursos que crea; la app los resuelve con `Fn::ImportValue` (mismo region/cuenta) y/o `{{resolve:ssm:...}}` (desacople preferido entre stacks de repos distintos). Convención de nombres `${ProjectName}-${Environment}-<Recurso>` |
+| Orden de despliegue | `infra` primero, luego `BTG-ConnectAI` | La app depende de exports/parámetros publicados por `infra`. El deploy de la app falla rápido si `infra` no ha publicado el contrato |
 | Empaquetado Lambda | ZIP a S3 + Lambda Layers | CloudFormation `Code: {S3Bucket, S3Key}`. Dependencias pip en Layers compartidos |
 | AI Engine | Strands Agent SDK + Amazon Bedrock Agent Core (Claude Haiku 3.5) | Framework open-source AWS sobre Bedrock; control de orquestación, herramientas y memoria de sesión |
 | Canal WhatsApp | Twilio (WhatsApp Sandbox) | Onboarding rápido sin aprobación Meta, webhooks REST simples |
@@ -287,7 +291,13 @@ graph TB
 
 ### Principios Arquitectónicos
 
-1. **Estrategia de red híbrida (VPC solo donde aporta)**: VPC no es seguridad por defecto en serverless — el control de acceso real es IAM. Por eso solo las Lambdas del **dominio bancario** (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) corren en subnets privadas de `IA-Builder-sandbox-networking`. Son las que en EXT-1 se conectarán al core privado. El resto (canal, orquestación, IA, notificaciones, auth) corre **fuera de VPC** en la red managed de Lambda. **No hay NAT Gateway** (`EnableNatGateway=false`).
+0a. **IaC de recursos compartidos centralizada en el repo `infra`**: Toda la infraestructura base/compartida se define y gobierna en el repo `infra` siguiendo SUS lineamientos (CloudFormation puro, `cloudformation/templates/<modulo>/` + `cloudformation/stacks/<ambiente>/`, tags obligatorios, deploy con OIDC). En `infra` viven: **API Gateway (HTTP API)**, **todas las colas SQS** (FIFO inbound + Standard de notificaciones email/sms + sus DLQs), **todos los buckets S3** (Statement, Audio_Temp, Login_Page, artefactos de Lambda), **todas las tablas DynamoDB** (Consent_Store, Auth_Session, OTP_Store), **Bedrock** (Agent Core + Guardrails), y el resto de infraestructura compartida (**Secrets Manager**, **SNS de alarmas**, **VPC access**: Security Groups + VPC Endpoints, **observabilidad compartida**). `BTG-ConnectAI` ya **no** contiene la IaC de estos recursos.
+
+0b. **BTG-ConnectAI solo define cómputo y orquestación**: Este repo define exclusivamente la IaC de **cada función Lambda** (Webhook_Receiver, Message_Processor, Auth_Service, balance-query, transfer-breb-validate, transfer-breb-execute, transfer-breb-initiator, statement-generator, OTP_Service, Email_Service, SMS_Service, Strands_Agent) y de la **state machine** `TransferBrebStateMachine`, más el código de aplicación (Python 3.13) y la Login_Page estática. Los recursos compartidos se consumen por referencia (ver sección *Integración Cross-Repo / Cross-Stack*).
+
+0c. **Contrato cross-stack explícito**: Las Lambdas y la state machine obtienen ARNs, URLs de cola, nombres de tabla, ARNs de bucket, ARN del Bedrock Agent/Guardrail, Security Group ID y Subnet IDs mediante el contrato publicado por `infra`: CloudFormation `Outputs`/`Export` consumidos con `Fn::ImportValue` y/o SSM Parameter Store. El orden de despliegue es **`infra` primero, luego `BTG-ConnectAI`**.
+
+1. **Estrategia de red híbrida (VPC solo donde aporta)**: VPC no es seguridad por defecto en serverless — el control de acceso real es IAM. Por eso solo las Lambdas del **dominio bancario** (`balance_query`, `transfer_breb_validate`, `transfer_breb_execute`, `statement_generator`) corren en subnets privadas de `IA-Builder-sandbox-networking`. Son las que en EXT-1 se conectarán al core privado. El resto (canal, orquestación, IA, notificaciones, auth) corre **fuera de VPC** en la red managed de Lambda. **No hay NAT Gateway** (`EnableNatGateway=false`). La VPC, las subnets, los Security Groups (incluido `BankingLambdaSG`) y los VPC Endpoints son propiedad del repo `infra`; `BTG-ConnectAI` solo los **referencia** vía `Fn::ImportValue`/SSM para configurar el `VpcConfig` de las Lambdas bancarias.
 2. **Cero salida a internet para el dominio bancario**: Las Lambdas en VPC NO tienen ruta `0.0.0.0/0` — alcanzan servicios AWS solo vía **VPC Endpoints Gateway** (gratis para S3/DynamoDB). Esto elimina cualquier ruta de exfiltración: aunque una Lambda bancaria se comprometa, no puede sacar datos a internet. Security Group sin ingress de red, egress 443 solo hacia los endpoints. CloudWatch Logs no requiere endpoint (la plataforma de Lambda los envía, no la ENI).
 3. **Runtime único Python 3.13**: Todas las Lambdas (Webhook_Receiver, Message_Processor, Action Groups, OTP_Service, notificadores, Strands_Agent) corren en Python 3.13. Stack 100% Python por decisión de equipo. boto3 para AWS, `aws-lambda-powertools` para logging/tracing, `twilio` SDK para mensajería.
 4. **Twilio como canal**: Twilio Sandbox recibe y envía mensajes WhatsApp. API Gateway expone el webhook público. Credenciales Twilio en Secrets Manager.
@@ -312,7 +322,7 @@ graph TB
 **Runtime:** Python 3.13
 **Memory:** 256 MB
 **Timeout:** 10 seconds (en práctica resuelve en <1s)
-**Trigger:** Amazon API Gateway (HTTP API — POST /webhook/twilio)
+**Trigger:** Amazon API Gateway (HTTP API — POST /webhook/twilio). El **API Gateway lo crea `infra`**; la **Integration (`AWS_PROXY`), la Route (`POST /webhook/twilio`) y el `AWS::Lambda::Permission`** se definen en `BTG-ConnectAI` usando el `HttpApiId` importado del contrato (ver *Integración Cross-Repo / Cross-Stack*).
 **Provisioned Concurrency:** Recomendado en producción (no requerido para hackathon)
 
 #### Lógica del Webhook_Receiver
@@ -1371,13 +1381,15 @@ class SmsNotificationEvent(TypedDict):
     destinationAccount: str   # Ya enmascarado
 ```
 
-#### Event Source Mapping (CloudFormation)
+#### Event Source Mapping (CloudFormation — definido en `BTG-ConnectAI`)
+
+> Las colas viven en `infra`; el Event Source Mapping que las ata a las Lambdas consumidoras se define en `BTG-ConnectAI` (repo dueño del cómputo), usando el ARN de la cola resuelto del contrato (`Fn::ImportValue` / SSM).
 
 ```yaml
 EmailServiceEventSourceMapping:
   Type: AWS::Lambda::EventSourceMapping
   Properties:
-    EventSourceArn: !GetAtt EmailNotificationQueue.Arn
+    EventSourceArn: !Ref EmailQueueArn        # contrato: de infra (Fn::ImportValue / SSM)
     FunctionName: !Ref EmailServiceFunction
     BatchSize: 10
     MaximumBatchingWindowInSeconds: 5
@@ -1437,7 +1449,7 @@ PublishNotifications:
 
 #### Configuración
 
-El Guardrail se define como recurso CloudFormation `AWS::Bedrock::Guardrail` y se referencia desde el Strands Agent al invocar el modelo (parámetro `guardrailIdentifier`/`guardrailVersion` en el `converse`/`invoke_model`):
+El Guardrail se define como recurso CloudFormation `AWS::Bedrock::Guardrail` **en el repo `infra`** (junto con el Bedrock Agent Core). El `Strands_Agent` (Lambda en `BTG-ConnectAI`) lo referencia al invocar el modelo (parámetro `guardrailIdentifier`/`guardrailVersion` en el `converse`/`invoke_model`), resolviendo `GuardrailId`/`GuardrailVersion` del contrato cross-stack (`Fn::ImportValue` / SSM). La definición de referencia es:
 
 ```yaml
 BtgConnectAiGuardrail:
@@ -1497,9 +1509,11 @@ BtgConnectAiGuardrail:
 
 ### 12. Observability Stack
 
-El Dashboard y las Alarms se definen como recursos CloudFormation (`AWS::CloudWatch::Dashboard`, `AWS::CloudWatch::Alarm`) en el template `observability.yaml`. El Dashboard incluye widgets de invocations/errors/latency p50/p90 para cada Lambda (Webhook_Receiver, Message_Processor, Auth_Service, Strands_Agent, OTP_Service, Email_Service, SMS_Service, balance-query, transfer-breb-validate, transfer-breb-execute, statement-generator, message-handler-notify), más métricas de Step Functions y SQS.
+El Dashboard, las Alarms y el tópico SNS de alarmas se definen como recursos CloudFormation (`AWS::CloudWatch::Dashboard`, `AWS::CloudWatch::Alarm`, `AWS::SNS::Topic`) **en el repo `infra`** (observabilidad compartida). El Dashboard incluye widgets de invocations/errors/latency p50/p90 para cada Lambda (Webhook_Receiver, Message_Processor, Auth_Service, Strands_Agent, OTP_Service, Email_Service, SMS_Service, balance-query, transfer-breb-validate, transfer-breb-execute, statement-generator, message-handler-notify), más métricas de Step Functions y SQS. Como las Lambdas se monitorean por nombre (`FunctionName`), `infra` usa la convención de naming del proyecto para construir las dimensiones y/o consume del contrato los nombres de función publicados por `BTG-ConnectAI`. El `AlarmsTopicArn` forma parte del contrato.
 
-#### CloudWatch Alarms (CloudFormation)
+#### CloudWatch Alarms (CloudFormation — definido en `infra`)
+
+> Patrón ilustrativo. La alarma vive en `infra`; `MessageProcessorFunction` representa el **nombre de función** publicado por `BTG-ConnectAI` en el contrato (o derivado de la convención de naming), y `AlarmsTopic` es el tópico SNS de alarmas de `infra`.
 
 ```yaml
 # Patrón de alarma error-rate por Lambda (math expression errors/invocations*100 > 10%)
@@ -1547,37 +1561,230 @@ MessageProcessorErrorRateAlarm:
 > - **SQS DLQ `ApproximateNumberOfMessagesVisible` > 0** en inbound-messages-dlq, email-dlq, sms-dlq
 > - **SQS `ApproximateAgeOfOldestMessage` > 60s** en inbound-messages-queue (Processor saturado)
 
-### 13. Infrastructure as Code (CloudFormation)
+### 13. Infrastructure as Code (CloudFormation) — Reparto entre repos
 
-El IaC sigue el mismo patrón del repo `infra` (donde está el networking): templates anidados en `cloudformation/templates/`, stack raíz en `cloudformation/stacks/sandbox/`, deploy via GitHub Actions con OIDC y `aws cloudformation deploy`. NO se usa CDK ni SAM.
+La IaC está **repartida en dos repositorios** con un límite claro de responsabilidad. Ambos usan CloudFormation puro (YAML), nested stacks, tags obligatorios y deploy via GitHub Actions con OIDC.
 
-#### Estructura de repositorio
+| Recurso | Repo dueño de la IaC | Notas |
+| ------- | -------------------- | ----- |
+| API Gateway (HTTP API) + ruta `/webhook/twilio` | `infra` | La **integración** con `Webhook_Receiver` se resuelve por referencia (ver wiring cruzado) |
+| SQS FIFO `inbound-messages-queue.fifo` + `inbound-messages-dlq` | `infra` | |
+| SQS `email-notification-queue` / `sms-notification-queue` + `email-dlq` / `sms-dlq` | `infra` | |
+| S3: Statement_Bucket, Audio_Temp, Login_Page, artefactos de Lambda | `infra` | |
+| DynamoDB: Consent_Store, Auth_Session, OTP_Store | `infra` | |
+| Bedrock: Agent Core + Guardrails | `infra` | |
+| VPC access: Security Groups (`BankingLambdaSG`), VPC Endpoints (S3/DynamoDB) | `infra` (módulo networking) | VPC/subnets ya existen en `IA-Builder-sandbox-networking` |
+| Secrets Manager (Twilio creds), SNS de alarmas, Dashboard/Alarms compartidos | `infra` | |
+| **Lambdas** (Webhook_Receiver, Message_Processor, Auth_Service, balance-query, transfer-breb-validate/execute/initiator, statement-generator, OTP_Service, Email_Service, SMS_Service, Strands_Agent) | **`BTG-ConnectAI`** | Incluye IAM roles de cada Lambda |
+| **State machine** `TransferBrebStateMachine` (+ su IAM role) | **`BTG-ConnectAI`** | |
+| **Event Source Mappings** (SQS → Lambda) | **`BTG-ConnectAI`** | Atan colas de `infra` a Lambdas de la app (ver wiring cruzado) |
+| Código de aplicación (Python 3.13) y Login_Page estática | **`BTG-ConnectAI`** | El bucket que la sirve es de `infra`; el contenido lo publica la app |
+
+#### Estructura del repo `infra` (resumen — gobernado por sus propios lineamientos)
+
+```text
+cloudformation/
+├── templates/
+│   ├── networking/          # vpc, subnets, security-groups (+ BankingLambdaSG), vpc-endpoints
+│   └── connectai-shared/    # api-gateway, queues, storage, data (DynamoDB), secrets,
+│                            #   bedrock (agent + guardrails), sns-alarms, observability
+└── stacks/
+    └── sandbox/
+        ├── networking.yaml          # ya existe
+        └── connectai-shared.yaml    # stack raíz de recursos compartidos; publica Outputs/Export + SSM
+```
+
+> El reparto exacto de templates dentro de `infra` lo determina ese repo según sus convenciones (`templates/<modulo>/` + `stacks/<ambiente>/`, un template por recurso lógico, tags `Environment`/`Project`/`ManagedBy: cloudformation`). Aquí solo se documenta la **frontera** y el **contrato** que `BTG-ConnectAI` consume.
+
+#### Estructura de repositorio `BTG-ConnectAI` (solo cómputo + orquestación)
 
 ```text
 cloudformation/
 ├── templates/
 │   └── connectai/
-│       ├── data.yaml                 # DynamoDB: Consent_Store, Auth_Session, OTP_Store
-│       ├── storage.yaml              # S3: Statement, Audio_Temp, Login_Page
-│       ├── queues.yaml               # SQS FIFO inbound + email + sms + DLQs
-│       ├── secrets.yaml              # Secrets Manager (Twilio creds)
-│       ├── iam.yaml                  # IAM roles de todas las Lambdas
-│       ├── lambdas-ingestion.yaml    # webhook-receiver, message-processor + EventSourceMapping
+│       ├── iam.yaml                  # IAM roles de todas las Lambdas + role del state machine
+│       ├── lambdas-ingestion.yaml    # webhook-receiver, message-processor + EventSourceMapping (SQS infra → Lambda)
 │       ├── lambdas-actions.yaml      # balance-query, transfer-breb-validate/execute/initiator, statement-generator
-│       ├── lambdas-notify.yaml       # otp-service, email-service, sms-service, message-handler-notify
+│       ├── lambdas-notify.yaml       # otp-service, email-service, sms-service (+ EventSourceMappings) , message-handler-notify
 │       ├── lambda-ai-agent.yaml      # strands agent
-│       ├── guardrails.yaml           # AWS::Bedrock::Guardrail
-│       ├── state-machine.yaml        # AWS::StepFunctions::StateMachine (carga ASL)
-│       ├── api-gateway.yaml          # AWS::ApiGatewayV2 (HTTP API) + ruta /webhook/twilio
-│       └── observability.yaml        # Dashboard + Alarms + SNS topic
+│       └── state-machine.yaml        # AWS::StepFunctions::StateMachine (carga ASL)
 ├── stacks/
 │   └── sandbox/
-│       └── connectai.yaml            # Stack raíz: nested stacks + parámetros + Fn::ImportValue networking
+│       └── connectai-app.yaml        # Stack raíz: nested stacks de Lambdas/SFN + resolución del contrato
+│                                     #   (Fn::ImportValue / {{resolve:ssm:...}}) publicado por `infra`
 ├── state-machines/
 │   └── transfer-breb.asl.json        # Definición Amazon States Language
 └── .github/workflows/
-    └── cfn-deploy.yml                # Deploy via OIDC (mismo patrón que infra)
+    └── cfn-deploy.yml                # Deploy via OIDC (mismo patrón que infra); corre DESPUÉS de infra
+```
 
+> Ya **no** existen en `BTG-ConnectAI` los templates `data.yaml`, `storage.yaml`, `queues.yaml`, `secrets.yaml`, `guardrails.yaml`, `api-gateway.yaml` ni `observability.yaml`: esos recursos los crea `infra`. Lo que antes los referenciaba con `!GetAtt`/`!Ref` local ahora los resuelve con `Fn::ImportValue` / SSM (ver siguiente sección).
+
+#### Integración Cross-Repo / Cross-Stack (el contrato)
+
+Como las Lambdas y la state machine viven en un stack distinto (y en un repo distinto) de los recursos que consumen, se define un **contrato explícito** publicado por `infra` y consumido por `BTG-ConnectAI`. Se usan dos mecanismos complementarios:
+
+1. **CloudFormation `Outputs` + `Export` → `Fn::ImportValue`** (acoplamiento fuerte, misma cuenta/region). `infra` exporta cada recurso; la app importa el valor. Ventaja: CloudFormation **bloquea el borrado** de un recurso exportado mientras exista un import (protege contra romper la app). Desventaja: crea dependencia dura entre stacks.
+
+2. **SSM Parameter Store** (acoplamiento débil — **recomendado entre repos distintos**). `infra` escribe parámetros `String` con los identificadores; la app los lee en deploy-time con `{{resolve:ssm:/btgconnectai/sandbox/<recurso>}}` o, para valores dinámicos, como `Parameter` de tipo `AWS::SSM::Parameter::Value<String>`. Ventaja: desacopla los ciclos de vida de los stacks/repos y evita el bloqueo de borrado; el contrato es un namespace de parámetros estable, no una dependencia de stack.
+
+**Recomendación:** usar **SSM Parameter Store como contrato principal entre repos** (desacople), y reservar `Export`/`ImportValue` para casos donde se quiera la protección de borrado de CloudFormation dentro de la misma cuenta. Ambos comparten la misma convención de nombres.
+
+##### Convención de nombres del contrato
+
+Alineada a `${ProjectName}-${Environment}-<Recurso>` (export) y a un namespace SSM equivalente:
+
+| Recurso (en `infra`) | Export Name (CFN) | SSM Parameter |
+| -------------------- | ----------------- | ------------- |
+| API Gateway HTTP API ID | `BTGConnectAI-sandbox-HttpApiId` | `/btgconnectai/sandbox/api/http-api-id` |
+| API Gateway execution endpoint | `BTGConnectAI-sandbox-HttpApiEndpoint` | `/btgconnectai/sandbox/api/endpoint` |
+| Inbound queue ARN / URL | `BTGConnectAI-sandbox-InboundQueueArn` / `...-InboundQueueUrl` | `/btgconnectai/sandbox/sqs/inbound-arn` · `.../inbound-url` |
+| Email queue ARN / URL | `BTGConnectAI-sandbox-EmailQueueArn` / `...-EmailQueueUrl` | `/btgconnectai/sandbox/sqs/email-arn` · `.../email-url` |
+| SMS queue ARN / URL | `BTGConnectAI-sandbox-SmsQueueArn` / `...-SmsQueueUrl` | `/btgconnectai/sandbox/sqs/sms-arn` · `.../sms-url` |
+| Consent_Store name / ARN | `BTGConnectAI-sandbox-ConsentTableName` / `...-ConsentTableArn` | `/btgconnectai/sandbox/ddb/consent-name` · `.../consent-arn` |
+| Auth_Session name / ARN | `BTGConnectAI-sandbox-AuthTableName` / `...-AuthTableArn` | `/btgconnectai/sandbox/ddb/auth-name` · `.../auth-arn` |
+| OTP_Store name / ARN | `BTGConnectAI-sandbox-OtpTableName` / `...-OtpTableArn` | `/btgconnectai/sandbox/ddb/otp-name` · `.../otp-arn` |
+| Statement_Bucket name / ARN | `BTGConnectAI-sandbox-StatementBucketName` / `...-StatementBucketArn` | `/btgconnectai/sandbox/s3/statement-name` · `.../statement-arn` |
+| Audio_Temp bucket name / ARN | `BTGConnectAI-sandbox-AudioTempBucketName` / `...-AudioTempBucketArn` | `/btgconnectai/sandbox/s3/audio-temp-name` · `.../audio-temp-arn` |
+| Bedrock Agent ARN / ID | `BTGConnectAI-sandbox-BedrockAgentArn` / `...-BedrockAgentId` | `/btgconnectai/sandbox/bedrock/agent-arn` · `.../agent-id` |
+| Bedrock Guardrail ID / version | `BTGConnectAI-sandbox-GuardrailId` / `...-GuardrailVersion` | `/btgconnectai/sandbox/bedrock/guardrail-id` · `.../guardrail-version` |
+| Twilio secret ARN | `BTGConnectAI-sandbox-TwilioSecretArn` | `/btgconnectai/sandbox/secrets/twilio-arn` |
+| SNS alarms topic ARN | `BTGConnectAI-sandbox-AlarmsTopicArn` | `/btgconnectai/sandbox/sns/alarms-arn` |
+| Banking Lambda SG ID | `BTGConnectAI-sandbox-BankingLambdaSGId` | `/btgconnectai/sandbox/vpc/banking-sg-id` |
+| Private Subnet IDs (CSV) | `BTGConnectAI-sandbox-PrivateSubnetIds` | `/btgconnectai/sandbox/vpc/private-subnet-ids` |
+
+> El stack raíz de la app (`connectai-app.yaml`) declara estos valores como `Parameters` resueltos vía SSM (`AWS::SSM::Parameter::Value<String>`) o los importa con `Fn::ImportValue`, y los pasa por nested stack a cada template de Lambda/SFN. Ejemplo de `VpcConfig` para las Lambdas bancarias:
+>
+> ```yaml
+> VpcConfig:
+>   SecurityGroupIds:
+>     - !Ref BankingLambdaSGId            # parámetro resuelto desde SSM (o Fn::ImportValue)
+>   SubnetIds: !Split [",", !Ref PrivateSubnetIds]
+> ```
+
+##### Orden de despliegue y dependencias
+
+```mermaid
+flowchart LR
+    A["infra: networking.yaml\n(VPC, subnets, SGs, endpoints)"] --> B["infra: connectai-shared.yaml\n(API GW, SQS, S3, DynamoDB, Bedrock,\nSecrets, SNS) → publica Outputs/Export + SSM"]
+    B --> C["BTG-ConnectAI: connectai-app.yaml\n(Lambdas + State Machine + ESMs)\nresuelve el contrato (ImportValue/SSM)"]
+```
+
+1. **`infra` primero**: despliega networking y luego los recursos compartidos, publicando el contrato (Exports + SSM).
+2. **`BTG-ConnectAI` después**: su pipeline (`cfn-deploy.yml`) resuelve el contrato y despliega Lambdas, state machine y Event Source Mappings. Si un parámetro/Export no existe, el deploy **falla rápido** — señal de que `infra` no se ha desplegado o cambió el contrato.
+3. **Cambios de contrato**: renombrar o eliminar un Export en `infra` requiere coordinar con la app (CloudFormation bloquea el borrado de Exports en uso). Con SSM, el cambio no bloquea pero la app fallaría en el siguiente deploy si el parámetro desaparece — por eso el namespace SSM se trata como **API estable**.
+
+##### Wiring que cruza el límite entre repos
+
+| Wiring | Recurso origen (dueño) | Recurso destino (dueño) | ¿Dónde se define? | Cómo se resuelve la dependencia |
+| ------ | ---------------------- | ----------------------- | ----------------- | ------------------------------- |
+| API Gateway → Webhook_Receiver | API GW HTTP API (`infra`) | `Webhook_Receiver` Lambda (`BTG-ConnectAI`) | **App** define la **Integration** + **Route** + `AWS::Lambda::Permission`, usando el `HttpApiId` importado de `infra`. Así el wiring vive junto al cómputo que lo necesita y `infra` no depende de ARNs de la app | App importa `HttpApiId`; crea `AWS::ApiGatewayV2::Integration` (`AWS_PROXY` → ARN del Lambda) + `AWS::ApiGatewayV2::Route` (`POST /webhook/twilio`) + permiso de invocación |
+| SQS inbound → Message_Processor | `inbound-messages-queue.fifo` (`infra`) | `Message_Processor` (`BTG-ConnectAI`) | **App** define el `AWS::Lambda::EventSourceMapping` | App importa `InboundQueueArn`; el role del Processor recibe `sqs:ReceiveMessage/...` sobre ese ARN |
+| SQS email/sms → Email_Service/SMS_Service | `email/sms-notification-queue` (`infra`) | `Email_Service`/`SMS_Service` (`BTG-ConnectAI`) | **App** define los `EventSourceMapping` | App importa `EmailQueueArn`/`SmsQueueArn` |
+| Bedrock Agent → Action Group Lambdas | Bedrock Agent (`infra`) | `balance-query`, `transfer-breb-initiator`, `statement-generator` (`BTG-ConnectAI`) | **Dividido**: `infra` define el Agent y sus Action Groups apuntando a los ARNs de las Lambdas; la **app** otorga `AWS::Lambda::Permission` para que `bedrock.amazonaws.com` (con `SourceArn` = Agent ARN) invoque sus Lambdas | Dependencia circular potencial → se rompe con el **orden de despliegue**: la app expone los ARNs de sus Lambdas vía SSM/Export; `infra` los consume para configurar los Action Groups en un paso posterior, o se usa un `AgentAliasArn` estable como `SourceArn` en el permiso. La app importa `BedrockAgentArn` para el `SourceArn` del permiso |
+| State machine → SQS notificaciones | `TransferBrebStateMachine` (`BTG-ConnectAI`) | `email/sms-notification-queue` (`infra`) | **App** (es tarea de la state machine) | El role del state machine recibe `sqs:SendMessage` sobre los ARNs importados |
+| Lambdas → DynamoDB / S3 / Secrets | Tablas, buckets, secret (`infra`) | Lambdas (`BTG-ConnectAI`) | **App** (políticas IAM de cada Lambda) | Los ARNs vienen del contrato; ver IAM más abajo |
+
+> **Regla general del wiring**: cada *trigger/integration/permiso* se define en el repo **dueño del cómputo** (la app), usando como entrada los identificadores del recurso compartido (que vienen de `infra`). Esto evita que `infra` tenga que conocer los ARNs de Lambdas concretas y mantiene a `infra` agnóstico de la aplicación. La única excepción es la definición del **Action Group** del Bedrock Agent, que por modelo de recurso vive con el Agent en `infra` y se complementa con el `Lambda::Permission` del lado de la app.
+
+#### Empaquetado de Lambdas
+
+Las Lambdas Python se empaquetan como ZIP y se suben al **bucket de artefactos creado por `infra`** antes del deploy. El pipeline (`cfn-deploy.yml` de `BTG-ConnectAI`) hace:
+
+1. `pip install -r src/shared/requirements.txt -t layer/python/` y zip → Lambda Layer compartido (twilio, aws-lambda-powertools, código `shared/`)
+2. Por cada Lambda: zip del código → `s3://<artefactos-bucket-infra>/lambdas/<nombre>-<git-sha>.zip` (el nombre del bucket se resuelve del contrato SSM/Export)
+3. `aws cloudformation deploy` del stack `connectai-app.yaml` con `--parameter-overrides LambdaCodeKey=<sha>` y los parámetros del contrato
+4. Cada `AWS::Lambda::Function` usa `Code: {S3Bucket, S3Key}` y `Layers: [!Ref SharedLayer]`
+
+#### IAM Roles (Least Privilege) — CloudFormation (en `BTG-ConnectAI`)
+
+Los IAM roles de las Lambdas y del state machine se definen en `BTG-ConnectAI` (son específicos del cómputo). La diferencia respecto al diseño anterior es que los **ARNs de los recursos ya no salen de `!GetAtt` local** sino del contrato importado de `infra` (`Fn::ImportValue` o parámetro SSM). Ejemplo:
+
+```yaml
+# Webhook_Receiver Role — minimalista, FUERA de VPC (basic execution role)
+WebhookReceiverRole:
+  Type: AWS::IAM::Role
+  Properties:
+    AssumeRolePolicyDocument:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action: sts:AssumeRole
+    ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Policies:
+      - PolicyName: webhook-receiver-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Ref InboundQueueArn        # contrato: Fn::ImportValue / SSM (de infra)
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref TwilioSecretArn         # contrato: Fn::ImportValue / SSM (de infra)
+
+# Message_Processor Role — el trabajo pesado, FUERA de VPC (necesita llamar a Twilio)
+MessageProcessorRole:
+  Type: AWS::IAM::Role
+  Properties:
+    AssumeRolePolicyDocument:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action: sts:AssumeRole
+    ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Policies:
+      - PolicyName: message-processor-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+              Resource: !Ref InboundQueueArn          # de infra
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem]
+              Resource: !Ref ConsentTableArn           # de infra
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !Ref AuthTableArn              # de infra
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource: !Ref OtpTableArn               # de infra
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt StrandsAgentFunction.Arn   # recurso local (app)
+            - Effect: Allow
+              Action: [states:SendTaskSuccess, states:SendTaskFailure]
+              Resource: !Ref TransferBrebStateMachineArn   # recurso local (app)
+            - Effect: Allow
+              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
+              Resource: "*"
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+              Resource: !Sub "${AudioTempBucketArn}/*"     # de infra
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${StatementBucketArn}/*"      # de infra
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref TwilioSecretArn                # de infra
+```
+
+> **Implicación IAM del reparto**: las Lambdas de la app necesitan permisos sobre recursos cuyo **ARN proviene de `infra`**. Como las políticas IAM viven en `BTG-ConnectAI`, los ARNs entran como parámetros del contrato (SSM/Export) y se referencian con `!Ref`/`!Sub`. Esto mantiene el principio de **least privilege** (cada Lambda solo accede a los ARNs concretos que necesita) sin que `infra` tenga que conocer los roles de la app. Para S3/DynamoDB se referencia el ARN exacto del recurso; se evita `Resource: "*"` salvo para acciones que no soportan resource-level (p. ej. Transcribe job APIs).
+
+> Roles análogos (CloudFormation `AWS::IAM::Role`) para el resto de Lambdas, todos en `BTG-ConnectAI`. La diferencia clave es el managed policy de ejecución según la ubicación de red:
+>
+> - **Fuera de VPC** → `AWSLambdaBasicExecutionRole`: `Auth_Service` (DynamoDB Auth_Session PutItem), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + SQS consume; solo `transfer_confirmation`), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail usando `GuardrailId`/`BedrockAgentArn` del contrato + Lambda InvokeFunction de las tools), `transfer-breb-initiator` (Step Functions StartExecution), `message-handler-notify` (Secrets Twilio)
+> - **Dentro de VPC** → `AWSLambdaVPCAccessExecutionRole` (dominio bancario, subnets privadas, usando `BankingLambdaSGId` + `PrivateSubnetIds` del contrato): `balance-query` (solo Logs, mock inline), `transfer-breb-validate/execute` (solo Logs, mock inline), `statement-generator` (S3 PutObject sobre `StatementBucketArn` vía Gateway Endpoint — el extracto se entrega por WhatsApp, no por email)
+> - El rol del **state machine** (no es Lambda, vive en la app): Lambda InvokeFunction de las tasks (recursos locales) + SQS SendMessage a las colas de notificación (`EmailQueueArn`/`SmsQueueArn` del contrato).
+
+#### Estructura del código de aplicación (`src/`)
+
+```text
 src/                                  # Código fuente de las Lambdas (Python 3.13)
 ├── lambdas/
 │   ├── webhook_receiver/
@@ -1636,97 +1843,6 @@ src/                                  # Código fuente de las Lambdas (Python 3.
 ├── requirements.txt                  # Dependencias runtime (twilio, aws-lambda-powertools, strands-agents)
 └── requirements-dev.txt              # pytest, hypothesis, moto, boto3-stubs
 ```
-
-#### Empaquetado de Lambdas
-
-Las Lambdas Python se empaquetan como ZIP y se suben a S3 antes del deploy. El pipeline (`cfn-deploy.yml`) hace:
-
-1. `pip install -r src/shared/requirements.txt -t layer/python/` y zip → Lambda Layer compartido (twilio, aws-lambda-powertools, código `shared/`)
-2. Por cada Lambda: zip del código → `s3://<bucket>/lambdas/<nombre>-<git-sha>.zip`
-3. `aws cloudformation deploy` con `--parameter-overrides LambdaCodeKey=<sha>` para que los templates referencien el ZIP correcto
-4. Cada `AWS::Lambda::Function` usa `Code: {S3Bucket, S3Key}` y `Layers: [!Ref SharedLayer]`
-
-#### IAM Roles (Least Privilege) — CloudFormation
-
-```yaml
-# Webhook_Receiver Role — minimalista, FUERA de VPC (basic execution role)
-WebhookReceiverRole:
-  Type: AWS::IAM::Role
-  Properties:
-    AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Effect: Allow
-          Principal: { Service: lambda.amazonaws.com }
-          Action: sts:AssumeRole
-    ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    Policies:
-      - PolicyName: webhook-receiver-policy
-        PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action: sqs:SendMessage
-              Resource: !GetAtt InboundMessagesQueue.Arn
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref TwilioSecretArn
-
-# Message_Processor Role — el trabajo pesado, FUERA de VPC (necesita llamar a Twilio)
-MessageProcessorRole:
-  Type: AWS::IAM::Role
-  Properties:
-    AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Effect: Allow
-          Principal: { Service: lambda.amazonaws.com }
-          Action: sts:AssumeRole
-    ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    Policies:
-      - PolicyName: message-processor-policy
-        PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
-              Resource: !GetAtt InboundMessagesQueue.Arn
-            - Effect: Allow
-              Action: [dynamodb:PutItem, dynamodb:GetItem]
-              Resource: !GetAtt ConsentTable.Arn
-            - Effect: Allow
-              Action: dynamodb:GetItem
-              Resource: !GetAtt AuthSessionTable.Arn
-            - Effect: Allow
-              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
-              Resource: !GetAtt OtpStoreTable.Arn
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt StrandsAgentFunction.Arn
-            - Effect: Allow
-              Action: [states:SendTaskSuccess, states:SendTaskFailure]
-              Resource: !Ref TransferBrebStateMachineArn
-            - Effect: Allow
-              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
-              Resource: "*"
-            - Effect: Allow
-              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
-              Resource: !Sub "${AudioTempBucket.Arn}/*"
-            - Effect: Allow
-              Action: s3:GetObject
-              Resource: !Sub "${StatementBucket.Arn}/*"
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref TwilioSecretArn
-```
-
-> Roles análogos (CloudFormation `AWS::IAM::Role`) para el resto de Lambdas. La diferencia clave es el managed policy de ejecución según la ubicación de red:
->
-> - **Fuera de VPC** → `AWSLambdaBasicExecutionRole`: `Auth_Service` (DynamoDB Auth_Session PutItem), `otp-service` (DynamoDB OTP_Store + Pinpoint), `email-service` (SES + SQS consume; solo `transfer_confirmation`), `sms-service` (Pinpoint + SQS consume), `strands-agent` (Bedrock InvokeModel + ApplyGuardrail + Lambda InvokeFunction de las tools), `transfer-breb-initiator` (Step Functions StartExecution), `message-handler-notify` (Secrets Twilio)
-> - **Dentro de VPC** → `AWSLambdaVPCAccessExecutionRole` (dominio bancario, subnets privadas): `balance-query` (solo Logs, mock inline), `transfer-breb-validate/execute` (solo Logs, mock inline), `statement-generator` (S3 PutObject vía Gateway Endpoint — el extracto se entrega por WhatsApp, no por email)
-> - El rol del **state machine** (no es Lambda): Lambda InvokeFunction de las tasks + SQS SendMessage a las colas de notificación.
 
 ## Data Models
 
@@ -2162,17 +2278,16 @@ Properties to implement as PBT (con hypothesis):
 
 ### CloudFormation Template Validation
 
+> Estas validaciones aplican a los templates que viven en **`BTG-ConnectAI`** (Lambdas + state machine + wiring). Las validaciones de los recursos compartidos (S3 Block Public Access, DynamoDB encryption, ausencia de NAT Gateway, VPC Endpoints, colas FIFO) son responsabilidad del repo **`infra`** y se ejecutan en su propio pipeline. Aquí se verifica además que la app **resuelve el contrato** correctamente.
+
 | Test | Tool | What it verifies |
 |------|------|-----------------|
-| Template lint | `cfn-lint` | Sintaxis y best practices de todos los templates YAML |
-| VpcConfig solo en dominio bancario | pytest sobre template | `balance-query`, `transfer-breb-validate/execute`, `statement-generator` tienen `VpcConfig` a subnets privadas; el resto NO tiene VpcConfig |
-| Sin NAT Gateway | pytest sobre template | No existe `AWS::EC2::NatGateway`; subnets privadas sin ruta 0.0.0.0/0; VPC Endpoints Gateway presentes (S3, DynamoDB) |
-| DynamoDB encryption | pytest sobre template | AWS managed keys configuradas |
-| S3 Block Public Access | pytest sobre template | Los 4 settings habilitados en cada bucket |
-| IAM policy scoping | `cfn-nag` / `checkov` | Least privilege por Lambda, sin wildcards peligrosos |
-| CloudWatch alarms | pytest sobre template | Threshold 10% error, ventana 5min |
+| Template lint | `cfn-lint` | Sintaxis y best practices de los templates YAML de la app |
+| VpcConfig solo en dominio bancario | pytest sobre template | `balance-query`, `transfer-breb-validate/execute`, `statement-generator` tienen `VpcConfig` con `BankingLambdaSGId`/`PrivateSubnetIds` resueltos del contrato; el resto NO tiene VpcConfig |
+| Contrato resuelto (cross-stack) | pytest sobre template | El stack raíz declara los parámetros del contrato (ARNs/URLs/IDs de `infra`) vía `Fn::ImportValue` o `AWS::SSM::Parameter::Value<String>`; ningún ARN de recurso compartido está hardcodeado |
+| IAM policy scoping | `cfn-nag` / `checkov` | Least privilege por Lambda; los `Resource` apuntan a ARNs del contrato, sin wildcards peligrosos |
+| Wiring cruzado | pytest sobre template | Integration/Route de API GW, Event Source Mappings y `Lambda::Permission` (Bedrock Agent) referencian identificadores del contrato, no recursos locales inexistentes |
 | Lambda runtime | pytest sobre template | Todas las Lambdas usan `python3.13` |
-| SQS FIFO dedup | pytest sobre template | inbound-queue es `.fifo` con dedup por MessageDeduplicationId |
 
 ### Test Execution
 
@@ -2180,14 +2295,14 @@ Properties to implement as PBT (con hypothesis):
 # Unit + Property tests (pytest + hypothesis)
 pytest src/tests/unit src/tests/property -v
 
-# Validación de templates CloudFormation
+# Validación de templates CloudFormation (solo los de BTG-ConnectAI: Lambdas + SFN + wiring)
 cfn-lint cloudformation/templates/connectai/*.yaml cloudformation/stacks/sandbox/*.yaml
-checkov -d cloudformation/   # security scanning (IAM, encryption, public access)
+checkov -d cloudformation/   # security scanning (IAM, least privilege)
 
 # Validar definición del state machine
 aws stepfunctions validate-state-machine-definition \
   --definition file://cloudformation/state-machines/transfer-breb.asl.json
 
-# Integration tests (requiere stack desplegado en sandbox)
-pytest src/tests/integration -v --stack-name BTGConnectAI-sandbox
+# Integration tests (requiere infra desplegado primero, luego el stack de la app)
+pytest src/tests/integration -v --stack-name BTGConnectAI-sandbox-app
 ```
