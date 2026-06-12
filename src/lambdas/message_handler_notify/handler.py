@@ -53,6 +53,7 @@ from typing import Any
 from shared.formatting import format_cop
 from shared.logger import get_logger
 from shared.masking import mask_account, mask_phone
+from shared.twilio_env import hydrate_twilio_env
 
 logger = get_logger("message-handler-notify")
 
@@ -234,6 +235,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     phone_number = event["phoneNumber"]
     message_type = event["messageType"]
     correlation_id = event.get("correlationId")
+
+    # Hydrate Twilio credentials from the Twilio secret (TWILIO_SECRET_ARN).
+    hydrate_twilio_env()
 
     if correlation_id:
         logger.append_keys(correlation_id=correlation_id)

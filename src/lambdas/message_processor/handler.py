@@ -78,6 +78,7 @@ from aws_lambda_powertools.utilities.batch import (
 )
 
 from shared.logger import get_logger
+from shared.twilio_env import hydrate_twilio_env
 from shared.types import TwilioWebhookPayload
 
 from . import auth, consent, messaging, otp_callback, transcription
@@ -351,6 +352,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     Returns:
         The partial batch response mapping consumed by the SQS integration.
     """
+    # Hydrate Twilio credentials + the callback HMAC secret from the Twilio
+    # secret (TWILIO_SECRET_ARN) into individual env vars the modules read.
+    hydrate_twilio_env()
     return process_partial_response(
         event=event,
         record_handler=record_handler,

@@ -86,6 +86,7 @@ import boto3
 from shared.constants import AUTH_SESSION_TTL
 from shared.logger import get_logger
 from shared.masking import mask_phone
+from shared.twilio_env import hydrate_twilio_env
 
 from .users import find_user
 
@@ -306,6 +307,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         A Function URL response dict with a JSON body and CORS headers.
     """
     method = _http_method(event)
+
+    # Hydrate CALLBACK_TOKEN_SECRET (and Twilio vars) from the Twilio secret so
+    # token verification uses the same shared HMAC key as the Message_Processor.
+    hydrate_twilio_env()
 
     # CORS preflight — browsers send this before the cross-origin POST.
     if method == "OPTIONS":

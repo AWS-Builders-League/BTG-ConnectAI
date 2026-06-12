@@ -110,6 +110,13 @@ Parameters:
     Type: String
     Description: Nombre del bucket Audio_Temp. Env var AUDIO_TEMP_BUCKET.
 
+  LoginPageBucketName:
+    Type: String
+    Description: >-
+      Nombre del bucket de la Login_Page (static website). Se usa para construir
+      LOGIN_PAGE_URL (http://<bucket>.s3-website-<region>.amazonaws.com) que el
+      Message_Processor incluye en el enlace de login enviado por WhatsApp.
+
   # ── Strands_Agent Lambda (Output de lambda-ai-agent.yaml) ────────────────
   AiAgentFunctionArn:
     Type: String
@@ -259,6 +266,7 @@ Resources:
           AUDIO_TEMP_BUCKET: !Ref AudioTempBucketName
           TWILIO_SECRET_ARN: !Ref TwilioSecretArn
           AI_AGENT_FUNCTION_NAME: !Ref AiAgentFunctionArn
+          LOGIN_PAGE_URL: !Sub 'http://${LoginPageBucketName}.s3-website-${AWS::Region}.amazonaws.com'
           POWERTOOLS_SERVICE_NAME: message-processor
           POWERTOOLS_LOG_LEVEL: INFO
       Tags:
@@ -310,6 +318,7 @@ Resources:
       Environment:
         Variables:
           AUTH_TABLE_NAME: !Ref AuthTableName
+          TWILIO_SECRET_ARN: !Ref TwilioSecretArn
           POWERTOOLS_SERVICE_NAME: auth-service
           POWERTOOLS_LOG_LEVEL: INFO
       Tags:

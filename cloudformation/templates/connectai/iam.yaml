@@ -276,6 +276,11 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !Ref AuthTableArn
+              # Secrets Manager: leer el secret de Twilio para derivar el
+              # CALLBACK_TOKEN_SECRET (clave HMAC compartida con Message_Processor)
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TwilioSecretArn
       Tags:
         - Key: Environment
           Value: !Ref Environment
