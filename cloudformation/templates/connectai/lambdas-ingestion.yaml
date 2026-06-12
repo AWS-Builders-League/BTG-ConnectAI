@@ -70,8 +70,8 @@ Parameters:
     Type: String
     Description: >-
       Endpoint de ejecución del HTTP API (contrato BTGConnectAI-sandbox-HttpApiEndpoint).
-      Se usa para construir LOGIN_PAGE_URL (`${HttpApiEndpoint}/login`), la URL HTTPS
-      que el message-processor envía por WhatsApp y que sirve/autentica el Login_Page.
+      Se usa para construir LOGIN_PAGE_URL como <endpoint>/login, la URL HTTPS que el
+      message-processor envía por WhatsApp y que sirve/autentica el Login_Page.
 
   # ── SQS (inbound FIFO queue creada por `infra`) ──────────────────────────
   InboundQueueArn:
