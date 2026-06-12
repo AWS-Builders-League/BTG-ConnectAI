@@ -16,6 +16,9 @@ dist/
 build/
 *.egg-info/
 
+# Lambda layer build output (rebuilt by layer/build.sh)
+layer/python/
+
 # OS
 .DS_Store
 Thumbs.db

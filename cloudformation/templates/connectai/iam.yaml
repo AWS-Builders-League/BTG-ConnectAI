@@ -1,0 +1,776 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - IAM roles (nested stack de seguridad). Define los roles de
+  ejecucion de TODAS las Lambdas de la app + el rol de ejecucion del
+  TransferBrebStateMachine. Regla clave del reparto: los ARNs de los recursos
+  provienen del CONTRATO cross-stack publicado por `infra` (pasados como
+  Parameters resueltos via SSM / Fn::ImportValue por el stack raiz), NO de
+  !GetAtt/!Ref local. Los ARNs de recursos LOCALES de la app (la Lambda ai-agent,
+  el state machine y las Action Group Lambdas) se construyen de forma
+  determinista con la convencion de naming <ProjectName>-<Environment>-<name>
+  y pseudo-parametros (AWS::Partition/Region/AccountId) para evitar dependencias
+  circulares (mismo patron con que el stack raiz construye el ARN del state
+  machine). Least privilege: se referencian ARNs concretos y se evita
+  Resource: "*" salvo en APIs que no soportan permisos a nivel de recurso
+  (p. ej. Transcribe, Step Functions SendTask*, Bedrock ApplyGuardrail/Model).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Identidad de la app + ARNs del contrato cross-stack (resueltos por el stack
+# raiz connectai-app.yaml desde SSM / Fn::ImportValue de `infra`).
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convencion de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  # ── SQS (ARNs del contrato de `infra`) ──────────────────────────────────────
+  InboundQueueArn:
+    Type: String
+    Description: ARN de la inbound FIFO queue (Webhook_Receiver produce / Message_Processor consume).
+
+  EmailQueueArn:
+    Type: String
+    Description: ARN de la email-notification-queue (Email_Service consume / state machine produce).
+
+  SmsQueueArn:
+    Type: String
+    Description: ARN de la sms-notification-queue (SMS_Service consume / state machine produce).
+
+  # ── DynamoDB (ARNs del contrato de `infra`) ─────────────────────────────────
+  ConsentTableArn:
+    Type: String
+    Description: ARN de la tabla Consent_Store.
+
+  AuthTableArn:
+    Type: String
+    Description: ARN de la tabla Auth_Session.
+
+  OtpTableArn:
+    Type: String
+    Description: ARN de la tabla OTP_Store.
+
+  # ── S3 (ARNs del contrato de `infra`) ───────────────────────────────────────
+  StatementBucketArn:
+    Type: String
+    Description: ARN del Statement_Bucket (statement-generator escribe; Message_Processor lee).
+
+  AudioTempBucketArn:
+    Type: String
+    Description: ARN del bucket Audio_Temp (Message_Processor sube/borra audio para transcripcion).
+
+  # ── Secrets (ARN del contrato de `infra`) ───────────────────────────────────
+  TwilioSecretArn:
+    Type: String
+    Description: ARN del secreto de Twilio en Secrets Manager.
+
+  # ── Bedrock (del contrato de `infra`) ───────────────────────────────────────
+  GuardrailId:
+    Type: String
+    Description: >-
+      ID del Bedrock Guardrail. Se usa para construir el ARN del guardrail sobre
+      el que el Strands_Agent tiene permiso bedrock:ApplyGuardrail.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupacion de parametros en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Contrato cross-stack: SQS'
+        Parameters:
+          - InboundQueueArn
+          - EmailQueueArn
+          - SmsQueueArn
+      - Label:
+          default: 'Contrato cross-stack: DynamoDB'
+        Parameters:
+          - ConsentTableArn
+          - AuthTableArn
+          - OtpTableArn
+      - Label:
+          default: 'Contrato cross-stack: S3'
+        Parameters:
+          - StatementBucketArn
+          - AudioTempBucketArn
+      - Label:
+          default: 'Contrato cross-stack: Secrets / Bedrock'
+        Parameters:
+          - TwilioSecretArn
+          - GuardrailId
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+#
+# Convencion: cada role usa managed policy de ejecucion segun su ubicacion de red
+#   - FUERA de VPC  → AWSLambdaBasicExecutionRole
+#   - DENTRO de VPC → AWSLambdaVPCAccessExecutionRole (dominio bancario)
+# Las politicas inline conceden least privilege sobre los ARNs del contrato
+# (parametros) y sobre los ARNs locales construidos de forma determinista.
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Roles FUERA de VPC (AWSLambdaBasicExecutionRole)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Webhook_Receiver ────────────────────────────────────────────────────────
+  # sync detras de API Gateway: encola en la inbound queue y lee el secreto de
+  # Twilio para validar la firma del webhook.
+  WebhookReceiverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-webhook-receiver-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: webhook-receiver-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref InboundQueueArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TwilioSecretArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Message_Processor ───────────────────────────────────────────────────────
+  # async (SQS-triggered): consume la inbound queue, gestiona consent/auth/OTP,
+  # transcribe audio, invoca el Strands_Agent (recurso local), hace callbacks al
+  # state machine (recurso local) y entrega respuestas/PDF via Twilio.
+  MessageProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-message-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: message-processor-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SQS: consumo de la inbound FIFO queue (del contrato)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !Ref InboundQueueArn
+              # DynamoDB: Consent_Store (lectura/escritura del registro de consent)
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !Ref ConsentTableArn
+              # DynamoDB: Auth_Session (solo lectura para validar la sesion)
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Ref AuthTableArn
+              # DynamoDB: OTP_Store (callback del OTP: leer/actualizar intentos/borrar)
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !Ref OtpTableArn
+              # Lambda: invocar el Strands_Agent (recurso LOCAL, ARN determinista)
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-strands-agent'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-strands-agent:*'
+              # Step Functions: callbacks del task token (no soportan resource-level → "*")
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+              # Transcribe: jobs de transcripcion (API sin permisos a nivel de recurso → "*")
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                Resource: '*'
+              # S3: objetos de audio temporal (subir/leer/borrar)
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${AudioTempBucketArn}/*'
+              # S3: leer el PDF del extracto para entregarlo via Twilio Media
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${StatementBucketArn}/*'
+              # Secrets Manager: credenciales de Twilio
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TwilioSecretArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+  # ── Auth_Service ─────────────────────────────────────────────────────────────
+  # sync (Function URL): valida el callback token, busca el usuario de prueba y
+  # crea la sesion en Auth_Session (TTL 30min). Solo escribe la sesion.
+  AuthServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-auth-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: auth-service-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB: Auth_Session (crear la sesion autenticada)
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !Ref AuthTableArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── OTP_Service ──────────────────────────────────────────────────────────────
+  # Invocada por Step Functions (waitForTaskToken): genera el codigo, lo persiste
+  # en OTP_Store con el taskToken y envia el SMS via Pinpoint.
+  OtpServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-otp-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: otp-service-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB: OTP_Store (persistir el codigo + taskToken + contexto)
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !Ref OtpTableArn
+              # Pinpoint: envio del SMS con el codigo (API sin resource-level → "*")
+              - Effect: Allow
+                Action: mobiletargeting:SendMessages
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Email_Service ────────────────────────────────────────────────────────────
+  # async (SQS-triggered): consume la email-notification-queue del contrato y
+  # envia los correos de confirmacion via SES.
+  EmailServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-email-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: email-service-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SQS: consumo de la email-notification-queue (del contrato)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !Ref EmailQueueArn
+              # SES: envio de correos (SendEmail requiere ARN de identidad que no
+              # esta en el contrato → "*")
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── SMS_Service ──────────────────────────────────────────────────────────────
+  # async (SQS-triggered): consume la sms-notification-queue del contrato y envia
+  # los SMS de confirmacion post-operacion via Pinpoint.
+  SmsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sms-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: sms-service-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SQS: consumo de la sms-notification-queue (del contrato)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !Ref SmsQueueArn
+              # Pinpoint: envio del SMS de confirmacion (API sin resource-level → "*")
+              - Effect: Allow
+                Action: mobiletargeting:SendMessages
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Strands_Agent ────────────────────────────────────────────────────────────
+  # FUERA de VPC. Interpreta intenciones con Claude 3.5 Haiku (Bedrock InvokeModel)
+  # aplicando el Guardrail del contrato (ApplyGuardrail) e invoca las Action Group
+  # Lambdas (tools) — recursos LOCALES con ARN determinista. Bedrock InvokeModel/
+  # ApplyGuardrail: se usa el ARN del contrato (GuardrailId);
+  # InvokeModel apunta a los foundation models (sin resource
+  # de cuenta → "*"). NO hay InvokeAgent (no existe Bedrock Agent Core).
+  AiAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-strands-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: strands-agent-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Bedrock: invocacion del foundation model (Claude 3.5 Haiku).
+              # Los foundation models no son recursos de cuenta → "*".
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              # Bedrock: aplicar el Guardrail del contrato (ARN concreto via GuardrailId)
+              - Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/${GuardrailId}'
+              # Lambda: invocar las Action Group Lambdas (tools) — recursos LOCALES
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-balance-query'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-balance-query:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-initiator'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-initiator:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-statement-generator'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-statement-generator:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── transfer-breb-initiator ──────────────────────────────────────────────────
+  # FUERA de VPC. Tool del Strands_Agent: dispara el TransferBrebStateMachine
+  # (recurso LOCAL, ARN determinista) con StartExecution y retorna de inmediato.
+  TransferInitiatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-transfer-breb-initiator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: transfer-breb-initiator-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Step Functions: StartExecution sobre la state machine LOCAL
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-TransferBrebStateMachine'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── message-handler-notify ────────────────────────────────────────────────────
+  # FUERA de VPC. Invocada desde los estados terminales del state machine: envia
+  # el mensaje final en español via Twilio REST (necesita el secreto del contrato).
+  NotifyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-message-handler-notify-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: message-handler-notify-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Secrets Manager: credenciales de Twilio
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TwilioSecretArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Roles DENTRO de VPC (AWSLambdaVPCAccessExecutionRole) — dominio bancario
+  #
+  # Corren en subnets privadas con acceso a AWS solo via VPC Endpoints. La managed
+  # policy AWSLambdaVPCAccessExecutionRole concede ENI mgmt + CloudWatch Logs.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── balance-query ──────────────────────────────────────────────────────────
+  # Consulta de saldos sobre Mock_Core (en memoria). Solo necesita Logs + VPC.
+  BalanceQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-balance-query-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── transfer-breb-validate ───────────────────────────────────────────────────
+  # Estado ValidateTransfer: valida contra Mock_Core (en memoria). Solo Logs + VPC.
+  TransferValidateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-transfer-breb-validate-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── transfer-breb-execute ─────────────────────────────────────────────────────
+  # Estado ExecuteTransfer: actualiza saldos en Mock_Core (en memoria). Solo Logs + VPC.
+  TransferExecuteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-transfer-breb-execute-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── statement-generator ────────────────────────────────────────────────────
+  # Genera el PDF del extracto y lo sube al Statement_Bucket del contrato via el
+  # Gateway Endpoint S3. Logs + VPC + S3 PutObject sobre el bucket del contrato.
+  StatementGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-statement-generator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: statement-generator-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3: escribir el PDF del extracto en el Statement_Bucket (del contrato)
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${StatementBucketArn}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Rol de ejecucion del TransferBrebStateMachine (Step Functions)
+  #
+  # Principal states.amazonaws.com. Invoca las Lambdas de las tasks (recursos
+  # LOCALES con ARN determinista), publica eventos en las colas email/sms del
+  # contrato y entrega logs (vended logs) + trazas X-Ray segun la configuracion
+  # del template state-machine.yaml (LoggingConfiguration ALL + Tracing).
+  # ═══════════════════════════════════════════════════════════════════════════
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-transfer-breb-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: transfer-breb-sfn-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda: invocar las tasks LOCALES del workflow (ARN determinista)
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-validate'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-validate:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-execute'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-transfer-breb-execute:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-otp-service'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-otp-service:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-message-handler-notify'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-message-handler-notify:*'
+              # SQS: publicar los eventos de notificacion en las colas del contrato
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !Ref EmailQueueArn
+                  - !Ref SmsQueueArn
+              # CloudWatch Logs: entrega de vended logs (LoggingConfiguration ALL).
+              # Estas acciones no soportan permisos a nivel de recurso → "*".
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              # X-Ray: trazas de ejecucion (TracingConfiguration Enabled).
+              # Estas acciones no soportan permisos a nivel de recurso → "*".
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+#
+# ARNs de TODOS los roles. El stack raiz (connectai-app.yaml) los consume via
+# !GetAtt IamStack.Outputs.<X> y los pasa a las nested stacks de computo. Los
+# nombres logicos deben coincidir EXACTAMENTE con los referenciados por el raiz.
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  # ── Roles FUERA de VPC ──────────────────────────────────────────────────────
+  WebhookReceiverRoleArn:
+    Description: ARN del role de ejecucion de Webhook_Receiver.
+    Value: !GetAtt WebhookReceiverRole.Arn
+
+  MessageProcessorRoleArn:
+    Description: ARN del role de ejecucion de Message_Processor.
+    Value: !GetAtt MessageProcessorRole.Arn
+
+  AuthServiceRoleArn:
+    Description: ARN del role de ejecucion de Auth_Service.
+    Value: !GetAtt AuthServiceRole.Arn
+
+  OtpServiceRoleArn:
+    Description: ARN del role de ejecucion de OTP_Service.
+    Value: !GetAtt OtpServiceRole.Arn
+
+  EmailServiceRoleArn:
+    Description: ARN del role de ejecucion de Email_Service.
+    Value: !GetAtt EmailServiceRole.Arn
+
+  SmsServiceRoleArn:
+    Description: ARN del role de ejecucion de SMS_Service.
+    Value: !GetAtt SmsServiceRole.Arn
+
+  AiAgentRoleArn:
+    Description: ARN del role de ejecucion de Strands_Agent.
+    Value: !GetAtt AiAgentRole.Arn
+
+  TransferInitiatorRoleArn:
+    Description: ARN del role de ejecucion de transfer-breb-initiator.
+    Value: !GetAtt TransferInitiatorRole.Arn
+
+  NotifyRoleArn:
+    Description: ARN del role de ejecucion de message-handler-notify.
+    Value: !GetAtt NotifyRole.Arn
+
+  # ── Roles DENTRO de VPC (dominio bancario) ──────────────────────────────────
+  BalanceQueryRoleArn:
+    Description: ARN del role de ejecucion de balance-query.
+    Value: !GetAtt BalanceQueryRole.Arn
+
+  TransferValidateRoleArn:
+    Description: ARN del role de ejecucion de transfer-breb-validate.
+    Value: !GetAtt TransferValidateRole.Arn
+
+  TransferExecuteRoleArn:
+    Description: ARN del role de ejecucion de transfer-breb-execute.
+    Value: !GetAtt TransferExecuteRole.Arn
+
+  StatementGeneratorRoleArn:
+    Description: ARN del role de ejecucion de statement-generator.
+    Value: !GetAtt StatementGeneratorRole.Arn
+
+  # ── Rol del state machine ────────────────────────────────────────────────────
+  StateMachineRoleArn:
+    Description: ARN del rol de ejecucion del TransferBrebStateMachine.
+    Value: !GetAtt StateMachineRole.Arn

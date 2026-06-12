@@ -1,0 +1,6 @@
+# Runtime dependencies for BTG ConnectAI Lambdas (Python 3.13)
+# Packaged into the shared Lambda Layer.
+twilio
+aws-lambda-powertools[parser]
+strands-agents
+fpdf2

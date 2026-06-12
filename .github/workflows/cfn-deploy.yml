@@ -1,0 +1,265 @@
+name: cfn-deploy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BTG ConnectAI — CloudFormation deploy pipeline (mismo patrón que el repo `infra`).
+#
+# ORDEN DE DESPLIEGUE: este pipeline corre **DESPUÉS** del pipeline de `infra`.
+# `infra` despliega los recursos compartidos y publica el contrato cross-stack
+# (CloudFormation Exports + parámetros SSM bajo /btgconnectai/sandbox/...).
+# Este workflow resuelve ese contrato y **falla rápido** si no está publicado.
+#
+# Qué hace:
+#   1. Checkout + Python 3.13
+#   2. OIDC: assume role vía aws-actions/configure-aws-credentials (sin llaves estáticas)
+#   3. Resuelve el contrato (bucket de artefactos de `infra` por SSM/Export) — fail fast
+#   4. cfn-lint sobre todos los templates de la app
+#   5. Build del Layer compartido + zip de cada Lambda en src/lambdas/*
+#   6. Sube los ZIP (Lambdas + Layer), la definición ASL y los nested templates a S3
+#   7. aws cloudformation deploy del stack raíz con CAPABILITY_NAMED_IAM y
+#      LambdaCodeKey = github.sha
+#
+# Seguridad / least-privilege:
+#   - El ARN del role de OIDC y la región se inyectan en runtime desde
+#     repository variables (vars.AWS_DEPLOY_ROLE_ARN / vars.AWS_REGION), NO se
+#     hardcodean en este archivo.
+#   - El bucket de artefactos se resuelve del contrato (SSM/Export) en runtime.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  # Despliegue manual (recomendado para coordinar el orden infra → app).
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Entorno de despliegue'
+        required: true
+        default: 'sandbox'
+        type: choice
+        options:
+          - sandbox
+          - staging
+          - prod
+  # Despliegue automático al integrar a main (infra ya debe estar desplegado).
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'layer/**'
+      - 'cloudformation/**'
+      - '.github/workflows/cfn-deploy.yml'
+
+# OIDC requiere id-token: write; el resto del repo se lee en read-only.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # Un único deploy por rama/entorno a la vez; no se cancela uno en curso.
+  group: cfn-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Región y prefijos del contrato. La región puede sobreescribirse con
+  # vars.AWS_REGION; por defecto us-east-1 (cuenta sandbox IA-Builder).
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: BTGConnectAI
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'sandbox' }}
+  PYTHON_VERSION: '3.13'
+  ROOT_STACK_TEMPLATE: cloudformation/stacks/sandbox/connectai-app.yaml
+  ASL_DEFINITION: cloudformation/state-machines/transfer-breb.asl.json
+
+jobs:
+  deploy:
+    name: Build, lint & deploy (CloudFormation)
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build/lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          # cfn-lint para validar los templates de la app (declarado en dev deps).
+          pip install cfn-lint
+
+      # ── 2. OIDC — assume role (sin credenciales estáticas) ──────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cfn-deploy-${{ github.run_id }}
+
+      # ── 3. Resolver el contrato cross-stack (fail fast) ─────────────────────
+      # El bucket de artefactos lo crea `infra`. Lo resolvemos primero por SSM y,
+      # si no existe el parámetro, intentamos el Export de CloudFormation. Si
+      # ninguno está publicado, el step falla → señal de que `infra` no se ha
+      # desplegado o cambió el contrato.
+      - name: Resolve infra contract (artifacts bucket)
+        run: |
+          set -euo pipefail
+          ENV="${ENVIRONMENT}"
+          SSM_PATH="/btgconnectai/${ENV}/s3/artifacts-name"
+          EXPORT_NAME="${PROJECT_NAME}-${ENV}-LambdaArtifactsBucketName"
+
+          echo "Resolviendo bucket de artefactos del contrato de infra..."
+          ARTIFACTS_BUCKET="$(aws ssm get-parameter \
+            --name "${SSM_PATH}" \
+            --query 'Parameter.Value' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "${ARTIFACTS_BUCKET}" ] || [ "${ARTIFACTS_BUCKET}" = "None" ]; then
+            echo "Parámetro SSM ${SSM_PATH} no encontrado; intentando Export ${EXPORT_NAME}..."
+            ARTIFACTS_BUCKET="$(aws cloudformation list-exports \
+              --query "Exports[?Name=='${EXPORT_NAME}'].Value | [0]" \
+              --output text 2>/dev/null || true)"
+          fi
+
+          if [ -z "${ARTIFACTS_BUCKET}" ] || [ "${ARTIFACTS_BUCKET}" = "None" ]; then
+            echo "::error::Contrato no publicado: no se pudo resolver el bucket de artefactos de 'infra'."
+            echo "::error::Verifica que el pipeline de 'infra' se haya desplegado y publicado ${SSM_PATH} (o el Export ${EXPORT_NAME})."
+            exit 1
+          fi
+
+          echo "Bucket de artefactos resuelto: ${ARTIFACTS_BUCKET}"
+          echo "ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET}" >> "${GITHUB_ENV}"
+          # LambdaCodeKey = git sha (versión de artefactos de esta corrida).
+          echo "LAMBDA_CODE_KEY=${GITHUB_SHA}" >> "${GITHUB_ENV}"
+
+      # ── 4. cfn-lint sobre los templates de la app ───────────────────────────
+      - name: cfn-lint templates
+        run: |
+          set -euo pipefail
+          cfn-lint --version
+          cfn-lint \
+            cloudformation/stacks/sandbox/*.yaml \
+            cloudformation/templates/connectai/*.yaml
+
+      # ── 5a. Build del Layer compartido ──────────────────────────────────────
+      - name: Build shared Lambda layer
+        run: |
+          set -euo pipefail
+          chmod +x layer/build.sh
+          bash layer/build.sh
+          test -f layer/shared-layer.zip
+
+      # ── 5b. Zip de cada Lambda en src/lambdas/* ─────────────────────────────
+      - name: Package Lambda functions
+        run: |
+          set -euo pipefail
+          DIST_DIR="${GITHUB_WORKSPACE}/dist/lambdas"
+          mkdir -p "${DIST_DIR}"
+
+          for fn_dir in src/lambdas/*/; do
+            [ -d "${fn_dir}" ] || continue
+            fn_name="$(basename "${fn_dir}")"
+            # Saltar artefactos que no son paquetes de Lambda.
+            if [ ! -f "${fn_dir}handler.py" ] && [ ! -f "${fn_dir}__init__.py" ]; then
+              echo "Omitiendo ${fn_name} (sin handler.py/__init__.py)"
+              continue
+            fi
+            artifact="${DIST_DIR}/${fn_name}-${LAMBDA_CODE_KEY}.zip"
+            echo "==> Empaquetando ${fn_name} -> ${artifact}"
+            # Zip del contenido del paquete en la raíz del ZIP; excluir caches y tests.
+            ( cd "${fn_dir}" && zip -qr "${artifact}" . \
+                -x '*__pycache__*' -x '*.pyc' -x '*/tests/*' )
+          done
+
+          echo "Artefactos generados:"
+          ls -lh "${DIST_DIR}"
+
+      # ── 6. Subir artefactos (Lambdas + Layer), ASL y nested templates a S3 ──
+      - name: Upload artifacts to infra bucket
+        run: |
+          set -euo pipefail
+          S3="s3://${ARTIFACTS_BUCKET}"
+
+          echo "==> Subiendo ZIPs de Lambdas a ${S3}/lambdas/"
+          aws s3 cp dist/lambdas/ "${S3}/lambdas/" \
+            --recursive --exclude '*' --include '*.zip' --only-show-errors
+
+          echo "==> Subiendo Layer compartido a ${S3}/layers/"
+          aws s3 cp layer/shared-layer.zip \
+            "${S3}/layers/shared-layer-${LAMBDA_CODE_KEY}.zip" --only-show-errors
+
+          echo "==> Subiendo definición ASL a ${S3}/state-machines/${LAMBDA_CODE_KEY}/"
+          aws s3 cp "${ASL_DEFINITION}" \
+            "${S3}/state-machines/${LAMBDA_CODE_KEY}/transfer-breb.asl.json" --only-show-errors
+
+          echo "==> Sync de nested templates a ${S3}/templates/${LAMBDA_CODE_KEY}/"
+          aws s3 sync cloudformation/templates/connectai/ \
+            "${S3}/templates/${LAMBDA_CODE_KEY}/" \
+            --exclude '*' --include '*.yaml' --only-show-errors
+
+      # ── 7. Deploy del stack raíz ────────────────────────────────────────────
+      # Los parámetros del contrato (ARNs/URLs/IDs de infra) se resuelven dentro
+      # del template vía AWS::SSM::Parameter::Value<String>; aquí solo se pasan
+      # los parámetros propios de la app. CAPABILITY_NAMED_IAM porque la app crea
+      # IAM roles con nombre para las Lambdas y el state machine.
+      - name: Deploy CloudFormation stack
+        run: |
+          set -euo pipefail
+          STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-app"
+          # URL base de los nested templates y key de la definicion ASL, ambos
+          # bajo el bucket de artefactos de `infra`, versionados por git-sha.
+          TEMPLATES_BASE_URL="https://${ARTIFACTS_BUCKET}.s3.${AWS_REGION}.amazonaws.com/templates/${LAMBDA_CODE_KEY}"
+          ASL_S3_KEY="state-machines/${LAMBDA_CODE_KEY}/transfer-breb.asl.json"
+          echo "==> Desplegando ${STACK_NAME} (LambdaCodeKey=${LAMBDA_CODE_KEY})"
+          echo "    TemplatesBaseUrl=${TEMPLATES_BASE_URL}"
+          echo "    StateMachineDefinitionS3Key=${ASL_S3_KEY}"
+          aws cloudformation deploy \
+            --stack-name "${STACK_NAME}" \
+            --template-file "${ROOT_STACK_TEMPLATE}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              ProjectName="${PROJECT_NAME}" \
+              Environment="${ENVIRONMENT}" \
+              LambdaCodeKey="${LAMBDA_CODE_KEY}" \
+              TemplatesBaseUrl="${TEMPLATES_BASE_URL}" \
+              StateMachineDefinitionS3Key="${ASL_S3_KEY}" \
+            --tags \
+              Project="${PROJECT_NAME}" \
+              Environment="${ENVIRONMENT}" \
+              ManagedBy=cloudformation \
+            --no-fail-on-empty-changeset
+
+      # ── 8. Publicar la Login_Page estatica en su bucket ─────────────────────
+      # Resuelve la Function URL real del Auth_Service (output del stack), sustituye
+      # el placeholder __AUTH_SERVICE_URL__ en app.js y sincroniza src/login-page/
+      # al bucket login-page de `infra` (nombre resuelto del contrato SSM).
+      - name: Publish Login_Page to S3
+        run: |
+          set -euo pipefail
+          AUTH_URL="$(aws lambda get-function-url-config \
+            --function-name "${PROJECT_NAME}-${ENVIRONMENT}-auth-service" \
+            --query 'FunctionUrl' --output text)"
+          LOGIN_BUCKET="$(aws ssm get-parameter \
+            --name "/btgconnectai/${ENVIRONMENT}/s3/login-page-name" \
+            --query 'Parameter.Value' --output text)"
+          echo "Auth_Service URL: ${AUTH_URL}"
+          echo "Login_Page bucket: ${LOGIN_BUCKET}"
+          workdir="$(mktemp -d)"
+          cp -r src/login-page/* "${workdir}/"
+          # Inyectar la Function URL real (el placeholder vive en app.js).
+          sed -i "s|__AUTH_SERVICE_URL__|${AUTH_URL}|g" "${workdir}/app.js"
+          aws s3 sync "${workdir}/" "s3://${LOGIN_BUCKET}/" \
+            --delete --only-show-errors
+          echo "Login_Page publicada en s3://${LOGIN_BUCKET}/"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### cfn-deploy"
+            echo ""
+            echo "- **Entorno:** ${ENVIRONMENT}"
+            echo "- **Región:** ${AWS_REGION}"
+            echo "- **LambdaCodeKey (git sha):** \`${LAMBDA_CODE_KEY:-${GITHUB_SHA}}\`"
+            echo "- **Bucket de artefactos:** \`${ARTIFACTS_BUCKET:-no resuelto}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

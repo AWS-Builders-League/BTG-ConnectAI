@@ -1,0 +1,7 @@
+# App compute/wiring templates live here (created in Task 15):
+# iam.yaml, lambdas-ingestion.yaml, lambdas-actions.yaml,
+# lambdas-notify.yaml, lambda-ai-agent.yaml, state-machine.yaml
+#
+# NOTE: Shared resources (data/storage/queues/secrets/vpc-access/
+# guardrails/api-gateway/observability) are created by the `infra` repo,
+# NOT here.

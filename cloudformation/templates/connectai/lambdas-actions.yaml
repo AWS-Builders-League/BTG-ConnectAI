@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - Action Group / state-machine task Lambdas (nested stack de
+  computo). Define las Lambdas del dominio bancario dentro de la VPC
+  (balance-query, transfer-breb-validate, transfer-breb-execute,
+  statement-generator) y las que corren fuera de la VPC (transfer-breb-initiator,
+  message-handler-notify), mas los AWS::Lambda::Permission para que el Bedrock
+  Agent invoque las tools. Los IAM roles se definen en iam.yaml y se reciben como
+  parametros. Nombres de funcion deterministas segun la convencion de naming.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Pasados desde el stack raiz (connectai-app.yaml, LambdasActionsStack), que a su
+# vez los resuelve del contrato cross-stack publicado por `infra` (SSM /
+# Fn::ImportValue), del SharedLayer local y de los Outputs de iam.yaml (los ARNs
+# de los roles). El ARN de la state machine se construye de forma determinista en
+# el stack raiz para romper el ciclo actions <-> state-machine.
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  # ── Identidad de la app ──────────────────────────────────────────────────
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convencion de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  # ── Empaquetado del codigo (bucket de artefactos de `infra`) ─────────────
+  LambdaArtifactsBucketName:
+    Type: String
+    Description: >-
+      Nombre del bucket de artefactos de Lambda creado por `infra`. El pipeline
+      sube aqui los ZIP del codigo y este template los referencia en Code.S3Bucket.
+
+  LambdaCodeKey:
+    Type: String
+    Description: >-
+      Git-sha de los artefactos de Lambda. El S3Key se construye con la
+      convencion lambdas/<name>-<git-sha>.zip.
+
+  SharedLayerArn:
+    Type: String
+    Description: >-
+      ARN (con version) del Lambda Layer compartido (deps pip + codigo
+      src/shared/). Creado por la app y pasado desde el stack raiz.
+
+  # ── Red (del contrato de `infra`) ────────────────────────────────────────
+  BankingLambdaSGId:
+    Type: String
+    Description: >-
+      ID del Security Group BankingLambdaSG para las Lambdas del dominio bancario
+      en subnets privadas (VpcConfig.SecurityGroupIds).
+
+  PrivateSubnetIds:
+    Type: String
+    Description: >-
+      IDs de subnets privadas en formato CSV. Se usa con Fn::Split para
+      VpcConfig.SubnetIds de las Lambdas del dominio bancario.
+
+  # ── S3 (del contrato de `infra`) ─────────────────────────────────────────
+  StatementBucketName:
+    Type: String
+    Description: >-
+      Nombre del Statement_Bucket. Inyectado como env var de la statement-generator
+      para escribir el PDF del extracto via el S3 Gateway Endpoint.
+
+  # ── Secrets (del contrato de `infra`) ────────────────────────────────────
+  TwilioSecretArn:
+    Type: String
+    Description: >-
+      ARN del secreto de Twilio en Secrets Manager. Inyectado como env var
+      TWILIO_SECRET_ARN de la message-handler-notify.
+
+  # ── State machine (ARN determinista, pasado desde el stack raiz) ─────────
+  StateMachineArn:
+    Type: String
+    Description: >-
+      ARN del TransferBrebStateMachine (construido de forma determinista en el
+      stack raiz). Inyectado como env var STATE_MACHINE_ARN de la
+      transfer-breb-initiator para el StartExecution.
+
+  # ── IAM roles (definidos en iam.yaml) ────────────────────────────────────
+  BalanceQueryRoleArn:
+    Type: String
+    Description: ARN del IAM role de balance-query (definido en iam.yaml).
+
+  TransferValidateRoleArn:
+    Type: String
+    Description: ARN del IAM role de transfer-breb-validate (definido en iam.yaml).
+
+  TransferExecuteRoleArn:
+    Type: String
+    Description: ARN del IAM role de transfer-breb-execute (definido en iam.yaml).
+
+  StatementGeneratorRoleArn:
+    Type: String
+    Description: ARN del IAM role de statement-generator (definido en iam.yaml).
+
+  TransferInitiatorRoleArn:
+    Type: String
+    Description: ARN del IAM role de transfer-breb-initiator (definido en iam.yaml).
+
+  NotifyRoleArn:
+    Type: String
+    Description: ARN del IAM role de message-handler-notify (definido en iam.yaml).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupacion de parametros en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Empaquetado del codigo'
+        Parameters:
+          - LambdaArtifactsBucketName
+          - LambdaCodeKey
+          - SharedLayerArn
+      - Label:
+          default: 'Contrato cross-stack: Red'
+        Parameters:
+          - BankingLambdaSGId
+          - PrivateSubnetIds
+      - Label:
+          default: 'Contrato cross-stack: S3 / Secrets'
+        Parameters:
+          - StatementBucketName
+          - TwilioSecretArn
+      - Label:
+          default: 'State machine'
+        Parameters:
+          - StateMachineArn
+      - Label:
+          default: 'IAM roles (iam.yaml)'
+        Parameters:
+          - BalanceQueryRoleArn
+          - TransferValidateRoleArn
+          - TransferExecuteRoleArn
+          - StatementGeneratorRoleArn
+          - TransferInitiatorRoleArn
+          - NotifyRoleArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+#
+# Naming determinista ${ProjectName}-${Environment}-<name>: iam.yaml concede
+# lambda:InvokeFunction / states:StartExecution contra estos ARNs exactos, por lo
+# que el FunctionName NO puede dejarse autogenerar.
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Lambdas DENTRO de la VPC (dominio bancario)
+  #   - VpcConfig: BankingLambdaSG + subnets privadas (acceso a AWS via Endpoints)
+  #   - Handler: <paquete>.<modulo>.handler (el ZIP empaqueta el paquete en raiz)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── balance-query (Action Group / tool del Strands_Agent, Req 7) ────────────
+  BalanceQueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-balance-query'
+      Description: >-
+        Consulta de saldos sobre Mock_Core. Tool query_balance del Strands_Agent
+        (invocada por el Bedrock Agent). Corre dentro de la VPC (dominio bancario).
+      Runtime: python3.13
+      Handler: balance_query.handler.handler
+      MemorySize: 128
+      Timeout: 15
+      Role: !Ref BalanceQueryRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/balance-query-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BankingLambdaSGId
+        SubnetIds: !Split [',', !Ref PrivateSubnetIds]
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: balance-query
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── transfer-breb-validate (estado ValidateTransfer, Req 8.10) ──────────────
+  TransferValidateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-transfer-breb-validate'
+      Description: >-
+        Valida la transferencia BRE-B contra Mock_Core (fondos / cuenta destino).
+        Task ValidateTransfer del TransferBrebStateMachine. Corre dentro de la VPC.
+      Runtime: python3.13
+      Handler: transfer_breb.validate.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref TransferValidateRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/transfer-breb-validate-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BankingLambdaSGId
+        SubnetIds: !Split [',', !Ref PrivateSubnetIds]
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: transfer-breb-validate
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── transfer-breb-execute (estado ExecuteTransfer, Req 8.11/8.12) ───────────
+  TransferExecuteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-transfer-breb-execute'
+      Description: >-
+        Aplica el movimiento (mock) y produce el comprobante de la transferencia.
+        Task ExecuteTransfer del TransferBrebStateMachine. Corre dentro de la VPC.
+      Runtime: python3.13
+      Handler: transfer_breb.execute.handler
+      MemorySize: 128
+      Timeout: 15
+      Role: !Ref TransferExecuteRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/transfer-breb-execute-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BankingLambdaSGId
+        SubnetIds: !Split [',', !Ref PrivateSubnetIds]
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: transfer-breb-execute
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── statement-generator (Action Group / tool del Strands_Agent, Req 9) ──────
+  # Escribe el PDF del extracto en el Statement_Bucket via el S3 Gateway Endpoint.
+  StatementGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-statement-generator'
+      Description: >-
+        Genera el PDF del extracto y lo sube al Statement_Bucket (via S3 Gateway
+        Endpoint). Tool generate_statement del Strands_Agent. Corre dentro de la VPC.
+      Runtime: python3.13
+      Handler: statement_generator.handler.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !Ref StatementGeneratorRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/statement-generator-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BankingLambdaSGId
+        SubnetIds: !Split [',', !Ref PrivateSubnetIds]
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          # El codigo del handler lee STATEMENT_BUCKET; se expone tambien
+          # STATEMENT_BUCKET_NAME por consistencia con el contrato de naming.
+          STATEMENT_BUCKET: !Ref StatementBucketName
+          STATEMENT_BUCKET_NAME: !Ref StatementBucketName
+          POWERTOOLS_SERVICE_NAME: statement-generator
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Lambdas FUERA de la VPC (necesitan APIs publicas: Step Functions / Twilio)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── transfer-breb-initiator (tool del Strands_Agent, Req 8.3/18.7) ──────────
+  # Dispara el TransferBrebStateMachine (StartExecution) y retorna de inmediato.
+  TransferInitiatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-transfer-breb-initiator'
+      Description: >-
+        Tool initiate-transfer-breb del Strands_Agent: hace StartExecution sobre el
+        TransferBrebStateMachine. Corre fuera de la VPC (solo Step Functions API).
+      Runtime: python3.13
+      Handler: transfer_breb.initiator.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref TransferInitiatorRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/transfer-breb-initiator-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachineArn
+          POWERTOOLS_SERVICE_NAME: transfer-breb-initiator
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── message-handler-notify (estados terminales del state machine, Req 8.4) ──
+  # Entrega el mensaje final en espanol via Twilio (necesita egress a internet).
+  NotifyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-message-handler-notify'
+      Description: >-
+        Envia el mensaje final (comprobante / fallo) en espanol via Twilio. Invocada
+        por los estados terminales del TransferBrebStateMachine. Fuera de la VPC.
+      Runtime: python3.13
+      Handler: message_handler_notify.handler.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref NotifyRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/message-handler-notify-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TWILIO_SECRET_ARN: !Ref TwilioSecretArn
+          POWERTOOLS_SERVICE_NAME: message-handler-notify
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NOTA: NO se crean AWS::Lambda::Permission para bedrock.amazonaws.com porque
+  # NO hay Bedrock Agent Core. El Strands_Agent (lambda-ai-agent) invoca estas
+  # Action Group Lambdas directamente via lambda:InvokeFunction (permiso ya
+  # concedido en su IAM role en iam.yaml). El Guardrail se aplica con ApplyGuardrail.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+#
+# Consumidos por el stack raiz: los *FunctionName van como env vars al
+# Strands_Agent (tools); los *FunctionArn van como tasks al TransferBrebStateMachine.
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  BalanceQueryFunctionName:
+    Description: Nombre de la Lambda balance-query (tool query_balance del agente).
+    Value: !Ref BalanceQueryFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-BalanceQueryFunctionName'
+
+  TransferInitiatorFunctionName:
+    Description: Nombre de la Lambda transfer-breb-initiator (tool del agente).
+    Value: !Ref TransferInitiatorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TransferInitiatorFunctionName'
+
+  StatementGeneratorFunctionName:
+    Description: Nombre de la Lambda statement-generator (tool generate_statement).
+    Value: !Ref StatementGeneratorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-StatementGeneratorFunctionName'
+
+  TransferValidateFunctionArn:
+    Description: ARN de la Lambda transfer-breb-validate (task ValidateTransfer).
+    Value: !GetAtt TransferValidateFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TransferValidateFunctionArn'
+
+  TransferExecuteFunctionArn:
+    Description: ARN de la Lambda transfer-breb-execute (task ExecuteTransfer).
+    Value: !GetAtt TransferExecuteFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TransferExecuteFunctionArn'
+
+  NotifyFunctionArn:
+    Description: ARN de la Lambda message-handler-notify (estados terminales).
+    Value: !GetAtt NotifyFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-NotifyFunctionArn'

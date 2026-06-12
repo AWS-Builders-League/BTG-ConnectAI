@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - Stack raiz de la app (cómputo y wiring).
+  Declara el contrato cross-stack con el repo `infra` como Parameters resueltos
+  vía SSM Parameter Store (AWS::SSM::Parameter::Value<String>) y/o Fn::ImportValue.
+  PRERREQUISITO: el repo `infra` debe estar desplegado y haber publicado el
+  contrato (Exports + parámetros SSM) ANTES de desplegar este stack. Si un
+  parámetro SSM o Export no existe, el deploy falla rápido.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Convención de naming del contrato (ver design.md):
+#   - Export CFN:  ${ProjectName}-${Environment}-<Recurso>
+#   - Namespace SSM: /btgconnectai/sandbox/...
+#
+# Los recursos compartidos (API Gateway, SQS, DynamoDB, S3, Bedrock, Secrets,
+# SNS y red) los crea `infra`. Aquí se resuelven en deploy-time. Para los
+# parámetros respaldados por SSM se usa el tipo AWS::SSM::Parameter::Value<String>
+# y el Default es la RUTA del parámetro SSM (no su valor): CloudFormation lo
+# resuelve al valor actual en el momento del deploy.
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  # ── Parámetros propios de la app ───────────────────────────────────────────
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convención de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  LambdaCodeKey:
+    Type: String
+    Description: >-
+      Key (git-sha) de los artefactos de Lambda subidos al bucket de artefactos
+      de `infra`. Ej: lambdas/<nombre>-<git-sha>.zip. Se pasa por
+      --parameter-overrides en el pipeline.
+
+  StateMachineDefinitionS3Key:
+    Type: String
+    Description: >-
+      Key del objeto con la definicion ASL del TransferBrebStateMachine en el
+      bucket de artefactos de `infra`. Ej: state-machines/transfer-breb-<git-sha>.asl.json.
+      Corresponde al archivo versionado cloudformation/state-machines/transfer-breb.asl.json.
+      Se pasa por --parameter-overrides en el pipeline.
+
+  TemplatesBaseUrl:
+    Type: String
+    Description: >-
+      URL base (HTTPS, sin barra final) del prefijo S3 donde el pipeline publica
+      los templates anidados de cómputo de esta app
+      (iam.yaml, lambdas-actions.yaml, lambdas-notify.yaml, lambda-ai-agent.yaml,
+      state-machine.yaml, lambdas-ingestion.yaml). Cada nested stack se referencia
+      anteponiendo esta URL al nombre del template. Ej:
+      https://<artifacts-bucket>.s3.<region>.amazonaws.com/templates/connectai
+    AllowedPattern: '^https://.*[^/]$'
+    ConstraintDescription: Debe ser una URL HTTPS sin barra final.
+
+  # ── API Gateway (creado por `infra`) ───────────────────────────────────────
+  HttpApiId:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/api/http-api-id'
+    Description: ID del HTTP API (API Gateway v2). Export BTGConnectAI-sandbox-HttpApiId.
+
+  HttpApiEndpoint:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/api/endpoint'
+    Description: Endpoint de ejecución del HTTP API. Export BTGConnectAI-sandbox-HttpApiEndpoint.
+
+  # ── SQS (creadas por `infra`) ──────────────────────────────────────────────
+  InboundQueueArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/inbound-arn'
+    Description: ARN de la inbound FIFO queue. Export BTGConnectAI-sandbox-InboundQueueArn.
+
+  InboundQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/inbound-url'
+    Description: URL de la inbound FIFO queue. Export BTGConnectAI-sandbox-InboundQueueUrl.
+
+  EmailQueueArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/email-arn'
+    Description: ARN de la email-notification-queue. Export BTGConnectAI-sandbox-EmailQueueArn.
+
+  EmailQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/email-url'
+    Description: URL de la email-notification-queue. Export BTGConnectAI-sandbox-EmailQueueUrl.
+
+  SmsQueueArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/sms-arn'
+    Description: ARN de la sms-notification-queue. Export BTGConnectAI-sandbox-SmsQueueArn.
+
+  SmsQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/sms-url'
+    Description: URL de la sms-notification-queue. Export BTGConnectAI-sandbox-SmsQueueUrl.
+
+  # ── DynamoDB (creadas por `infra`) ─────────────────────────────────────────
+  ConsentTableName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/consent-name'
+    Description: Nombre de la tabla Consent_Store. Export BTGConnectAI-sandbox-ConsentTableName.
+
+  ConsentTableArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/consent-arn'
+    Description: ARN de la tabla Consent_Store. Export BTGConnectAI-sandbox-ConsentTableArn.
+
+  AuthTableName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/auth-name'
+    Description: Nombre de la tabla Auth_Session. Export BTGConnectAI-sandbox-AuthTableName.
+
+  AuthTableArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/auth-arn'
+    Description: ARN de la tabla Auth_Session. Export BTGConnectAI-sandbox-AuthTableArn.
+
+  OtpTableName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/otp-name'
+    Description: Nombre de la tabla OTP_Store. Export BTGConnectAI-sandbox-OtpTableName.
+
+  OtpTableArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/ddb/otp-arn'
+    Description: ARN de la tabla OTP_Store. Export BTGConnectAI-sandbox-OtpTableArn.
+
+  # ── S3 (creados por `infra`) ───────────────────────────────────────────────
+  StatementBucketName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/s3/statement-name'
+    Description: Nombre del Statement_Bucket. Export BTGConnectAI-sandbox-StatementBucketName.
+
+  StatementBucketArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/s3/statement-arn'
+    Description: ARN del Statement_Bucket. Export BTGConnectAI-sandbox-StatementBucketArn.
+
+  AudioTempBucketName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/s3/audio-temp-name'
+    Description: Nombre del bucket Audio_Temp. Export BTGConnectAI-sandbox-AudioTempBucketName.
+
+  AudioTempBucketArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/s3/audio-temp-arn'
+    Description: ARN del bucket Audio_Temp. Export BTGConnectAI-sandbox-AudioTempBucketArn.
+
+  LambdaArtifactsBucketName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/s3/artifacts-name'
+    Description: >-
+      Nombre del bucket de artefactos de Lambda (creado por `infra`). El pipeline
+      sube los ZIP de las Lambdas y el Layer aquí; los templates de cómputo
+      referencian Code: {S3Bucket: <este valor>, S3Key: <LambdaCodeKey>}.
+      Export BTGConnectAI-sandbox-LambdaArtifactsBucketName.
+
+  # ── Bedrock (creado por `infra`) ───────────────────────────────────────────
+  # NOTA: el Strands_Agent invoca el modelo directamente y aplica el Guardrail
+  # (ApplyGuardrail). NO hay Bedrock Agent Core, por eso no se resuelven
+  # BedrockAgentArn/BedrockAgentId del contrato.
+  GuardrailId:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/bedrock/guardrail-id'
+    Description: ID del Bedrock Guardrail. Export BTGConnectAI-sandbox-GuardrailId.
+
+  GuardrailVersion:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/bedrock/guardrail-version'
+    Description: Versión del Bedrock Guardrail. Export BTGConnectAI-sandbox-GuardrailVersion.
+
+  # ── Secrets / SNS (creados por `infra`) ────────────────────────────────────
+  TwilioSecretArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/secrets/twilio-arn'
+    Description: ARN del secreto de Twilio en Secrets Manager. Export BTGConnectAI-sandbox-TwilioSecretArn.
+
+  AlarmsTopicArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sns/alarms-arn'
+    Description: ARN del SNS topic de alarmas. Export BTGConnectAI-sandbox-AlarmsTopicArn.
+
+  # ── Red (creada por `infra`) ───────────────────────────────────────────────
+  BankingLambdaSGId:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/vpc/banking-sg-id'
+    Description: >-
+      ID del Security Group BankingLambdaSG para las Lambdas del dominio bancario
+      en subnets privadas. Export BTGConnectAI-sandbox-BankingLambdaSGId.
+
+  PrivateSubnetIds:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/vpc/private-subnet-ids'
+    Description: >-
+      IDs de subnets privadas en formato CSV. Downstream se usa con
+      Fn::Split para VpcConfig.SubnetIds. Export BTGConnectAI-sandbox-PrivateSubnetIds.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupación de parámetros del contrato en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+          - LambdaCodeKey
+          - StateMachineDefinitionS3Key
+          - TemplatesBaseUrl
+      - Label:
+          default: 'Contrato cross-stack: API Gateway'
+        Parameters:
+          - HttpApiId
+          - HttpApiEndpoint
+      - Label:
+          default: 'Contrato cross-stack: SQS'
+        Parameters:
+          - InboundQueueArn
+          - InboundQueueUrl
+          - EmailQueueArn
+          - EmailQueueUrl
+          - SmsQueueArn
+          - SmsQueueUrl
+      - Label:
+          default: 'Contrato cross-stack: DynamoDB'
+        Parameters:
+          - ConsentTableName
+          - ConsentTableArn
+          - AuthTableName
+          - AuthTableArn
+          - OtpTableName
+          - OtpTableArn
+      - Label:
+          default: 'Contrato cross-stack: S3'
+        Parameters:
+          - StatementBucketName
+          - StatementBucketArn
+          - AudioTempBucketName
+          - AudioTempBucketArn
+          - LambdaArtifactsBucketName
+      - Label:
+          default: 'Contrato cross-stack: Bedrock'
+        Parameters:
+          - GuardrailId
+          - GuardrailVersion
+      - Label:
+          default: 'Contrato cross-stack: Secrets / SNS'
+        Parameters:
+          - TwilioSecretArn
+          - AlarmsTopicArn
+      - Label:
+          default: 'Contrato cross-stack: Red'
+        Parameters:
+          - BankingLambdaSGId
+          - PrivateSubnetIds
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+#
+# Stack raíz de cómputo/wiring. Crea el Lambda Layer compartido y declara las
+# nested stacks (AWS::CloudFormation::Stack) en orden de dependencias:
+#
+#   iam  →  lambdas-actions / lambda-ai-agent / lambdas-notify  →  state-machine
+#        →  lambdas-ingestion (API GW wiring + ESM)
+#
+# Cada nested stack recibe los parámetros del contrato (resueltos vía SSM /
+# Fn::ImportValue por este stack raíz) + LambdaArtifactsBucketName + LambdaCodeKey,
+# y los Outputs de las nested stacks previas (vía !GetAtt <Stack>.Outputs.<X>).
+# El orden de creación lo impone CloudFormation a partir de esas referencias
+# !GetAtt (no hace falta DependsOn explícito), salvo donde se documenta.
+#
+# NOTA del reparto: ya NO hay nested stacks de recursos compartidos
+# (data/storage/queues/secrets/vpc-access/guardrails/api-gateway/observability);
+# esos los crea `infra` y aquí se consumen como contrato.
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Lambda Layer compartido ────────────────────────────────────────────────
+  # Código src/shared/ + deps de runtime (twilio, aws-lambda-powertools, strands,
+  # fpdf2). El pipeline publica layer/shared-layer.zip al bucket de artefactos de
+  # `infra`; aquí se expone como LayerVersion y su ARN se pasa a cada nested stack
+  # de cómputo para adjuntarlo a las Lambdas (Layers: [!Ref SharedLayerArn]).
+  SharedLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-${Environment}-shared-layer'
+      Description: >-
+        Capa compartida: src/shared/ + dependencias de runtime. Versionada por
+        LambdaCodeKey (git-sha) para forzar una nueva versión en cada despliegue.
+      Content:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'layers/shared-layer-${LambdaCodeKey}.zip'
+      CompatibleRuntimes:
+        - python3.13
+      CompatibleArchitectures:
+        - x86_64
+
+  # ── 1) IAM roles (sin dependencias de otras nested stacks) ──────────────────
+  # Define los roles de TODAS las Lambdas + el rol del state machine. Los ARNs de
+  # los recursos provienen del contrato (parámetros resueltos); los ARNs de
+  # recursos locales (ai-agent, state machine) se construyen de forma determinista
+  # con la convención de naming para evitar dependencias circulares.
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/iam.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        InboundQueueArn: !Ref InboundQueueArn
+        EmailQueueArn: !Ref EmailQueueArn
+        SmsQueueArn: !Ref SmsQueueArn
+        ConsentTableArn: !Ref ConsentTableArn
+        AuthTableArn: !Ref AuthTableArn
+        OtpTableArn: !Ref OtpTableArn
+        StatementBucketArn: !Ref StatementBucketArn
+        AudioTempBucketArn: !Ref AudioTempBucketArn
+        TwilioSecretArn: !Ref TwilioSecretArn
+        GuardrailId: !Ref GuardrailId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── 2a) Action group / state-machine task Lambdas ───────────────────────────
+  # balance-query, transfer-breb-validate/execute, statement-generator (EN VPC),
+  # transfer-breb-initiator y message-handler-notify (FUERA de VPC). El ARN de la
+  # state machine se construye de forma determinista (rompe el ciclo
+  # actions ↔ state-machine): el initiator hace StartExecution sobre ese ARN.
+  LambdasActionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/lambdas-actions.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
+        LambdaCodeKey: !Ref LambdaCodeKey
+        SharedLayerArn: !Ref SharedLayer
+        BankingLambdaSGId: !Ref BankingLambdaSGId
+        PrivateSubnetIds: !Ref PrivateSubnetIds
+        StatementBucketName: !Ref StatementBucketName
+        TwilioSecretArn: !Ref TwilioSecretArn
+        StateMachineArn: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-TransferBrebStateMachine'
+        BalanceQueryRoleArn: !GetAtt IamStack.Outputs.BalanceQueryRoleArn
+        TransferValidateRoleArn: !GetAtt IamStack.Outputs.TransferValidateRoleArn
+        TransferExecuteRoleArn: !GetAtt IamStack.Outputs.TransferExecuteRoleArn
+        StatementGeneratorRoleArn: !GetAtt IamStack.Outputs.StatementGeneratorRoleArn
+        TransferInitiatorRoleArn: !GetAtt IamStack.Outputs.TransferInitiatorRoleArn
+        NotifyRoleArn: !GetAtt IamStack.Outputs.NotifyRoleArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── 2b) Notification Lambdas ─────────────────────────────────────────────────
+  # otp-service (invocada por Step Functions waitForTaskToken), email-service y
+  # sms-service (cada una con su EventSourceMapping sobre las colas de `infra`).
+  LambdasNotifyStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/lambdas-notify.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
+        LambdaCodeKey: !Ref LambdaCodeKey
+        SharedLayerArn: !Ref SharedLayer
+        OtpTableName: !Ref OtpTableName
+        EmailQueueArn: !Ref EmailQueueArn
+        SmsQueueArn: !Ref SmsQueueArn
+        TwilioSecretArn: !Ref TwilioSecretArn
+        OtpServiceRoleArn: !GetAtt IamStack.Outputs.OtpServiceRoleArn
+        EmailServiceRoleArn: !GetAtt IamStack.Outputs.EmailServiceRoleArn
+        SmsServiceRoleArn: !GetAtt IamStack.Outputs.SmsServiceRoleArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── 2c) Strands_Agent Lambda ─────────────────────────────────────────────────
+  # FUERA de VPC. Recibe el role de iam, el SharedLayer, los nombres de las tools
+  # (Outputs de lambdas-actions) y el contrato de Bedrock/Guardrails de `infra`.
+  LambdaAiAgentStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/lambda-ai-agent.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
+        LambdaCodeKey: !Ref LambdaCodeKey
+        SharedLayerArn: !Ref SharedLayer
+        AiAgentRoleArn: !GetAtt IamStack.Outputs.AiAgentRoleArn
+        GuardrailId: !Ref GuardrailId
+        GuardrailVersion: !Ref GuardrailVersion
+        BalanceQueryFunctionName: !GetAtt LambdasActionsStack.Outputs.BalanceQueryFunctionName
+        TransferInitiatorFunctionName: !GetAtt LambdasActionsStack.Outputs.TransferInitiatorFunctionName
+        StatementGeneratorFunctionName: !GetAtt LambdasActionsStack.Outputs.StatementGeneratorFunctionName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── 3) State machine ─────────────────────────────────────────────────────────
+  # TransferBrebStateMachine (STANDARD). Tasks: ValidateTransfer/ExecuteTransfer
+  # (lambdas-actions), OtpService (lambdas-notify), Notify (lambdas-actions).
+  # Las URLs de las colas email/sms y el ARN de alarmas las resuelve el propio
+  # template anidado desde sus defaults SSM (parámetros AWS::SSM::Parameter::Value
+  # no se pueden alimentar con valores ya resueltos), por eso no se pasan aquí.
+  StateMachineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/state-machine.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
+        StateMachineDefinitionS3Key: !Ref StateMachineDefinitionS3Key
+        StateMachineRoleArn: !GetAtt IamStack.Outputs.StateMachineRoleArn
+        ValidateTransferFunctionArn: !GetAtt LambdasActionsStack.Outputs.TransferValidateFunctionArn
+        OtpServiceFunctionArn: !GetAtt LambdasNotifyStack.Outputs.OtpServiceFunctionArn
+        ExecuteTransferFunctionArn: !GetAtt LambdasActionsStack.Outputs.TransferExecuteFunctionArn
+        NotifyFunctionArn: !GetAtt LambdasActionsStack.Outputs.NotifyFunctionArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── 4) Ingestion Lambdas + API Gateway wiring + ESM ─────────────────────────
+  # webhook-receiver, message-processor (ESM sobre InboundQueueArn) y auth-service.
+  # Conecta el HTTP API de `infra` (Integration + Route + Permission) y consume el
+  # ARN del Strands_Agent. Se crea al final porque depende de iam + ai-agent.
+  LambdasIngestionStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplatesBaseUrl}/lambdas-ingestion.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
+        LambdaCodeKey: !Ref LambdaCodeKey
+        SharedLayerArn: !Ref SharedLayer
+        HttpApiId: !Ref HttpApiId
+        InboundQueueArn: !Ref InboundQueueArn
+        InboundQueueUrl: !Ref InboundQueueUrl
+        TwilioSecretArn: !Ref TwilioSecretArn
+        ConsentTableName: !Ref ConsentTableName
+        AuthTableName: !Ref AuthTableName
+        OtpTableName: !Ref OtpTableName
+        StatementBucketName: !Ref StatementBucketName
+        AudioTempBucketName: !Ref AudioTempBucketName
+        AiAgentFunctionArn: !GetAtt LambdaAiAgentStack.Outputs.AiAgentFunctionArn
+        WebhookReceiverRoleArn: !GetAtt IamStack.Outputs.WebhookReceiverRoleArn
+        MessageProcessorRoleArn: !GetAtt IamStack.Outputs.MessageProcessorRoleArn
+        AuthServiceRoleArn: !GetAtt IamStack.Outputs.AuthServiceRoleArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Marca de auditoría del despliegue ───────────────────────────────────────
+  DeploymentMetadataParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/btgconnectai/${Environment}/app/deployment-metadata'
+      Type: String
+      Value: !Sub >-
+        {"project":"${ProjectName}","environment":"${Environment}",
+        "lambdaCodeKey":"${LambdaCodeKey}","stackName":"${AWS::StackName}"}
+      Description: >-
+        Marca de auditoría del último despliegue del stack raíz de la app
+        (git-sha + metadatos del contrato consumido).
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        ManagedBy: cloudformation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+#
+# Se re-exponen los valores resueltos del contrato para visibilidad y para que
+# las nested stacks de la Task 15 puedan consumirlos vía Outputs si se requiere.
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  ResolvedHttpApiId:
+    Description: HTTP API ID resuelto del contrato.
+    Value: !Ref HttpApiId
+
+  ResolvedInboundQueueArn:
+    Description: Inbound queue ARN resuelto del contrato.
+    Value: !Ref InboundQueueArn
+
+  ResolvedLambdaArtifactsBucketName:
+    Description: Bucket de artefactos de Lambda resuelto del contrato.
+    Value: !Ref LambdaArtifactsBucketName
+
+  DeployedLambdaCodeKey:
+    Description: Key (git-sha) de los artefactos de Lambda desplegados.
+    Value: !Ref LambdaCodeKey
+
+  DeploymentMetadataParameterName:
+    Description: Nombre del parámetro SSM con la marca de auditoría del despliegue.
+    Value: !Ref DeploymentMetadataParameter
+
+  # ── Outputs de las nested stacks de cómputo ─────────────────────────────────
+  SharedLayerArn:
+    Description: ARN (con versión) del Lambda Layer compartido.
+    Value: !Ref SharedLayer
+
+  AiAgentFunctionArn:
+    Description: ARN de la Strands_Agent Lambda (nested stack lambda-ai-agent).
+    Value: !GetAtt LambdaAiAgentStack.Outputs.AiAgentFunctionArn
+
+  StateMachineArn:
+    Description: ARN del TransferBrebStateMachine (nested stack state-machine).
+    Value: !GetAtt StateMachineStack.Outputs.StateMachineArn
+
+  # ── Re-exposición de valores del contrato para visibilidad/depuración ───────
+  ResolvedHttpApiEndpoint:
+    Description: Endpoint de ejecución del HTTP API resuelto del contrato.
+    Value: !Ref HttpApiEndpoint
+
+  ResolvedEmailQueueUrl:
+    Description: URL de la email-notification-queue resuelta del contrato.
+    Value: !Ref EmailQueueUrl
+
+  ResolvedSmsQueueUrl:
+    Description: URL de la sms-notification-queue resuelta del contrato.
+    Value: !Ref SmsQueueUrl
+
+  ResolvedAlarmsTopicArn:
+    Description: ARN del SNS topic de alarmas resuelto del contrato.
+    Value: !Ref AlarmsTopicArn

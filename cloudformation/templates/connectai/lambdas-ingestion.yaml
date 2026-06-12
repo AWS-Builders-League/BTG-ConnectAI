@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - Ingestion Lambdas + API Gateway wiring + EventSourceMapping.
+  Nested stack de cómputo: define las Lambdas de ingesta del canal de WhatsApp:
+  webhook-receiver (recibe el webhook de Twilio vía HTTP API y encola en la
+  inbound FIFO queue), message-processor (consume la cola, orquesta consentimiento
+  / auth / transcripción e invoca al Strands_Agent) y auth-service (endpoint de
+  login mock detrás de una Function URL para el Login_Page). Las tres corren
+  FUERA de VPC. Conecta el HTTP API de `infra` (Integration + Route + Permission)
+  y crea el EventSourceMapping sobre la inbound queue del contrato. Los IAM roles
+  se definen en iam.yaml y se reciben como parámetros; el SharedLayer, los nombres
+  de tablas/buckets y el ARN del Strands_Agent se pasan desde el stack raíz (mismo
+  patrón que las demás nested stacks de cómputo).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Estos valores se pasan desde el stack raíz (connectai-app.yaml), que a su vez
+# los resuelve del contrato cross-stack publicado por `infra` (SSM /
+# Fn::ImportValue) y/o de los Outputs de otras nested stacks de la app
+# (iam.yaml para los roles, lambda-ai-agent.yaml para el ARN del agente, el
+# template del SharedLayer para su ARN). Los nombres DEBEN coincidir EXACTAMENTE
+# con los que pasa el stack raíz en LambdasIngestionStack.
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  # ── Identidad de la app ──────────────────────────────────────────────────
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convención de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  # ── Empaquetado del código (bucket de artefactos de `infra`) ─────────────
+  LambdaArtifactsBucketName:
+    Type: String
+    Description: >-
+      Nombre del bucket de artefactos de Lambda creado por `infra`
+      (contrato BTGConnectAI-sandbox-LambdaArtifactsBucketName). El pipeline
+      sube aquí los ZIP del código de las Lambdas de ingesta y este template los
+      referencia en Code.S3Bucket.
+
+  LambdaCodeKey:
+    Type: String
+    Description: >-
+      Git-sha de los artefactos de Lambda. El S3Key se construye con la
+      convención lambdas/<nombre>-<git-sha>.zip.
+
+  SharedLayerArn:
+    Type: String
+    Description: >-
+      ARN (con versión) del Lambda Layer compartido (deps pip + código
+      src/shared/). Creado por la app y pasado desde el stack raíz.
+
+  # ── API Gateway (HTTP API creado por `infra`) ────────────────────────────
+  HttpApiId:
+    Type: String
+    Description: >-
+      ID del HTTP API (API Gateway v2) creado por `infra`
+      (contrato BTGConnectAI-sandbox-HttpApiId). Aquí se le añade la Integration
+      AWS_PROXY hacia webhook-receiver, la Route POST /webhook/twilio y el permiso
+      de invocación.
+
+  # ── SQS (inbound FIFO queue creada por `infra`) ──────────────────────────
+  InboundQueueArn:
+    Type: String
+    Description: >-
+      ARN de la inbound FIFO queue (contrato BTGConnectAI-sandbox-InboundQueueArn).
+      Fuente del EventSourceMapping del message-processor.
+
+  InboundQueueUrl:
+    Type: String
+    Description: >-
+      URL de la inbound FIFO queue (contrato BTGConnectAI-sandbox-InboundQueueUrl).
+      Inyectada como env var INBOUND_QUEUE_URL en el webhook-receiver para encolar
+      los mensajes entrantes.
+
+  # ── Secrets (creado por `infra`) ─────────────────────────────────────────
+  TwilioSecretArn:
+    Type: String
+    Description: >-
+      ARN del secreto de Twilio en Secrets Manager
+      (contrato BTGConnectAI-sandbox-TwilioSecretArn). Inyectado como env var
+      TWILIO_SECRET_ARN (validación de firma y credenciales de Twilio).
+
+  # ── DynamoDB (creadas por `infra`) ───────────────────────────────────────
+  ConsentTableName:
+    Type: String
+    Description: Nombre de la tabla Consent_Store. Env var CONSENT_TABLE_NAME.
+
+  AuthTableName:
+    Type: String
+    Description: Nombre de la tabla Auth_Session. Env var AUTH_TABLE_NAME.
+
+  OtpTableName:
+    Type: String
+    Description: Nombre de la tabla OTP_Store. Env var OTP_TABLE_NAME.
+
+  # ── S3 (creados por `infra`) ─────────────────────────────────────────────
+  StatementBucketName:
+    Type: String
+    Description: Nombre del Statement_Bucket. Env var STATEMENT_BUCKET_NAME.
+
+  AudioTempBucketName:
+    Type: String
+    Description: Nombre del bucket Audio_Temp. Env var AUDIO_TEMP_BUCKET.
+
+  # ── Strands_Agent Lambda (Output de lambda-ai-agent.yaml) ────────────────
+  AiAgentFunctionArn:
+    Type: String
+    Description: >-
+      ARN de la Strands_Agent Lambda (Output de lambda-ai-agent.yaml). Inyectado
+      como env var AI_AGENT_FUNCTION_NAME para que el message-processor invoque al
+      agente de forma síncrona (RequestResponse).
+
+  # ── IAM (roles definidos en iam.yaml) ────────────────────────────────────
+  WebhookReceiverRoleArn:
+    Type: String
+    Description: >-
+      ARN del IAM role del webhook-receiver (definido en iam.yaml). Least
+      privilege: sqs:SendMessage sobre la inbound queue, secretsmanager:GetSecretValue
+      sobre el secreto de Twilio y AWSLambdaBasicExecutionRole.
+
+  MessageProcessorRoleArn:
+    Type: String
+    Description: >-
+      ARN del IAM role del message-processor (definido en iam.yaml). Least
+      privilege: sqs:Receive/Delete/GetAttributes sobre la inbound queue, acceso a
+      las tablas/buckets, lambda:InvokeFunction sobre el Strands_Agent y
+      AWSLambdaBasicExecutionRole.
+
+  AuthServiceRoleArn:
+    Type: String
+    Description: >-
+      ARN del IAM role del auth-service (definido en iam.yaml). Least privilege:
+      acceso a la tabla Auth_Session y AWSLambdaBasicExecutionRole.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupación de parámetros en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Empaquetado del código'
+        Parameters:
+          - LambdaArtifactsBucketName
+          - LambdaCodeKey
+          - SharedLayerArn
+      - Label:
+          default: 'Contrato cross-stack: API Gateway / SQS / Secrets'
+        Parameters:
+          - HttpApiId
+          - InboundQueueArn
+          - InboundQueueUrl
+          - TwilioSecretArn
+      - Label:
+          default: 'Contrato cross-stack: DynamoDB / S3'
+        Parameters:
+          - ConsentTableName
+          - AuthTableName
+          - OtpTableName
+          - StatementBucketName
+          - AudioTempBucketName
+      - Label:
+          default: 'Strands_Agent'
+        Parameters:
+          - AiAgentFunctionArn
+      - Label:
+          default: 'IAM'
+        Parameters:
+          - WebhookReceiverRoleArn
+          - MessageProcessorRoleArn
+          - AuthServiceRoleArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Webhook_Receiver Lambda ─────────────────────────────────────────────────
+  # Recibe el webhook de Twilio (vía HTTP API), valida la firma, parsea el mensaje
+  # y lo encola en la inbound FIFO queue. FUERA de VPC: solo necesita SQS +
+  # Secrets Manager. Handler: el código vive en el paquete `webhook_receiver`
+  # (imports relativos), entry point webhook_receiver.handler.handler.
+  WebhookReceiverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-webhook-receiver'
+      Description: >-
+        Recibe el webhook de Twilio (HTTP API), valida la firma X-Twilio-Signature,
+        parsea el mensaje entrante y lo encola en la inbound FIFO queue.
+      Runtime: python3.13
+      Handler: webhook_receiver.handler.handler
+      MemorySize: 256
+      Timeout: 10
+      Role: !Ref WebhookReceiverRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/webhook-receiver-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          INBOUND_QUEUE_URL: !Ref InboundQueueUrl
+          TWILIO_SECRET_ARN: !Ref TwilioSecretArn
+          POWERTOOLS_SERVICE_NAME: webhook-receiver
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Message_Processor Lambda ────────────────────────────────────────────────
+  # Consume la inbound FIFO queue (vía EventSourceMapping), gestiona consentimiento,
+  # autenticación, transcripción de audio e invoca al Strands_Agent. FUERA de VPC.
+  # Handler: paquete `message_processor`, entry point message_processor.handler.handler.
+  MessageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-message-processor'
+      Description: >-
+        Consume la inbound FIFO queue, orquesta consentimiento / auth /
+        transcripción e invoca al Strands_Agent, devolviendo la respuesta al
+        cliente vía Twilio (con partial-batch-failure reporting).
+      Runtime: python3.13
+      Handler: message_processor.handler.handler
+      MemorySize: 512
+      Timeout: 120
+      Role: !Ref MessageProcessorRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/message-processor-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          CONSENT_TABLE_NAME: !Ref ConsentTableName
+          AUTH_TABLE_NAME: !Ref AuthTableName
+          OTP_TABLE_NAME: !Ref OtpTableName
+          STATEMENT_BUCKET_NAME: !Ref StatementBucketName
+          AUDIO_TEMP_BUCKET: !Ref AudioTempBucketName
+          TWILIO_SECRET_ARN: !Ref TwilioSecretArn
+          AI_AGENT_FUNCTION_NAME: !Ref AiAgentFunctionArn
+          POWERTOOLS_SERVICE_NAME: message-processor
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── EventSourceMapping: inbound FIFO queue → Message_Processor ──────────────
+  # BatchSize 1 (orden estricto por sesión), ReportBatchItemFailures (partial
+  # batch failure, Req 3.9) y MaximumConcurrency 10 (controla el fan-out FIFO).
+  InboundQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref InboundQueueArn
+      FunctionName: !Ref MessageProcessorFunction
+      Enabled: true
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      ScalingConfig:
+        MaximumConcurrency: 10
+
+  # ── Auth_Service Lambda ─────────────────────────────────────────────────────
+  # Endpoint de login mock detrás de una Function URL (no API Gateway), con CORS.
+  # FUERA de VPC. Handler: paquete `auth_service`, entry point auth_service.handler.handler.
+  AuthServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-auth-service'
+      Description: >-
+        Servicio de login mock que respalda el Login_Page. Valida el callback token
+        firmado, comprueba credenciales y crea la Auth_Session. Expuesto vía Lambda
+        Function URL con CORS.
+      Runtime: python3.13
+      Handler: auth_service.handler.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref AuthServiceRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/auth-service-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          AUTH_TABLE_NAME: !Ref AuthTableName
+          POWERTOOLS_SERVICE_NAME: auth-service
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Function URL del Auth_Service (con CORS para el Login_Page) ─────────────
+  AuthServiceFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref AuthServiceFunction
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - content-type
+        MaxAge: 300
+
+  # Permiso público para invocar la Function URL del Auth_Service (AuthType NONE).
+  AuthServiceFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthServiceFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # ── API Gateway wiring: Integration + Route + Permission ────────────────────
+  # El HTTP API lo crea `infra`; aquí se conecta la Lambda webhook-receiver.
+  WebhookReceiverIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookReceiverFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  WebhookReceiverRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: 'POST /webhook/twilio'
+      Target: !Sub 'integrations/${WebhookReceiverIntegration}'
+
+  # Permiso para que API Gateway invoque la Lambda webhook-receiver en esa ruta.
+  WebhookReceiverApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookReceiverFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApiId}/*/*/webhook/twilio'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  WebhookReceiverFunctionArn:
+    Description: ARN de la Lambda webhook-receiver.
+    Value: !GetAtt WebhookReceiverFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-WebhookReceiverFunctionArn'
+
+  WebhookReceiverFunctionName:
+    Description: Nombre de la Lambda webhook-receiver.
+    Value: !Ref WebhookReceiverFunction
+
+  MessageProcessorFunctionArn:
+    Description: ARN de la Lambda message-processor.
+    Value: !GetAtt MessageProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-MessageProcessorFunctionArn'
+
+  MessageProcessorFunctionName:
+    Description: Nombre de la Lambda message-processor.
+    Value: !Ref MessageProcessorFunction
+
+  AuthServiceFunctionArn:
+    Description: ARN de la Lambda auth-service.
+    Value: !GetAtt AuthServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AuthServiceFunctionArn'
+
+  AuthServiceFunctionName:
+    Description: Nombre de la Lambda auth-service.
+    Value: !Ref AuthServiceFunction
+
+  AuthServiceFunctionUrl:
+    Description: Function URL pública del auth-service (consumida por el Login_Page).
+    Value: !GetAtt AuthServiceFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AuthServiceFunctionUrl'

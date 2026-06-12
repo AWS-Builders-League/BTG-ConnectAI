@@ -943,7 +943,7 @@ def generate_statement(params: dict) -> dict:
 **Memory:** 512 MB  
 **Timeout:** 60 seconds  
 **Trigger:** Lambda InvokeFunction desde Message_Processor (sync)  
-**Foundation Model:** Claude 3.5 Haiku via Bedrock (anthropic.claude-3-5-haiku-20241022-v1:0)  
+**Foundation Model:** Claude Haiku 4.5 via Bedrock (us.anthropic.claude-haiku-4-5-20251001-v1:0, inference profile)  
 **Session Strategy:** sessionId derivado del número de teléfono — Strands mantiene historial en memoria de sesión  
 **Guardrails:** Bedrock Guardrails aplicados sobre el modelo (content filtering + topic policies)
 

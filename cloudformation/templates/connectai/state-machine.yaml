@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - TransferBrebStateMachine (AWS Step Functions, Standard
+  Workflow). Orquesta el flujo de transferencia BRE-B con autorizacion OTP
+  (patron waitForTaskToken). La definicion ASL vive versionada en el repo
+  (cloudformation/state-machines/transfer-breb.asl.json) y se referencia via
+  DefinitionS3Location desde el bucket de artefactos de `infra`. Los ARNs de las
+  Lambdas locales (tasks del workflow) y las URLs de las colas email/sms del
+  contrato cross-stack se inyectan en deploy-time via DefinitionSubstitutions.
+  El rol de ejecucion del state machine se define en iam.yaml y se pasa como
+  parametro desde el stack raiz.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Convencion del contrato (ver design.md):
+#   - Export CFN:   ${ProjectName}-${Environment}-<Recurso>
+#   - Namespace SSM: /btgconnectai/sandbox/...
+#
+# Los ARNs de las Lambdas locales (ValidateTransfer, OtpService, ExecuteTransfer,
+# message-handler-notify) los crean los templates hermanos (lambdas-actions.yaml
+# y lambdas-notify.yaml) y se pasan por el stack raiz. Las URLs de las colas de
+# notificacion (email/sms) y el ARN del SNS de alarmas provienen del contrato de
+# `infra`. El rol del state machine se define en iam.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convencion de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  # ── Definicion ASL (artefacto en S3, creado en la Task 10.1) ────────────────
+  LambdaArtifactsBucketName:
+    Type: String
+    Description: >-
+      Nombre del bucket de artefactos (creado por `infra`) donde el pipeline sube
+      la definicion ASL versionada del state machine. Pasado desde el stack raiz.
+
+  StateMachineDefinitionS3Key:
+    Type: String
+    Description: >-
+      Key (git-sha) del objeto con la definicion ASL en el bucket de artefactos.
+      Ej: state-machines/transfer-breb-<git-sha>.asl.json. Corresponde al archivo
+      versionado cloudformation/state-machines/transfer-breb.asl.json.
+
+  # ── Rol de ejecucion (definido en iam.yaml) ─────────────────────────────────
+  StateMachineRoleArn:
+    Type: String
+    Description: >-
+      ARN del rol de ejecucion del state machine (definido en iam.yaml). Concede
+      lambda:InvokeFunction sobre las tasks locales, sqs:SendMessage sobre las
+      colas email/sms del contrato y permisos de CloudWatch Logs (vended logs).
+
+  # ── ARNs de las Lambdas locales (tasks del workflow) ────────────────────────
+  ValidateTransferFunctionArn:
+    Type: String
+    Description: ARN de la Lambda transfer-breb-validate (estado ValidateTransfer).
+
+  OtpServiceFunctionArn:
+    Type: String
+    Description: >-
+      ARN de la Lambda otp-service (estado GenerateOTP, invocada via
+      waitForTaskToken).
+
+  ExecuteTransferFunctionArn:
+    Type: String
+    Description: ARN de la Lambda transfer-breb-execute (estado ExecuteTransfer).
+
+  NotifyFunctionArn:
+    Type: String
+    Description: >-
+      ARN de la Lambda message-handler-notify (estados NotifyUserSuccess /
+      NotifyValidationFailed / NotifyOTPExpired / NotifyOTPBlocked /
+      NotifyTransferFailed).
+
+  # ── Colas de notificacion (del contrato de `infra`) ─────────────────────────
+  EmailQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/email-url'
+    Description: >-
+      URL de la email-notification-queue (estado PublishEmailEvent).
+      Export BTGConnectAI-sandbox-EmailQueueUrl.
+
+  SmsQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/sms-url'
+    Description: >-
+      URL de la sms-notification-queue (estado PublishSmsEvent).
+      Export BTGConnectAI-sandbox-SmsQueueUrl.
+
+  # ── SNS de alarmas (del contrato de `infra`) ────────────────────────────────
+  AlarmsTopicArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sns/alarms-arn'
+    Description: >-
+      ARN del SNS topic de alarmas. Destino de la alarma ExecutionsFailed.
+      Export BTGConnectAI-sandbox-AlarmsTopicArn.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupacion de parametros en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Definicion ASL y rol'
+        Parameters:
+          - LambdaArtifactsBucketName
+          - StateMachineDefinitionS3Key
+          - StateMachineRoleArn
+      - Label:
+          default: 'Lambdas locales (tasks del workflow)'
+        Parameters:
+          - ValidateTransferFunctionArn
+          - OtpServiceFunctionArn
+          - ExecuteTransferFunctionArn
+          - NotifyFunctionArn
+      - Label:
+          default: 'Contrato cross-stack: SQS / SNS'
+        Parameters:
+          - EmailQueueUrl
+          - SmsQueueUrl
+          - AlarmsTopicArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Log group del state machine (retencion 90 dias, Req 18.1/18.5) ──────────
+  # El prefijo /aws/vendedlogs/states/ es el requerido por Step Functions para
+  # entregar logs de ejecucion (vended logs).
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-${Environment}-TransferBrebStateMachine'
+      RetentionInDays: 90
+
+  # ── State machine (Standard Workflow, Req 18.1/18.2/18.3/18.4) ──────────────
+  TransferBrebStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-TransferBrebStateMachine'
+      StateMachineType: STANDARD
+      RoleArn: !Ref StateMachineRoleArn
+      # Definicion ASL versionada en el repo (Task 10.1), referenciada desde el
+      # bucket de artefactos. Los tokens ${...} de la ASL se resuelven via
+      # DefinitionSubstitutions en deploy-time (no se hardcodea ningun ARN/URL).
+      DefinitionS3Location:
+        Bucket: !Ref LambdaArtifactsBucketName
+        Key: !Ref StateMachineDefinitionS3Key
+      DefinitionSubstitutions:
+        ValidateTransferFunctionArn: !Ref ValidateTransferFunctionArn
+        OtpServiceFunctionArn: !Ref OtpServiceFunctionArn
+        ExecuteTransferFunctionArn: !Ref ExecuteTransferFunctionArn
+        NotifyFunctionArn: !Ref NotifyFunctionArn
+        EmailNotificationQueueUrl: !Ref EmailQueueUrl
+        SmsNotificationQueueUrl: !Ref SmsQueueUrl
+      # Logging CloudWatch nivel ALL con datos de ejecucion (Req 18.5).
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── Alarma CloudWatch: ExecutionsFailed > 5 en 5 min (Req 18.6) ─────────────
+  ExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-TransferBrebStateMachine-ExecutionsFailed'
+      AlarmDescription: >-
+        Alarma cuando ExecutionsFailed del TransferBrebStateMachine supera 5 en
+        una ventana de 5 minutos.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TransferBrebStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmsTopicArn
+      OKActions:
+        - !Ref AlarmsTopicArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  StateMachineArn:
+    Description: ARN del TransferBrebStateMachine (consumido por transfer-breb-initiator).
+    Value: !Ref TransferBrebStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TransferBrebStateMachineArn'
+
+  StateMachineName:
+    Description: Nombre del TransferBrebStateMachine.
+    Value: !GetAtt TransferBrebStateMachine.Name
+
+  StateMachineLogGroupName:
+    Description: Nombre del log group de ejecucion del state machine.
+    Value: !Ref StateMachineLogGroup

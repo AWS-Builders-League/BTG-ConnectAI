@@ -1,0 +1,49 @@
+[project]
+name = "btg-connect-ai"
+version = "0.1.0"
+description = "BTG ConnectAI MVP — conversational banking assistant for WhatsApp (Twilio + API Gateway + Strands Agent on Bedrock)"
+requires-python = ">=3.13"
+readme = "README.md"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["src/tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["src"]
+addopts = "-ra -q"
+markers = [
+    "unit: fast, isolated unit tests",
+    "property: hypothesis property-based tests",
+    "integration: integration tests touching mocked AWS services",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["shared"]

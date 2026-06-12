@@ -1,0 +1,9 @@
+# Development & CI dependencies for BTG ConnectAI (Python 3.13)
+-r requirements.txt
+
+pytest
+hypothesis
+moto
+boto3-stubs
+cfn-lint
+checkov

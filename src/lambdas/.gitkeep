@@ -1,0 +1,1 @@
+# Lambda handlers live here, one folder per Lambda: src/lambdas/<name>/handler.py

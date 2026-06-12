@@ -1,0 +1,2 @@
+# Shared utilities packaged as a common Lambda Layer (created in Task 1.2):
+# logger.py, masking.py, constants.py, types.py, formatting.py, errors.py

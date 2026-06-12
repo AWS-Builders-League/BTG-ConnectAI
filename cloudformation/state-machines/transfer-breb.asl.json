@@ -1,0 +1,259 @@
+{
+  "Comment": "TransferBrebStateMachine - Flujo de transferencia BRE-B con autorizacion OTP (waitForTaskToken). Todos los ARNs/URLs son tokens de DefinitionSubstitutions reemplazados por CloudFormation en deploy.",
+  "StartAt": "ValidateTransfer",
+  "States": {
+    "ValidateTransfer": {
+      "Type": "Task",
+      "Resource": "${ValidateTransferFunctionArn}",
+      "ResultPath": "$.validation",
+      "Next": "GenerateOTP",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["InsufficientFundsError", "InvalidDestinationError"],
+          "ResultPath": "$.error",
+          "Next": "NotifyValidationFailed"
+        }
+      ]
+    },
+    "GenerateOTP": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${OtpServiceFunctionArn}",
+        "Payload": {
+          "operation": "generate-and-wait",
+          "phoneNumber.$": "$.phoneNumber",
+          "transferAmount.$": "$.amount",
+          "destinationAccount.$": "$.destinationAccount",
+          "taskToken.$": "$$.Task.Token",
+          "executionArn.$": "$$.Execution.Id"
+        }
+      },
+      "HeartbeatSeconds": 300,
+      "ResultPath": "$.otpResult",
+      "Next": "ValidateOTP",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "Next": "NotifyOTPExpired"
+        },
+        {
+          "ErrorEquals": ["OTPBlockedError"],
+          "Next": "NotifyOTPBlocked"
+        }
+      ]
+    },
+    "ValidateOTP": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.otpResult.valid",
+          "BooleanEquals": true,
+          "Next": "ExecuteTransfer"
+        }
+      ],
+      "Default": "NotifyOTPExpired"
+    },
+    "ExecuteTransfer": {
+      "Type": "Task",
+      "Resource": "${ExecuteTransferFunctionArn}",
+      "ResultPath": "$.receipt",
+      "Next": "PublishNotifications",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyTransferFailed"
+        }
+      ]
+    },
+    "PublishNotifications": {
+      "Type": "Parallel",
+      "ResultPath": "$.notifications",
+      "Branches": [
+        {
+          "StartAt": "PublishEmailEvent",
+          "States": {
+            "PublishEmailEvent": {
+              "Comment": "Email-branch message shape alineada con Email_Service que lee event['to'] y event['payload']. El iniciador del workflow (transfer-breb-initiator) DEBE incluir clientEmail en el input de la ejecucion, resuelto desde Mock_Core/auth.",
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${EmailNotificationQueueUrl}",
+                "MessageBody": {
+                  "type": "transfer_confirmation",
+                  "to.$": "$.clientEmail",
+                  "payload.$": "$.receipt",
+                  "correlationId.$": "$.correlationId"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "PublishSmsEvent",
+          "States": {
+            "PublishSmsEvent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${SmsNotificationQueueUrl}",
+                "MessageBody": {
+                  "type": "transfer_confirmation",
+                  "phoneNumber.$": "$.phoneNumber",
+                  "amount.$": "$.amount",
+                  "correlationId.$": "$.correlationId"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "NotifyUserSuccess"
+    },
+    "NotifyUserSuccess": {
+      "Type": "Task",
+      "Resource": "${NotifyFunctionArn}",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "transfer_success",
+        "receipt.$": "$.receipt"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "NotifyValidationFailed": {
+      "Type": "Task",
+      "Resource": "${NotifyFunctionArn}",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "validation_failed",
+        "error.$": "$.error"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "NotifyOTPExpired": {
+      "Type": "Task",
+      "Resource": "${NotifyFunctionArn}",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "otp_expired"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "NotifyOTPBlocked": {
+      "Type": "Task",
+      "Resource": "${NotifyFunctionArn}",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "otp_blocked"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "NotifyTransferFailed": {
+      "Type": "Task",
+      "Resource": "${NotifyFunctionArn}",
+      "Parameters": {
+        "phoneNumber.$": "$.phoneNumber",
+        "messageType": "transfer_failed"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  BTG ConnectAI MVP - Strands_Agent Lambda (Conversational_Agent).
+  Nested stack de cómputo: define SOLO la Lambda del agente Strands
+  (Claude 3.5 Haiku sobre Amazon Bedrock). El Guardrail lo crea el repo `infra`;
+  aquí se referencia vía el contrato cross-stack (GuardrailId/GuardrailVersion).
+  No hay Bedrock Agent Core: el agente invoca el modelo directamente. La función corre
+  FUERA de VPC (solo necesita Bedrock + Lambda invoke de las tools). El IAM role,
+  el SharedLayer y los nombres de las Action Group Lambdas se reciben como
+  parámetros del stack raíz (mismo patrón que las demás nested stacks de cómputo).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+#
+# Estos valores se pasan desde el stack raíz (connectai-app.yaml), que a su vez
+# los resuelve del contrato cross-stack publicado por `infra` (SSM /
+# Fn::ImportValue) y/o de los Outputs de otras nested stacks de la app
+# (iam.yaml para el role, lambdas-actions.yaml para los nombres de las tools, el
+# template del SharedLayer para su ARN).
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  # ── Identidad de la app ──────────────────────────────────────────────────
+  ProjectName:
+    Type: String
+    Default: 'BTGConnectAI'
+    Description: Nombre del proyecto (prefijo de la convención de naming del contrato).
+
+  Environment:
+    Type: String
+    Default: 'sandbox'
+    AllowedValues: ['sandbox', 'staging', 'prod']
+    Description: Entorno de despliegue.
+
+  # ── Empaquetado del código (bucket de artefactos de `infra`) ─────────────
+  LambdaArtifactsBucketName:
+    Type: String
+    Description: >-
+      Nombre del bucket de artefactos de Lambda creado por `infra`
+      (contrato BTGConnectAI-sandbox-LambdaArtifactsBucketName). El pipeline
+      sube aquí el ZIP del código del agente y este template lo referencia en
+      Code.S3Bucket.
+
+  LambdaCodeKey:
+    Type: String
+    Description: >-
+      Git-sha de los artefactos de Lambda. El S3Key se construye con la
+      convención lambdas/ai-agent-<git-sha>.zip.
+
+  SharedLayerArn:
+    Type: String
+    Description: >-
+      ARN (con versión) del Lambda Layer compartido (deps pip + código
+      src/shared/). Creado por la app y pasado desde el stack raíz.
+
+  # ── IAM (role definido en iam.yaml) ──────────────────────────────────────
+  AiAgentRoleArn:
+    Type: String
+    Description: >-
+      ARN del IAM role del Strands_Agent (definido en iam.yaml). Least privilege:
+      Bedrock InvokeModel + ApplyGuardrail (sobre GuardrailId del
+      contrato) + lambda:InvokeFunction de las Action Group Lambdas (tools) +
+      AWSLambdaBasicExecutionRole. Esta nested stack NO define el role: lo
+      referencia para mantener la separación de responsabilidades del reparto.
+
+  # ── Bedrock / Guardrails (creados por `infra`, vía contrato) ─────────────
+  BedrockModelId:
+    Type: String
+    Default: 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
+    Description: >-
+      Modelo de Bedrock (Claude Haiku 4.5, via inference profile us.*). Inyectado
+      como env var BEDROCK_MODEL_ID para el agente Strands. Haiku 4.5 no admite
+      on-demand con el id "pelado": debe usarse el inference profile us.* .
+
+  GuardrailId:
+    Type: String
+    Description: >-
+      ID del Bedrock Guardrail (contrato BTGConnectAI-sandbox-GuardrailId, creado
+      por `infra`). Se aplica sobre el modelo vía env var GUARDRAIL_ID.
+
+  GuardrailVersion:
+    Type: String
+    Description: >-
+      Versión del Bedrock Guardrail (contrato BTGConnectAI-sandbox-GuardrailVersion).
+      Se aplica sobre el modelo vía env var GUARDRAIL_VERSION.
+
+  # ── Action Group Lambdas (tools) — recursos locales de la app ────────────
+  BalanceQueryFunctionName:
+    Type: String
+    Description: >-
+      Nombre/ARN de la Lambda balance-query (Output de lambdas-actions.yaml).
+      Inyectado como env var BALANCE_QUERY_FUNCTION_NAME para la tool query_balance.
+
+  TransferInitiatorFunctionName:
+    Type: String
+    Description: >-
+      Nombre/ARN de la Lambda transfer-breb-initiator (Output de lambdas-actions.yaml).
+      Inyectado como env var TRANSFER_INITIATOR_FUNCTION_NAME para la tool
+      initiate_transfer_breb.
+
+  StatementGeneratorFunctionName:
+    Type: String
+    Description: >-
+      Nombre/ARN de la Lambda statement-generator (Output de lambdas-actions.yaml).
+      Inyectado como env var STATEMENT_GENERATOR_FUNCTION_NAME para la tool
+      generate_statement.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata - agrupación de parámetros en la consola de CloudFormation
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'App'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Empaquetado del código'
+        Parameters:
+          - LambdaArtifactsBucketName
+          - LambdaCodeKey
+          - SharedLayerArn
+      - Label:
+          default: 'IAM'
+        Parameters:
+          - AiAgentRoleArn
+      - Label:
+          default: 'Bedrock / Guardrails (contrato de infra)'
+        Parameters:
+          - BedrockModelId
+          - GuardrailId
+          - GuardrailVersion
+      - Label:
+          default: 'Action Group Lambdas (tools)'
+        Parameters:
+          - BalanceQueryFunctionName
+          - TransferInitiatorFunctionName
+          - StatementGeneratorFunctionName
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # Strands_Agent Lambda (Conversational_Agent).
+  # - Runtime: python3.13 | MemorySize: 512 | Timeout: 60
+  # - SIN VpcConfig: solo necesita Bedrock (InvokeModel/ApplyGuardrail) y
+  #   lambda:InvokeFunction hacia las Action Group Lambdas; corre en la red
+  #   managed de Lambda (segura por IAM).
+  # - Code: ZIP en el bucket de artefactos de `infra`; usa el SharedLayer.
+  # - Handler: el código vive en el paquete `ai_agent` (relative imports
+  #   `from . import tools`), por lo que el entry point es ai_agent.handler.handler.
+  AiAgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-strands-agent'
+      Description: >-
+        Strands_Agent (Claude 3.5 Haiku sobre Bedrock). Interpreta intenciones en
+        español, orquesta las tools (balance-query, transfer-breb-initiator,
+        statement-generator) y aplica los Guardrails de `infra`.
+      Runtime: python3.13
+      Handler: ai_agent.handler.handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !Ref AiAgentRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/ai-agent-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          GUARDRAIL_ID: !Ref GuardrailId
+          GUARDRAIL_VERSION: !Ref GuardrailVersion
+          BALANCE_QUERY_FUNCTION_NAME: !Ref BalanceQueryFunctionName
+          TRANSFER_INITIATOR_FUNCTION_NAME: !Ref TransferInitiatorFunctionName
+          STATEMENT_GENERATOR_FUNCTION_NAME: !Ref StatementGeneratorFunctionName
+          POWERTOOLS_SERVICE_NAME: ai-agent
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+#
+# El stack raíz los consume para wiring downstream: el Message_Processor recibe
+# el ARN como STRANDS_AGENT_LAMBDA_ARN (y su role el lambda:InvokeFunction sobre
+# este ARN); el repo `infra` puede consumir el ARN para configurar Action Groups
+# si aplica.
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  AiAgentFunctionArn:
+    Description: ARN de la Strands_Agent Lambda.
+    Value: !GetAtt AiAgentFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AiAgentFunctionArn'
+
+  AiAgentFunctionName:
+    Description: Nombre de la Strands_Agent Lambda.
+    Value: !Ref AiAgentFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AiAgentFunctionName'

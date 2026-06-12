@@ -1,0 +1,2 @@
+# Root app stack lives here (created in Task 2):
+# connectai-app.yaml (nested-stack root that consumes the infra cross-stack contract)
