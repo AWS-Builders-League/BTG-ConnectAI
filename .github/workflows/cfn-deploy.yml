@@ -149,27 +149,48 @@ jobs:
           bash layer/build.sh
           test -f layer/shared-layer.zip
 
-      # ── 5b. Zip de cada Lambda en src/lambdas/* ─────────────────────────────
+      # ── 5b. Zip de cada Lambda (mapeo key->paquete) ─────────────────────────
+      # El ZIP debe contener el PAQUETE en su raiz para que el Handler
+      # "<paquete>.<modulo>.handler" resuelva (incluye imports relativos como
+      # `from . import tools`). El nombre del key usa guiones y coincide EXACTO
+      # con el S3Key que referencian los templates (lambdas/<key>-<sha>.zip).
+      # transfer_breb es un solo paquete con 3 handlers -> 3 keys distintos.
       - name: Package Lambda functions
+        shell: bash
         run: |
           set -euo pipefail
           DIST_DIR="${GITHUB_WORKSPACE}/dist/lambdas"
           mkdir -p "${DIST_DIR}"
 
-          for fn_dir in src/lambdas/*/; do
-            [ -d "${fn_dir}" ] || continue
-            fn_name="$(basename "${fn_dir}")"
-            # Saltar artefactos que no son paquetes de Lambda.
-            if [ ! -f "${fn_dir}handler.py" ] && [ ! -f "${fn_dir}__init__.py" ]; then
-              echo "Omitiendo ${fn_name} (sin handler.py/__init__.py)"
-              continue
+          declare -A MAP=(
+            [webhook-receiver]=webhook_receiver
+            [message-processor]=message_processor
+            [auth-service]=auth_service
+            [balance-query]=balance_query
+            [transfer-breb-validate]=transfer_breb
+            [transfer-breb-execute]=transfer_breb
+            [transfer-breb-initiator]=transfer_breb
+            [statement-generator]=statement_generator
+            [message-handler-notify]=message_handler_notify
+            [otp-service]=otp_service
+            [email-service]=email_service
+            [sms-service]=sms_service
+            [ai-agent]=ai_agent
+          )
+
+          cd src/lambdas
+          for key in "${!MAP[@]}"; do
+            pkg="${MAP[$key]}"
+            if [ ! -d "${pkg}" ]; then
+              echo "ERROR: paquete '${pkg}' no existe en src/lambdas"; exit 1
             fi
-            artifact="${DIST_DIR}/${fn_name}-${LAMBDA_CODE_KEY}.zip"
-            echo "==> Empaquetando ${fn_name} -> ${artifact}"
-            # Zip del contenido del paquete en la raíz del ZIP; excluir caches y tests.
-            ( cd "${fn_dir}" && zip -qr "${artifact}" . \
-                -x '*__pycache__*' -x '*.pyc' -x '*/tests/*' )
+            artifact="${DIST_DIR}/${key}-${LAMBDA_CODE_KEY}.zip"
+            echo "==> ${key}  <-  ${pkg}/"
+            rm -f "${artifact}"
+            zip -qr "${artifact}" "${pkg}" \
+              -x '*__pycache__*' '*.pyc' '*/tests/*'
           done
+          cd "${GITHUB_WORKSPACE}"
 
           echo "Artefactos generados:"
           ls -lh "${DIST_DIR}"
