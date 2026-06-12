@@ -63,6 +63,14 @@ TEST_USERS: list[TestUser] = [
         "document_id": "3030303030",
         "email": "juan.garcia@example.com",
     },
+    {
+        "username": "juan.salgado",
+        "password": "Btg2025**",
+        "phone_number": "+573193928783",
+        "name": "Juan Salgado",
+        "document_id": "4040404040",
+        "email": "juan.salgado@example.com",
+    },
 ]
 
 # Index by username for O(1) lookup.

@@ -120,6 +120,37 @@ MOCK_CLIENTS: list[MockClient] = [
             {"transaction_id": "TRX-008", "account_id": "ACC-005", "date": "2024-12-13T11:00:00Z", "description": "Depósito efectivo", "amount": 500_000, "currency": "COP", "type": "credit"},
         ],
     },
+    {
+        "phone_number": "+573193928783",
+        "name": "Juan Salgado",
+        "email": "juan.salgado@example.com",
+        "document_id": "4040404040",
+        "products": [
+            {
+                "account_id": "ACC-006",
+                "account_number": "1003928783",
+                "product_type": "cuenta_corriente",
+                "product_name": "Cuenta Corriente BTG",
+                "currency": "COP",
+                "available_balance": 7_500_000.00,
+                "total_balance": 7_500_000.00,
+                "cutoff_date": "2024-12-15",
+            },
+            {
+                "account_id": "ACC-007",
+                "account_number": "2003928783",
+                "product_type": "fondo_inversion",
+                "product_name": "Fondo BTG Pactual Liquidez",
+                "currency": "COP",
+                "available_balance": 18_000_000.00,
+                "total_balance": 18_000_000.00,
+                "cutoff_date": "2024-12-15",
+            },
+        ],
+        "transactions": [
+            {"transaction_id": "TRX-009", "account_id": "ACC-006", "date": "2024-12-14T09:00:00Z", "description": "Nómina", "amount": 6_000_000, "currency": "COP", "type": "credit"},
+        ],
+    },
 ]
 
 

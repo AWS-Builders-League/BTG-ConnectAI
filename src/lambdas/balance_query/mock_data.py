@@ -177,6 +177,54 @@ MOCK_CLIENTS: list[MockClient] = [
             },
         ],
     },
+    {
+        "phone_number": "+573193928783",
+        "name": "Juan Salgado",
+        "email": "juan.salgado@example.com",
+        "document_id": "4040404040",
+        "products": [
+            {
+                "account_id": "CC-004",
+                "account_number": "4003928783",
+                "product_type": "cuenta_corriente",
+                "product_name": "Cuenta Corriente BTG",
+                "currency": "COP",
+                "available_balance": 7_500_000.00,
+                "total_balance": 7_500_000.00,
+                "cutoff_date": CUTOFF_DATE,
+            },
+            {
+                "account_id": "FI-004",
+                "account_number": "9003928783",
+                "product_type": "fondo_inversion",
+                "product_name": "Fondo Renta Fija BTG",
+                "currency": "COP",
+                "available_balance": 18_000_000.00,
+                "total_balance": 18_500_000.00,
+                "cutoff_date": CUTOFF_DATE,
+            },
+        ],
+        "transactions": [
+            {
+                "transaction_id": "TX-CC-004-01",
+                "account_id": "CC-004",
+                "date": "2025-01-07T10:00:00-05:00",
+                "description": "Pago nómina enero",
+                "amount": 6_000_000.00,
+                "currency": "COP",
+                "type": "credit",
+            },
+            {
+                "transaction_id": "TX-CC-004-02",
+                "account_id": "CC-004",
+                "date": "2025-01-18T19:30:00-05:00",
+                "description": "Compra en línea",
+                "amount": 450_000.00,
+                "currency": "COP",
+                "type": "debit",
+            },
+        ],
+    },
 ]
 
 
