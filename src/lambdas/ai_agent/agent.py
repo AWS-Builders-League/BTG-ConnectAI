@@ -59,12 +59,15 @@ Environment variables (resolved from the cross-stack contract):
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from strands import Agent
 from strands.models import BedrockModel
 
+from shared.constants import COLOMBIA_TZ
 from shared.logger import get_logger
 
-from .prompts import SYSTEM_PROMPT
+from .prompts import build_system_prompt
 from .tools import TOOLS
 
 logger = get_logger("ai-agent")
@@ -83,7 +86,22 @@ DEFAULT_GUARDRAIL_VERSION: str = "DRAFT"
 DEFAULT_REGION: str = "us-east-1"
 
 # Module-scope cache so warm invocations reuse the same Agent (cold-start saving).
+# Keyed by UTC date: the cached agent carries today's date in its system prompt,
+# so it is rebuilt (at most once per day per warm container) when the date rolls
+# over, keeping the injected FECHA ACTUAL fresh without paying the cost per call.
 _agent: Agent | None = None
+_agent_date: str | None = None
+
+
+def _today_iso() -> str:
+    """Return today's date in Colombia (America/Bogota) as ``AAAA-MM-DD``.
+
+    Colombia local time (UTC-5, no DST) is used — matching the
+    ``statement-generator`` tool's own ``_today()`` — so the agent and the tool
+    always agree on what counts as a future date, and "hoy" matches the client's
+    actual calendar day rather than UTC.
+    """
+    return datetime.now(COLOMBIA_TZ).date().isoformat()
 
 
 def build_agent(session_id: str | None = None, *, force_new: bool = False) -> Agent:
@@ -106,9 +124,13 @@ def build_agent(session_id: str | None = None, *, force_new: bool = False) -> Ag
     Returns:
         A configured :class:`strands.Agent`.
     """
-    global _agent
+    global _agent, _agent_date
 
-    if _agent is not None and not force_new:
+    today_iso = _today_iso()
+
+    # Reuse the cached agent only while it still carries today's date; rebuild it
+    # when the UTC date has rolled over so FECHA ACTUAL never goes stale.
+    if _agent is not None and not force_new and _agent_date == today_iso:
         return _agent
 
     import os
@@ -142,14 +164,20 @@ def build_agent(session_id: str | None = None, *, force_new: bool = False) -> Ag
             "guardrail_applied": bool(guardrail_id),
             "session_id": session_id,
             "tool_count": len(TOOLS),
+            "today": today_iso,
         },
     )
 
     model = BedrockModel(**model_kwargs)
-    agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=TOOLS)
+    agent = Agent(
+        model=model,
+        system_prompt=build_system_prompt(today_iso),
+        tools=TOOLS,
+    )
 
     if not force_new:
         _agent = agent
+        _agent_date = today_iso
 
     return agent
 

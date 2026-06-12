@@ -56,6 +56,7 @@ from typing import Any
 
 import boto3
 
+from shared.constants import COLOMBIA_TZ
 from shared.formatting import format_cop
 from shared.logger import get_logger
 from shared.masking import mask_account
@@ -74,8 +75,13 @@ _PDF_CONTENT_TYPE = "application/pdf"
 
 
 def _today() -> date:
-    """Return today's date (UTC). Isolated so tests can reason about it."""
-    return datetime.utcnow().date()
+    """Return today's date in Colombia (America/Bogota). Isolated for testing.
+
+    Uses Colombia local time (UTC-5, no DST) so the future-date check matches the
+    client's actual calendar day — and agrees with the agent's notion of "today"
+    (both use :data:`shared.constants.COLOMBIA_TZ`).
+    """
+    return datetime.now(COLOMBIA_TZ).date()
 
 
 def _parse_cutoff_date(raw: str | None) -> date | None:

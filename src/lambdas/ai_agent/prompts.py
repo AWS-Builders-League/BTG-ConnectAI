@@ -75,8 +75,12 @@ retorna de inmediato y el sistema envía un código OTP por SMS. NO esperes el O
 en la conversación ni pidas el código tú mismo: informa al cliente que recibirá \
 un OTP por SMS y que debe responderlo para autorizar la transferencia. El \
 sistema procesará ese código por separado.
-10. Para EXTRACTOS: Solicita la fecha de corte. Si el cliente da una fecha \
-futura, informa que debe ser una fecha pasada.
+10. Para EXTRACTOS: deduce la fecha de corte en formato AAAA-MM-DD usando la \
+FECHA ACTUAL indicada arriba como referencia (p. ej. "abril del año pasado", "el \
+mes pasado", "hasta marzo"). Una fecha de corte es válida si es HOY o anterior. \
+NO rechaces fechas por tu cuenta calculando el año de memoria: pásale la fecha a \
+la herramienta generate_statement y deja que ella valide; solo advierte de "fecha \
+futura" si la fecha es claramente posterior a la FECHA ACTUAL indicada arriba.
 11. NO pidas al cliente su número de teléfono: el sistema ya lo conoce y se lo \
 entrega automáticamente a las herramientas.
 12. Cuando presentes transacciones o movimientos, muestra máximo 5 y ofrece ver \
@@ -90,4 +94,38 @@ FORMATO DE RESPUESTA:
 """
 
 
-__all__ = ["SYSTEM_PROMPT", "SERVICES_MENU", "REFERENTIAL_DISCLAIMER"]
+def build_system_prompt(today_iso: str) -> str:
+    """Return the system prompt with the current date injected at the top.
+
+    Claude has no inherent knowledge of "today", so without this it judges
+    past/future dates against its training-cutoff notion of the present and
+    wrongly flags valid past dates (e.g. an April-2025 statement) as future.
+    Prepending an authoritative FECHA ACTUAL lets the model resolve relative
+    dates ("el mes pasado", "abril del año pasado") and decide past-vs-future
+    correctly; the ``generate_statement`` tool remains the final validator.
+
+    Args:
+        today_iso: Today's date as an ISO ``AAAA-MM-DD`` string (UTC, matching
+            the tool's own ``_today()`` so the agent and the tool never disagree
+            on what "future" means).
+
+    Returns:
+        The full system prompt string with the temporal context header.
+    """
+    header = (
+        "CONTEXTO TEMPORAL (autoritativo):\n"
+        f"- La fecha de HOY es {today_iso} (formato AAAA-MM-DD).\n"
+        "- Usa SIEMPRE esta fecha como referencia para interpretar fechas "
+        "relativas y para decidir si una fecha es pasada o futura.\n"
+        "- NUNCA asumas el año ni el mes actual de memoria: usa exclusivamente la "
+        "fecha de HOY indicada aquí.\n\n"
+    )
+    return header + SYSTEM_PROMPT
+
+
+__all__ = [
+    "SYSTEM_PROMPT",
+    "SERVICES_MENU",
+    "REFERENTIAL_DISCLAIMER",
+    "build_system_prompt",
+]

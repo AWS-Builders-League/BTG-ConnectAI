@@ -34,7 +34,7 @@ shared, persistent bucket:
     handler embeds a ``uuid4`` in the key), so examples never collide; we verify
     the *returned* key exists and its body is a real PDF.
 
-"today" is the handler's ``_today()`` (UTC date). We compute the future/past
+"today" is the handler's ``_today()`` (Colombia/America-Bogota date). We compute the future/past
 date boundaries from it once at import so the generated dates are always
 strictly future (today + 1 .. today + 3650) or strictly past
 (2024-01-01 .. today - 1), avoiding midnight-boundary flakiness.

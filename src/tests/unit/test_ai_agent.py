@@ -63,6 +63,7 @@ from lambdas.ai_agent.prompts import (  # noqa: E402
     REFERENTIAL_DISCLAIMER,
     SERVICES_MENU,
     SYSTEM_PROMPT,
+    build_system_prompt,
 )
 
 pytestmark = pytest.mark.unit
@@ -357,6 +358,35 @@ class TestOutOfDomainDeclined:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Current-date injection (so the model never misjudges past vs future)
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentDateInjection:
+    def test_build_system_prompt_injects_today_and_keeps_base(self) -> None:
+        prompt = build_system_prompt("2026-06-12")
+
+        # The supplied date is present as the authoritative reference...
+        assert "2026-06-12" in prompt
+        assert "fecha de hoy" in prompt.lower()
+        # ...and the full base behaviour contract is preserved underneath.
+        assert prompt.endswith(SYSTEM_PROMPT)
+
+    def test_statement_rule_defers_future_check_to_tool(self) -> None:
+        # The extract rule must tell the model to use today's date and let the
+        # tool validate, instead of guessing the year from memory.
+        prompt = build_system_prompt("2026-06-12").lower()
+        assert "generate_statement" in prompt
+        assert "fecha actual" in prompt
+
+    def test_agent_today_is_iso_colombia(self) -> None:
+        # The agent's notion of "today" is ISO YYYY-MM-DD in Colombia local time,
+        # matching the statement-generator tool so they never disagree on "future".
+        today = agent_mod._today_iso()
+        assert len(today) == 10 and today[4] == "-" and today[7] == "-"
+
+
+# ---------------------------------------------------------------------------
 # 4. Guardrails block (Requirement 12.6)
 # ---------------------------------------------------------------------------
 
@@ -396,7 +426,14 @@ class TestGuardrails:
         assert model_kwargs["model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
         # The agent wires the Spanish system prompt and the three banking tools.
         agent_kwargs = _CaptureAgent.last_kwargs
-        assert agent_kwargs["system_prompt"] == SYSTEM_PROMPT
+        system_prompt = agent_kwargs["system_prompt"]
+        # The base behaviour contract is preserved...
+        assert system_prompt.endswith(SYSTEM_PROMPT)
+        # ...with an authoritative current-date header injected on top so the
+        # model judges past/future dates correctly (today is supplied, not guessed).
+        assert "FECHA de HOY".lower() in system_prompt.lower()
+        today = agent_mod._today_iso()
+        assert today in system_prompt
         assert agent_kwargs["tools"] == tools_mod.TOOLS
 
     def test_build_agent_omits_guardrail_when_unset(self, monkeypatch) -> None:
