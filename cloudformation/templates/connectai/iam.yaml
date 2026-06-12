@@ -200,9 +200,13 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                 Resource: !Ref ConsentTableArn
-              # DynamoDB: Auth_Session (solo lectura para validar la sesion)
+              # DynamoDB: Auth_Session (validar sesion + guardar/limpiar el
+              # pending request mientras el cliente se autentica)
               - Effect: Allow
-                Action: dynamodb:GetItem
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
                 Resource: !Ref AuthTableArn
               # DynamoDB: OTP_Store (callback del OTP: leer/actualizar intentos/borrar)
               - Effect: Allow
