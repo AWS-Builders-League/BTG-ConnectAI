@@ -48,6 +48,9 @@ _ENV_FROM_SECRET = {
     "TWILIO_ACCOUNT_SID": "account_sid",
     "TWILIO_AUTH_TOKEN": "auth_token",
     "TWILIO_WHATSAPP_NUMBER": "whatsapp_number",
+    # Optional Twilio Content Template SID for the interactive (button) T&C
+    # message. Add a "tc_template_sid" key to the Twilio secret to enable buttons.
+    "TWILIO_TC_TEMPLATE_SID": "tc_template_sid",
     # Shared HMAC key for the login-link callback token: reuse the Twilio auth
     # token so signer (Message_Processor) and verifier (Auth_Service) match.
     "CALLBACK_TOKEN_SECRET": "auth_token",

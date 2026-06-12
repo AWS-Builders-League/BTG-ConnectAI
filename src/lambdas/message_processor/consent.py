@@ -32,8 +32,8 @@ the core consent gate works regardless of the messaging module's state.
 
 from __future__ import annotations
 
-import json
 import os
+import unicodedata
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -57,9 +57,67 @@ CONSENT_REQUIRED_MESSAGE: str = (
     "aceptes. Cuando quieras, escríbenos de nuevo para revisarlos y aceptarlos."
 )
 
+# Plain-text Terms & Conditions message used only when no Content Template SID is
+# configured. Asks the client to reply ACEPTO / RECHAZO.
+TERMS_AND_CONDITIONS_TEXT: str = (
+    "👋 ¡Bienvenido a BTG ConnectAI!\n\n"
+    f"Antes de continuar debes aceptar nuestros Términos y Condiciones "
+    f"(versión {TC_VERSION}). Tratamos tus datos conforme a la ley y solo para "
+    "atender tus solicitudes bancarias.\n\n"
+    "Responde *ACEPTO* para continuar o *RECHAZO* si no estás de acuerdo."
+)
+
+
+def _normalize_text(text: str) -> str:
+    """Lower-case, strip and remove accents from a free-text reply.
+
+    Used to match consent keywords robustly (``"Sí"`` -> ``"si"``,
+    ``"ACEPTO"`` -> ``"acepto"``).
+    """
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    no_accents = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return no_accents.strip().lower()
+
+
+def interpret_consent_reply(
+    button_payload: str | None, body: str | None
+) -> Literal["accept", "reject", "unknown"]:
+    """Map a quick-reply button **or** free text to a consent decision.
+
+    Quick-reply buttons take precedence (the primary UX); if no recognized button
+    is present the message body is matched (accent/case-insensitively) against the
+    accept/reject keyword sets. Returns ``"unknown"`` when neither matches.
+    """
+    if button_payload == ACCEPT_BUTTON_PAYLOAD:
+        return "accept"
+    if button_payload == REJECT_BUTTON_PAYLOAD:
+        return "reject"
+
+    normalized = _normalize_text(body or "")
+    if normalized in _ACCEPT_KEYWORDS:
+        return "accept"
+    if normalized in _REJECT_KEYWORDS:
+        return "reject"
+    return "unknown"
+
 # Quick-reply button payloads Twilio sends back in ``ButtonPayload``.
 ACCEPT_BUTTON_PAYLOAD: str = "accept_tc"
 REJECT_BUTTON_PAYLOAD: str = "reject_tc"
+
+# Text keywords accepted as consent decisions when the client replies with plain
+# text instead of (or in addition to) a quick-reply button. Compared accent- and
+# case-insensitively. Buttons remain the primary UX; this is a safety net.
+_ACCEPT_KEYWORDS: frozenset[str] = frozenset(
+    {"acepto", "aceptar", "acepto los terminos", "si", "acepto tc", "1"}
+)
+_REJECT_KEYWORDS: frozenset[str] = frozenset(
+    {"rechazo", "rechazar", "no", "no acepto", "2"}
+)
+
+# Optional Twilio Content Template SID for the interactive (button) T&C message.
+# When present the quick-reply buttons are sent; when absent we fall back to a
+# plain-text message so the consent gate never hard-fails.
+_TC_TEMPLATE_SID_ENV: str = "TWILIO_TC_TEMPLATE_SID"
 
 # Module-level resources/clients are reused across warm invocations.
 _dynamodb = boto3.resource("dynamodb")
@@ -172,8 +230,10 @@ def handle_consent_flow(
         phone_number: The client's phone number (E.164).
     """
     button = payload.get("ButtonPayload")
+    body = payload.get("Body")
+    decision = interpret_consent_reply(button, body)
 
-    if button == ACCEPT_BUTTON_PAYLOAD:
+    if decision == "accept":
         store_consent(phone_number, "accepted")
         from .messaging import send_welcome_message  # lazy: avoids hard coupling
 
@@ -181,7 +241,7 @@ def handle_consent_flow(
         logger.info("consent accepted", extra={"phone": mask_phone(phone_number)})
         return
 
-    if button == REJECT_BUTTON_PAYLOAD:
+    if decision == "reject":
         store_consent(phone_number, "rejected")
         from .messaging import send_twilio_message  # lazy: avoids hard coupling
 
@@ -189,7 +249,7 @@ def handle_consent_flow(
         logger.info("consent rejected", extra={"phone": mask_phone(phone_number)})
         return
 
-    # First message with no (accepted) consent — present the T&C buttons.
+    # First message with no (accepted) consent — present the T&C.
     send_terms_and_conditions_message(phone_number)
 
 
@@ -222,23 +282,32 @@ def _whatsapp_from() -> str:
 
 
 def send_terms_and_conditions_message(phone_number: str) -> None:
-    """Send the interactive T&C message with accept/reject buttons (Req 1.1).
+    """Send the T&C message (Req 1.1).
 
-    Uses a Twilio Content Template (quick-reply buttons) identified by the
-    ``TWILIO_TC_TEMPLATE_SID`` environment variable. The client's phone number
-    is passed as a content variable for template personalization.
+    If ``TWILIO_TC_TEMPLATE_SID`` is configured, send the interactive Content
+    Template (accept/reject quick-reply buttons). Otherwise fall back to a
+    plain-text message asking the client to reply *ACEPTO* / *RECHAZO* — this
+    keeps the consent gate working in the Twilio sandbox without a template.
 
     Args:
         phone_number: The client's phone number (E.164).
     """
     pk = _normalize_phone(phone_number)
     client = _get_twilio_client()
-    client.messages.create(
-        from_=_whatsapp_from(),
-        to=f"whatsapp:{pk}",
-        content_sid=os.environ["TWILIO_TC_TEMPLATE_SID"],
-        content_variables=json.dumps({"phoneNumber": pk}),
-    )
+    template_sid = os.environ.get(_TC_TEMPLATE_SID_ENV)
+
+    if template_sid:
+        client.messages.create(
+            from_=_whatsapp_from(),
+            to=f"whatsapp:{pk}",
+            content_sid=template_sid,
+        )
+    else:
+        client.messages.create(
+            from_=_whatsapp_from(),
+            to=f"whatsapp:{pk}",
+            body=TERMS_AND_CONDITIONS_TEXT,
+        )
     logger.info("terms and conditions message sent", extra={"phone": mask_phone(pk)})
 
 
@@ -246,6 +315,8 @@ __all__ = [
     "ACCEPT_BUTTON_PAYLOAD",
     "REJECT_BUTTON_PAYLOAD",
     "CONSENT_REQUIRED_MESSAGE",
+    "TERMS_AND_CONDITIONS_TEXT",
+    "interpret_consent_reply",
     "get_consent",
     "has_accepted_consent",
     "store_consent",
