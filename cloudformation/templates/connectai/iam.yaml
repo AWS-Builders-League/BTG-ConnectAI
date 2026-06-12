@@ -276,10 +276,20 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # DynamoDB: Auth_Session (crear la sesion autenticada)
+              # DynamoDB: Auth_Session. PutItem crea la sesion autenticada;
+              # GetItem/DeleteItem leen y consumen el pending request (pk
+              # "pending#<phone>") para reanudar la operacion tras el login.
               - Effect: Allow
-                Action: dynamodb:PutItem
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
                 Resource: !Ref AuthTableArn
+              # SQS: encolar el mensaje sintetico en la inbound FIFO queue para
+              # reanudar (auto-resume) la peticion original via el Message_Processor.
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref InboundQueueArn
               # Secrets Manager: leer el secret de Twilio para derivar el
               # CALLBACK_TOKEN_SECRET (clave HMAC compartida con Message_Processor)
               - Effect: Allow

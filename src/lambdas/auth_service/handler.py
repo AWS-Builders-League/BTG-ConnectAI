@@ -93,8 +93,16 @@ from .users import find_user
 
 logger = get_logger("auth-service")
 
-# Module-level boto3 resource reused across warm invocations.
+# Module-level boto3 resource/client reused across warm invocations.
 _dynamodb = boto3.resource("dynamodb")
+_sqs = boto3.client("sqs")
+
+# Partition-key prefix under which the Message_Processor stores the client's
+# original request while the login link is outstanding (mirrors
+# ``message_processor.auth.PENDING_REQUEST_PK_PREFIX``). Duplicated — not imported —
+# because the two Lambdas are packaged independently and must not depend on each
+# other's code (same rationale as the callback-token scheme above).
+PENDING_REQUEST_PK_PREFIX = "pending#"
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +297,90 @@ def _create_auth_session(phone: str, user: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Auto-resume of the pending request after login (Req 5.1 / 5.4)
+# ---------------------------------------------------------------------------
+
+
+def _resume_pending_request(normalized_phone: str) -> None:
+    """Replay the client's pre-login request so the flow continues automatically.
+
+    After a successful login the Message_Processor has already stored the
+    original request under ``pending#<phone>`` (it could not run it then because
+    there was no Auth_Session yet). Now that the session exists, we **re-inject**
+    that request into the inbound FIFO queue as a synthetic Twilio-shaped message,
+    so the whole Message_Processor pipeline runs end-to-end (consent → routing →
+    auth gate, which now passes → Strands_Agent → Twilio reply) without the client
+    having to retype anything. The pending marker is then deleted so it is
+    consumed exactly once.
+
+    Best-effort: any failure here is logged and swallowed. The login itself has
+    already succeeded (the Auth_Session is written and the success response is
+    returned regardless), and the client can still resume manually by sending the
+    message again.
+
+    Args:
+        normalized_phone: The authenticated client's bare E.164 phone number
+            (the Auth_Session / pending-request partition key root).
+    """
+    queue_url = os.environ.get("INBOUND_QUEUE_URL")
+    if not queue_url:
+        logger.warning("INBOUND_QUEUE_URL not set; skipping pending-request resume")
+        return
+
+    table = _get_auth_table()
+    pending_pk = f"{PENDING_REQUEST_PK_PREFIX}{normalized_phone}"
+
+    item = table.get_item(Key={"pk": pending_pk}).get("Item")
+    if not item:
+        logger.info(
+            "no pending request to resume", extra={"phone": mask_phone(normalized_phone)}
+        )
+        return
+
+    pending_text = item.get("pendingRequest")
+    ttl = item.get("ttl")
+
+    # Drop a stale pending request (login completed after the 10-min link/pending
+    # window): consume the marker but do not replay an outdated intent.
+    if not pending_text or (ttl is not None and int(ttl) <= int(_now().timestamp())):
+        table.delete_item(Key={"pk": pending_pk})
+        logger.info(
+            "pending request missing/expired; discarded",
+            extra={"phone": mask_phone(normalized_phone)},
+        )
+        return
+
+    # Synthetic message shaped like the Webhook_Receiver's SQS body so the
+    # Message_Processor's record_handler parses it unchanged: a plain text message
+    # (NumMedia "0") From the authenticated WhatsApp number, carrying the original
+    # request as Body and a fresh correlationId for end-to-end tracing.
+    from_address = f"whatsapp:{normalized_phone}"
+    correlation_id = str(uuid.uuid4())
+    synthetic = {
+        "From": from_address,
+        "Body": pending_text,
+        "NumMedia": "0",
+        "correlationId": correlation_id,
+        "resumedFromLogin": True,  # marker for log/trace; ignored by the pipeline
+    }
+
+    _sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=json.dumps(synthetic),
+        MessageGroupId=from_address,  # per-client FIFO ordering (same as webhook)
+        MessageDeduplicationId=correlation_id,  # unique → never deduped away
+    )
+
+    # Consume the marker exactly once now that it has been re-injected.
+    table.delete_item(Key={"pk": pending_pk})
+
+    logger.info(
+        "pending request resumed after login",
+        extra={"phone": mask_phone(normalized_phone), "correlation_id": correlation_id},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
 
@@ -378,6 +470,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "auth session created",
         extra={"username": username, "phone": mask_phone(normalized_phone)},
     )
+
+    # 5. Auto-resume: replay the request the client made before logging in so the
+    #    conversation continues on WhatsApp without them retyping it (Req 5.1 /
+    #    5.4). Best-effort — never fail the login if the resume cannot be enqueued.
+    try:
+        _resume_pending_request(normalized_phone)
+    except Exception:  # noqa: BLE001 - login already succeeded; resume is best-effort
+        logger.exception(
+            "failed to resume pending request after login",
+            extra={"phone": mask_phone(normalized_phone)},
+        )
 
     return _response(200, {"status": "success"})
 

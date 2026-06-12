@@ -103,6 +103,65 @@ def auth_table(monkeypatch):
             handler._dynamodb = original
 
 
+_INBOUND_QUEUE_NAME = "BTGConnectAI-sandbox-inbound.fifo"
+
+
+@pytest.fixture
+def auth_table_with_queue(monkeypatch):
+    """Like :func:`auth_table` but also wires a moto inbound FIFO queue.
+
+    Sets ``INBOUND_QUEUE_URL`` and rebinds both ``handler._dynamodb`` and
+    ``handler._sqs`` to the mocked resources, so the auto-resume path
+    (:func:`handler._resume_pending_request`) is exercised end-to-end. Yields
+    ``(table, sqs_client, queue_url)``.
+    """
+    monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AUTH_TABLE_NAME", _TABLE_NAME)
+    monkeypatch.setenv("CALLBACK_TOKEN_SECRET", _SECRET)
+
+    with mock_aws():
+        resource = boto3.resource("dynamodb", region_name=_REGION)
+        resource.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table = resource.Table(_TABLE_NAME)
+
+        sqs = boto3.client("sqs", region_name=_REGION)
+        queue_url = sqs.create_queue(
+            QueueName=_INBOUND_QUEUE_NAME,
+            Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+        )["QueueUrl"]
+        monkeypatch.setenv("INBOUND_QUEUE_URL", queue_url)
+
+        orig_db, orig_sqs = handler._dynamodb, handler._sqs
+        handler._dynamodb = resource
+        handler._sqs = sqs
+        try:
+            yield table, sqs, queue_url
+        finally:
+            handler._dynamodb = orig_db
+            handler._sqs = orig_sqs
+
+
+def _put_pending(table, *, phone: str = _PHONE, text: str = "Necesito mi extracto",
+                 ttl_offset: int = 600) -> None:
+    """Write a pending-request marker (``pending#<phone>``) into the table."""
+    table.put_item(
+        Item={
+            "pk": f"{handler.PENDING_REQUEST_PK_PREFIX}{phone}",
+            "phoneNumber": phone,
+            "pendingRequest": text,
+            "createdAt": "2026-06-12T00:00:00+00:00",
+            "ttl": int(time.time()) + ttl_offset,
+        }
+    )
+
+
 class _LambdaContext:
     """Minimal Lambda context for Powertools' ``inject_lambda_context``."""
 
@@ -362,3 +421,82 @@ class TestBadRequest:
 
         assert result["statusCode"] == 200
         assert auth_table.get_item(Key={"pk": _PHONE}).get("Item") is not None
+
+
+# ---------------------------------------------------------------------------
+# 8. Auto-resume of the pending request after login (Req 5.1 / 5.4)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResumePendingRequest:
+    def test_pending_request_is_enqueued_and_consumed(self, auth_table_with_queue) -> None:
+        # A successful login with an outstanding pending request re-injects it as
+        # a synthetic Twilio-shaped message and deletes the pending marker.
+        table, sqs, queue_url = auth_table_with_queue
+        _put_pending(table, text="Necesito mi extracto de mayo")
+
+        result = _call(_valid_body())
+
+        assert result["statusCode"] == 200
+        # The Auth_Session was created and the pending marker consumed (deleted).
+        assert table.get_item(Key={"pk": _PHONE}).get("Item") is not None
+        pending_pk = f"{handler.PENDING_REQUEST_PK_PREFIX}{_PHONE}"
+        assert table.get_item(Key={"pk": pending_pk}).get("Item") is None
+
+        # A single synthetic message was enqueued with the webhook-compatible shape.
+        messages = sqs.receive_message(
+            QueueUrl=queue_url, MaxNumberOfMessages=10
+        ).get("Messages", [])
+        assert len(messages) == 1
+        body = json.loads(messages[0]["Body"])
+        assert body["From"] == f"whatsapp:{_PHONE}"
+        assert body["Body"] == "Necesito mi extracto de mayo"
+        assert body["NumMedia"] == "0"
+        assert body["correlationId"]
+
+    def test_no_pending_request_enqueues_nothing(self, auth_table_with_queue) -> None:
+        # Login succeeds and nothing is enqueued when there is no pending request.
+        table, sqs, queue_url = auth_table_with_queue
+
+        result = _call(_valid_body())
+
+        assert result["statusCode"] == 200
+        messages = sqs.receive_message(
+            QueueUrl=queue_url, MaxNumberOfMessages=10
+        ).get("Messages", [])
+        assert messages == []
+
+    def test_expired_pending_is_discarded_not_replayed(self, auth_table_with_queue) -> None:
+        # An expired pending marker is consumed but never replayed (stale intent).
+        table, sqs, queue_url = auth_table_with_queue
+        _put_pending(table, ttl_offset=-10)
+
+        result = _call(_valid_body())
+
+        assert result["statusCode"] == 200
+        pending_pk = f"{handler.PENDING_REQUEST_PK_PREFIX}{_PHONE}"
+        assert table.get_item(Key={"pk": pending_pk}).get("Item") is None
+        messages = sqs.receive_message(
+            QueueUrl=queue_url, MaxNumberOfMessages=10
+        ).get("Messages", [])
+        assert messages == []
+
+    def test_resume_failure_does_not_break_login(
+        self, auth_table_with_queue, monkeypatch
+    ) -> None:
+        # The resume is best-effort: an SQS failure must not fail the login, which
+        # has already written the session and must still return success.
+        table, sqs, _queue_url = auth_table_with_queue
+        _put_pending(table)
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("sqs unavailable")
+
+        monkeypatch.setattr(handler._sqs, "send_message", _boom)
+
+        result = _call(_valid_body())
+
+        assert result["statusCode"] == 200
+        assert _body_json(result) == {"status": "success"}
+        # The session is intact regardless of the resume failure.
+        assert table.get_item(Key={"pk": _PHONE}).get("Item") is not None

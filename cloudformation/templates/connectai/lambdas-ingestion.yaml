@@ -324,6 +324,9 @@ Resources:
         Variables:
           AUTH_TABLE_NAME: !Ref AuthTableName
           TWILIO_SECRET_ARN: !Ref TwilioSecretArn
+          # Inbound FIFO queue: el auth_service encola un mensaje sintetico aqui
+          # tras el login para reanudar (auto-resume) la peticion original.
+          INBOUND_QUEUE_URL: !Ref InboundQueueUrl
           POWERTOOLS_SERVICE_NAME: auth-service
           POWERTOOLS_LOG_LEVEL: INFO
       Tags:
