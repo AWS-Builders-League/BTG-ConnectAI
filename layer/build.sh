@@ -37,7 +37,20 @@ cp -r "${REPO_ROOT}/src/shared" "${PYTHON_TARGET}/shared"
 
 echo "==> Pruning bytecode / caches"
 find "${PYTHON_TARGET}" -type d -name "__pycache__" -prune -exec rm -rf {} +
-find "${PYTHON_TARGET}" -type d -name "*.dist-info" -prune -exec rm -rf {} + || true
+
+# NO borrar los *.dist-info: OpenTelemetry (dependencia de strands-agents) resuelve
+# su runtime context en import-time vía importlib.metadata.entry_points(
+# group="opentelemetry_context"), que lee entry_points.txt desde el .dist-info.
+# Sin esa metadata, entry_points() devuelve vacío -> next() lanza StopIteration
+# sin atrapar -> el import de `strands` (y por tanto la Lambda) revienta.
+# Solo se podan los archivos pesados/innecesarios de cada dist-info, conservando
+# entry_points.txt y METADATA (lo que OTel y otros plugins necesitan).
+find "${PYTHON_TARGET}" -type d -name "*.dist-info" -prune -exec sh -c '
+  for d; do
+    rm -rf "${d}/RECORD" "${d}/REQUESTED" "${d}/direct_url.json" \
+           "${d}/INSTALLER" "${d}/licenses" "${d}/LICENSE"* 2>/dev/null || true
+  done
+' sh {} +
 
 echo "==> Zipping layer -> ${ARTIFACT}"
 ( cd "${LAYER_DIR}" && zip -qr "${ARTIFACT}" python )
