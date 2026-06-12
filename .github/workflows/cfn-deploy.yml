@@ -250,28 +250,10 @@ jobs:
               ManagedBy=cloudformation \
             --no-fail-on-empty-changeset
 
-      # ── 8. Publicar la Login_Page estatica en su bucket ─────────────────────
-      # Resuelve la Function URL real del Auth_Service (output del stack), sustituye
-      # el placeholder __AUTH_SERVICE_URL__ en app.js y sincroniza src/login-page/
-      # al bucket login-page de `infra` (nombre resuelto del contrato SSM).
-      - name: Publish Login_Page to S3
-        run: |
-          set -euo pipefail
-          AUTH_URL="$(aws lambda get-function-url-config \
-            --function-name "${PROJECT_NAME}-${ENVIRONMENT}-auth-service" \
-            --query 'FunctionUrl' --output text)"
-          LOGIN_BUCKET="$(aws ssm get-parameter \
-            --name "/btgconnectai/${ENVIRONMENT}/s3/login-page-name" \
-            --query 'Parameter.Value' --output text)"
-          echo "Auth_Service URL: ${AUTH_URL}"
-          echo "Login_Page bucket: ${LOGIN_BUCKET}"
-          workdir="$(mktemp -d)"
-          cp -r src/login-page/* "${workdir}/"
-          # Inyectar la Function URL real (el placeholder vive en app.js).
-          sed -i "s|__AUTH_SERVICE_URL__|${AUTH_URL}|g" "${workdir}/app.js"
-          aws s3 sync "${workdir}/" "s3://${LOGIN_BUCKET}/" \
-            --delete --only-show-errors
-          echo "Login_Page publicada en s3://${LOGIN_BUCKET}/"
+      # NOTA: El Login_Page ya NO se publica a S3. La pagina se sirve embebida por
+      # la propia Lambda auth-service en `GET /login` (HTTP API, HTTPS), y la pagina
+      # autentica en `POST /login` (mismo origen). El bucket S3 estatico y el
+      # placeholder __AUTH_SERVICE_URL__ de src/login-page/app.js quedan obsoletos.
 
       - name: Deployment summary
         if: always()

@@ -5,7 +5,7 @@ Description: >-
   webhook-receiver (recibe el webhook de Twilio vía HTTP API y encola en la
   inbound FIFO queue), message-processor (consume la cola, orquesta consentimiento
   / auth / transcripción e invoca al Strands_Agent) y auth-service (endpoint de
-  login mock detrás de una Function URL para el Login_Page). Las tres corren
+  login mock detrás del HTTP API, ruta ANY /login, para el Login_Page). Las tres corren
   FUERA de VPC. Conecta el HTTP API de `infra` (Integration + Route + Permission)
   y crea el EventSourceMapping sobre la inbound queue del contrato. Los IAM roles
   se definen en iam.yaml y se reciben como parámetros; el SharedLayer, los nombres
@@ -65,6 +65,13 @@ Parameters:
       (contrato BTGConnectAI-sandbox-HttpApiId). Aquí se le añade la Integration
       AWS_PROXY hacia webhook-receiver, la Route POST /webhook/twilio y el permiso
       de invocación.
+
+  HttpApiEndpoint:
+    Type: String
+    Description: >-
+      Endpoint de ejecución del HTTP API (contrato BTGConnectAI-sandbox-HttpApiEndpoint).
+      Se usa para construir LOGIN_PAGE_URL (`${HttpApiEndpoint}/login`), la URL HTTPS
+      que el message-processor envía por WhatsApp y que sirve/autentica el Login_Page.
 
   # ── SQS (inbound FIFO queue creada por `infra`) ──────────────────────────
   InboundQueueArn:
@@ -259,10 +266,12 @@ Resources:
           AUDIO_TEMP_BUCKET: !Ref AudioTempBucketName
           TWILIO_SECRET_ARN: !Ref TwilioSecretArn
           AI_AGENT_FUNCTION_NAME: !Ref AiAgentFunctionArn
-          # HTTPS via el Function URL del auth_service (mismo origen sirve la
-          # pagina de login en GET y autentica en POST). Evita el endpoint S3
-          # website (HTTP), que iOS/WhatsApp no abren.
-          LOGIN_PAGE_URL: !GetAtt AuthServiceFunctionUrl.FunctionUrl
+          # HTTPS via el HTTP API (ruta ANY /login del auth_service): el mismo
+          # origen sirve la pagina de login en GET y autentica en POST (la pagina
+          # hace fetch a window.location.origin + pathname). Evita el endpoint S3
+          # website (HTTP), que iOS/WhatsApp no abren, y las Function URLs publicas
+          # (bloqueadas por SCP de la org).
+          LOGIN_PAGE_URL: !Sub '${HttpApiEndpoint}/login'
           POWERTOOLS_SERVICE_NAME: message-processor
           POWERTOOLS_LOG_LEVEL: INFO
       Tags:
@@ -325,29 +334,36 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
-  # ── Function URL del Auth_Service (con CORS para el Login_Page) ─────────────
-  AuthServiceFunctionUrl:
-    Type: AWS::Lambda::Url
+  # ── API Gateway wiring del Auth_Service (ruta ANY /login) ───────────────────
+  # El Login_Page se sirve y autentica detrás del HTTP API de `infra` (HTTPS),
+  # NO de una Function URL (bloqueadas por SCP de la org). El handler ramifica
+  # por metodo (GET sirve la pagina, POST autentica) en el MISMO path, y la
+  # pagina hace fetch a window.location.origin + pathname; por eso una sola ruta
+  # `ANY /login` cubre ambos y todo es mismo-origen (sin CORS).
+  AuthServiceIntegration:
+    Type: AWS::ApiGatewayV2::Integration
     Properties:
-      TargetFunctionArn: !Ref AuthServiceFunction
-      AuthType: NONE
-      Cors:
-        AllowOrigins:
-          - '*'
-        AllowMethods:
-          - POST
-        AllowHeaders:
-          - content-type
-        MaxAge: 300
+      ApiId: !Ref HttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthServiceFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
 
-  # Permiso público para invocar la Function URL del Auth_Service (AuthType NONE).
-  AuthServiceFunctionUrlPermission:
+  AuthServiceRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApiId
+      RouteKey: 'ANY /login'
+      Target: !Sub 'integrations/${AuthServiceIntegration}'
+
+  # Permiso para que API Gateway invoque la Lambda auth-service en esa ruta.
+  AuthServiceApiPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref AuthServiceFunction
-      Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApiId}/*/*/login'
 
   # ── API Gateway wiring: Integration + Route + Permission ────────────────────
   # El HTTP API lo crea `infra`; aquí se conecta la Lambda webhook-receiver.
@@ -410,8 +426,8 @@ Outputs:
     Description: Nombre de la Lambda auth-service.
     Value: !Ref AuthServiceFunction
 
-  AuthServiceFunctionUrl:
-    Description: Function URL pública del auth-service (consumida por el Login_Page).
-    Value: !GetAtt AuthServiceFunctionUrl.FunctionUrl
+  AuthServiceLoginUrl:
+    Description: URL HTTPS del Login_Page (ruta ANY /login del HTTP API).
+    Value: !Sub '${HttpApiEndpoint}/login'
     Export:
-      Name: !Sub '${ProjectName}-${Environment}-AuthServiceFunctionUrl'
+      Name: !Sub '${ProjectName}-${Environment}-AuthServiceLoginUrl'

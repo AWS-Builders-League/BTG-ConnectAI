@@ -468,6 +468,7 @@ Resources:
         LambdaCodeKey: !Ref LambdaCodeKey
         SharedLayerArn: !Ref SharedLayer
         HttpApiId: !Ref HttpApiId
+        HttpApiEndpoint: !Ref HttpApiEndpoint
         InboundQueueArn: !Ref InboundQueueArn
         InboundQueueUrl: !Ref InboundQueueUrl
         TwilioSecretArn: !Ref TwilioSecretArn
