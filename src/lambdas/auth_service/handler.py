@@ -88,6 +88,7 @@ from shared.logger import get_logger
 from shared.masking import mask_phone
 from shared.twilio_env import hydrate_twilio_env
 
+from .login_page import LOGIN_PAGE_HTML
 from .users import find_user
 
 logger = get_logger("auth-service")
@@ -315,6 +316,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # CORS preflight — browsers send this before the cross-origin POST.
     if method == "OPTIONS":
         return _response(200, None)
+
+    # GET → serve the self-contained Login_Page (HTTPS via the Function URL).
+    # The page reads phone/token from the query string and POSTs back here.
+    if method == "GET":
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+            },
+            "body": LOGIN_PAGE_HTML,
+        }
 
     if method != "POST":
         return _response(405, {"status": "error", "error": "method_not_allowed"})

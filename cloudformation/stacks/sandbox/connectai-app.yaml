@@ -155,11 +155,6 @@ Parameters:
     Default: '/btgconnectai/sandbox/s3/audio-temp-arn'
     Description: ARN del bucket Audio_Temp. Export BTGConnectAI-sandbox-AudioTempBucketArn.
 
-  LoginPageBucketName:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/s3/login-page-name'
-    Description: Nombre del bucket de la Login_Page (static website). Export BTGConnectAI-sandbox-LoginPageBucketName.
-
   LambdaArtifactsBucketName:
     Type: 'AWS::SSM::Parameter::Value<String>'
     Default: '/btgconnectai/sandbox/s3/artifacts-name'
@@ -253,7 +248,6 @@ Metadata:
           - StatementBucketArn
           - AudioTempBucketName
           - AudioTempBucketArn
-          - LoginPageBucketName
           - LambdaArtifactsBucketName
       - Label:
           default: 'Contrato cross-stack: Bedrock'
@@ -482,7 +476,6 @@ Resources:
         OtpTableName: !Ref OtpTableName
         StatementBucketName: !Ref StatementBucketName
         AudioTempBucketName: !Ref AudioTempBucketName
-        LoginPageBucketName: !Ref LoginPageBucketName
         AiAgentFunctionArn: !GetAtt LambdaAiAgentStack.Outputs.AiAgentFunctionArn
         WebhookReceiverRoleArn: !GetAtt IamStack.Outputs.WebhookReceiverRoleArn
         MessageProcessorRoleArn: !GetAtt IamStack.Outputs.MessageProcessorRoleArn
