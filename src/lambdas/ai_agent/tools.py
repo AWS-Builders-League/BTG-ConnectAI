@@ -250,32 +250,32 @@ def query_balance(product_type: str | None = None, phone_number: str | None = No
 
 @tool
 def initiate_transfer_breb(
-    source_account: str,
-    destination_account: str,
+    destination_key: str,
     amount: float,
-    concept: str = "",
     phone_number: str | None = None,
 ) -> dict:
-    """Inicia una transferencia BRE-B entre cuentas.
+    """Inicia una transferencia BRE-B.
 
-    Dispara el TransferBrebStateMachine, que enviará un código OTP por SMS al
+    Dispara el TransferBrebStateMachine, que enviará un código OTP por email al
     cliente para autorizar la transferencia. NO espera el OTP: retorna de
     inmediato. Úsala SOLO después de que el cliente confirmó explícitamente la
-    operación (cuenta origen, cuenta destino, monto y concepto).
+    operación (llave destino y monto).
+
+    La cuenta origen se resuelve automáticamente (la cuenta corriente del cliente).
+    La llave destino puede ser: número de cédula, correo electrónico, número de
+    celular o llave aleatoria del destinatario.
 
     No proporciones phone_number: el sistema inyecta automáticamente el número
     del cliente autenticado.
 
     Args:
-        source_account: Cuenta origen del cliente.
-        destination_account: Cuenta destino de la transferencia.
+        destination_key: Llave BRE-B del destinatario (cédula, email, celular o llave aleatoria).
         amount: Monto a transferir en COP.
-        concept: Concepto o descripción de la transferencia (opcional).
         phone_number: Uso interno del sistema. No lo completes.
 
     Returns:
         dict con {executionArn, status, message} indicando que se envió el OTP
-        por SMS. El cliente debe responder ese código para autorizar.
+        por email. El cliente debe responder ese código para autorizar.
     """
     resolved_phone = _resolve_phone_number(phone_number)
     correlation_id = current_correlation_id()
@@ -285,18 +285,17 @@ def initiate_transfer_breb(
         "tool initiate_transfer_breb",
         extra={
             "phone": mask_phone(resolved_phone),
-            "source": mask_account(source_account),
-            "destination": mask_account(destination_account),
+            "destination": destination_key,
             "amount": amount,
         },
     )
 
     payload: dict[str, Any] = {
         "phoneNumber": resolved_phone,
-        "sourceAccount": source_account,
-        "destinationAccount": destination_account,
+        "sourceAccount": "",
+        "destinationAccount": destination_key,
         "amount": amount,
-        "concept": concept,
+        "concept": "",
     }
     # The initiator uses correlationId as the idempotent execution name
     # (Property 19); only include it when present.
@@ -311,7 +310,7 @@ def initiate_transfer_breb(
     result.setdefault(
         "message",
         (
-            "Te envié un código OTP por SMS. Por favor respóndelo aquí para "
+            "Te envié un código OTP por email. Por favor respóndelo aquí para "
             "autorizar la transferencia."
         ),
     )

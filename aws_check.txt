@@ -1,1 +1,6 @@
--rw-rw-r-- 1 ubuntu ubuntu 46M Jun 25 16:38 shared-layer.zip
+BTGConnectAI-sandbox-transfer-breb-validate: 1	READY
+BTGConnectAI-sandbox-transfer-breb-execute: 1	READY
+BTGConnectAI-sandbox-message-handler-notify: 1	READY
+BTGConnectAI-sandbox-balance-query: 1	READY
+BTGConnectAI-sandbox-statement-generator: 1	READY
+BTGConnectAI-sandbox-auth-service: 1	READY

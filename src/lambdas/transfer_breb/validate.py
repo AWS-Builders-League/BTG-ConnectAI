@@ -26,11 +26,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from shared.errors import InsufficientFundsError, InvalidDestinationError
+from shared.errors import InsufficientFundsError
 from shared.logger import get_logger
 from shared.masking import mask_account, mask_phone
 
-from .mock_data import find_account_by_number, is_valid_destination
+from .mock_data import find_account_by_number
 
 logger = get_logger("transfer-breb-validate")
 
@@ -83,11 +83,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         logger.warning("insufficient funds for transfer")
         raise InsufficientFundsError("Fondos insuficientes")
 
-    # 2. Destination account must be a known, valid account.
-    if not is_valid_destination(destination_account):
-        logger.warning("invalid destination account")
-        raise InvalidDestinationError("Cuenta destino no encontrada")
-
+    # 2. Destination: BRE-B uses keys (document, email, phone, random key).
+    # In the MVP we accept any destination without validation — the real core
+    # resolves the key to an account in production.
     logger.info("transfer validation passed")
 
     return {

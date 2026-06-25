@@ -73,18 +73,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         },
     )
 
-    # Apply the (mock, per-invocation) balance movement. The destination may be
-    # an external/unknown account on a future real-core integration, so guard
-    # against a missing product reference.
+    # Apply the (mock, per-invocation) balance movement on the source account.
+    # The destination is resolved by the real core via the BRE-B key in production;
+    # in the MVP we only debit the source.
     source_acct = find_account_by_number(phone_number, source_account)
     if source_acct is not None:
         source_acct["available_balance"] -= amount
         source_acct["total_balance"] -= amount
-
-    dest_acct = find_account_by_number(None, destination_account)
-    if dest_acct is not None:
-        dest_acct["available_balance"] += amount
-        dest_acct["total_balance"] += amount
 
     now = datetime.now(timezone.utc)
     receipt = {

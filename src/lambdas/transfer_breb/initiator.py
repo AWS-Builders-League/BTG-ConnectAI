@@ -74,12 +74,27 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     transfer_input: dict[str, Any] = {
         "phoneNumber": event["phoneNumber"],
         "clientEmail": event.get("clientEmail", ""),
-        "sourceAccount": event["sourceAccount"],
+        "sourceAccount": event.get("sourceAccount", ""),
         "destinationAccount": event["destinationAccount"],
         "amount": event["amount"],
         "concept": event.get("concept", ""),
         "correlationId": correlation_id,
     }
+
+    # Resolve clientEmail and sourceAccount from Mock_Core if not provided.
+    from .mock_data import get_client_by_phone
+
+    client = get_client_by_phone(event["phoneNumber"])
+    if client:
+        if not transfer_input["clientEmail"]:
+            transfer_input["clientEmail"] = client.get("email", "")
+        if not transfer_input["sourceAccount"]:
+            # Use the first cuenta_corriente as default source
+            for product in client.get("products", []):
+                if product.get("product_type") == "cuenta_corriente":
+                    transfer_input["sourceAccount"] = product["account_number"]
+                    break
+
     if "sessionId" in event:
         transfer_input["sessionId"] = event["sessionId"]
 
@@ -87,7 +102,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "starting transfer state machine",
         extra={
             "phone": mask_phone(event["phoneNumber"]),
-            "source": mask_account(event["sourceAccount"]),
+            "source": mask_account(transfer_input["sourceAccount"]),
             "destination": mask_account(event["destinationAccount"]),
             "amount": event["amount"],
         },
