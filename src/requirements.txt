@@ -4,3 +4,4 @@ twilio
 aws-lambda-powertools[parser]
 strands-agents
 fpdf2
+resend

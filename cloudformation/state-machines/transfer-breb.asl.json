@@ -35,6 +35,7 @@
         "Payload": {
           "operation": "generate-and-wait",
           "phoneNumber.$": "$.phoneNumber",
+          "clientEmail.$": "$.clientEmail",
           "transferAmount.$": "$.amount",
           "destinationAccount.$": "$.destinationAccount",
           "taskToken.$": "$$.Task.Token",
@@ -82,7 +83,7 @@
       "Type": "Task",
       "Resource": "${ExecuteTransferFunctionArn}",
       "ResultPath": "$.receipt",
-      "Next": "PublishNotifications",
+      "Next": "PublishEmailNotification",
       "Retry": [
         {
           "ErrorEquals": [
@@ -102,50 +103,20 @@
         }
       ]
     },
-    "PublishNotifications": {
-      "Type": "Parallel",
-      "ResultPath": "$.notifications",
-      "Branches": [
-        {
-          "StartAt": "PublishEmailEvent",
-          "States": {
-            "PublishEmailEvent": {
-              "Comment": "Email-branch message shape alineada con Email_Service que lee event['to'] y event['payload']. El iniciador del workflow (transfer-breb-initiator) DEBE incluir clientEmail en el input de la ejecucion, resuelto desde Mock_Core/auth.",
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sqs:sendMessage",
-              "Parameters": {
-                "QueueUrl": "${EmailNotificationQueueUrl}",
-                "MessageBody": {
-                  "type": "transfer_confirmation",
-                  "to.$": "$.clientEmail",
-                  "payload.$": "$.receipt",
-                  "correlationId.$": "$.correlationId"
-                }
-              },
-              "End": true
-            }
-          }
-        },
-        {
-          "StartAt": "PublishSmsEvent",
-          "States": {
-            "PublishSmsEvent": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sqs:sendMessage",
-              "Parameters": {
-                "QueueUrl": "${SmsNotificationQueueUrl}",
-                "MessageBody": {
-                  "type": "transfer_confirmation",
-                  "phoneNumber.$": "$.phoneNumber",
-                  "amount.$": "$.amount",
-                  "correlationId.$": "$.correlationId"
-                }
-              },
-              "End": true
-            }
-          }
+    "PublishEmailNotification": {
+      "Comment": "Publica el evento de confirmacion en la email-notification-queue para que Email_Service lo envie por Resend.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "${EmailNotificationQueueUrl}",
+        "MessageBody": {
+          "type": "transfer_confirmation",
+          "to.$": "$.clientEmail",
+          "payload.$": "$.receipt",
+          "correlationId.$": "$.correlationId"
         }
-      ],
+      },
+      "ResultPath": "$.emailNotification",
       "Next": "NotifyUserSuccess"
     },
     "NotifyUserSuccess": {

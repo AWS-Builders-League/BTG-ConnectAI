@@ -42,9 +42,10 @@ Parameters:
     Type: String
     Description: ARN de la email-notification-queue (Email_Service consume / state machine produce).
 
-  SmsQueueArn:
+  # ── Secrets ──────────────────────────────────────────────────────────────────
+  ResendSecretArn:
     Type: String
-    Description: ARN de la sms-notification-queue (SMS_Service consume / state machine produce).
+    Description: ARN del secreto de Resend en Secrets Manager (API key + from_email).
 
   # ── DynamoDB (ARNs del contrato de `infra`) ─────────────────────────────────
   ConsentTableArn:
@@ -96,7 +97,6 @@ Metadata:
         Parameters:
           - InboundQueueArn
           - EmailQueueArn
-          - SmsQueueArn
       - Label:
           default: 'Contrato cross-stack: DynamoDB'
         Parameters:
@@ -112,6 +112,7 @@ Metadata:
           default: 'Contrato cross-stack: Secrets / Bedrock'
         Parameters:
           - TwilioSecretArn
+          - ResendSecretArn
           - GuardrailId
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +306,7 @@ Resources:
 
   # ── OTP_Service ──────────────────────────────────────────────────────────────
   # Invocada por Step Functions (waitForTaskToken): genera el codigo, lo persiste
-  # en OTP_Store con el taskToken y envia el SMS via Pinpoint.
+  # en OTP_Store con el taskToken y envia el OTP por email via Resend.
   OtpServiceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -328,10 +329,10 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !Ref OtpTableArn
-              # Pinpoint: envio del SMS con el codigo (API sin resource-level → "*")
+              # Secrets Manager: leer la API key de Resend
               - Effect: Allow
-                Action: mobiletargeting:SendMessages
-                Resource: '*'
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ResendSecretArn
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -341,8 +342,8 @@ Resources:
           Value: cloudformation
 
   # ── Email_Service ────────────────────────────────────────────────────────────
-  # async (SQS-triggered): consume la email-notification-queue del contrato y
-  # envia los correos de confirmacion via SES.
+  # async (SQS-triggered): consume la email-notification-queue y envia
+  # confirmaciones de transferencia por email via Resend.
   EmailServiceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -369,13 +370,10 @@ Resources:
                   - sqs:ChangeMessageVisibility
                   - sqs:GetQueueAttributes
                 Resource: !Ref EmailQueueArn
-              # SES: envio de correos (SendEmail requiere ARN de identidad que no
-              # esta en el contrato → "*")
+              # Secrets Manager: leer la API key de Resend
               - Effect: Allow
-                Action:
-                  - ses:SendEmail
-                  - ses:SendRawEmail
-                Resource: '*'
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ResendSecretArn
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -384,46 +382,7 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
-  # ── SMS_Service ──────────────────────────────────────────────────────────────
-  # async (SQS-triggered): consume la sms-notification-queue del contrato y envia
-  # los SMS de confirmacion post-operacion via Pinpoint.
-  SmsServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${ProjectName}-${Environment}-sms-service-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: sms-service-policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # SQS: consumo de la sms-notification-queue (del contrato)
-              - Effect: Allow
-                Action:
-                  - sqs:ReceiveMessage
-                  - sqs:DeleteMessage
-                  - sqs:ChangeMessageVisibility
-                  - sqs:GetQueueAttributes
-                Resource: !Ref SmsQueueArn
-              # Pinpoint: envio del SMS de confirmacion (API sin resource-level → "*")
-              - Effect: Allow
-                Action: mobiletargeting:SendMessages
-                Resource: '*'
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: ManagedBy
-          Value: cloudformation
+
 
   # ── Strands_Agent ────────────────────────────────────────────────────────────
   # FUERA de VPC. Interpreta intenciones con Claude 3.5 Haiku (Bedrock InvokeModel)
@@ -690,12 +649,10 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-otp-service:*'
                   - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-message-handler-notify'
                   - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-message-handler-notify:*'
-              # SQS: publicar los eventos de notificacion en las colas del contrato
+              # SQS: publicar el evento de confirmacion en la email queue del contrato
               - Effect: Allow
                 Action: sqs:SendMessage
-                Resource:
-                  - !Ref EmailQueueArn
-                  - !Ref SmsQueueArn
+                Resource: !Ref EmailQueueArn
               # CloudWatch Logs: entrega de vended logs (LoggingConfiguration ALL).
               # Estas acciones no soportan permisos a nivel de recurso → "*".
               - Effect: Allow
@@ -756,9 +713,7 @@ Outputs:
     Description: ARN del role de ejecucion de Email_Service.
     Value: !GetAtt EmailServiceRole.Arn
 
-  SmsServiceRoleArn:
-    Description: ARN del role de ejecucion de SMS_Service.
-    Value: !GetAtt SmsServiceRole.Arn
+
 
   AiAgentRoleArn:
     Description: ARN del role de ejecucion de Strands_Agent.

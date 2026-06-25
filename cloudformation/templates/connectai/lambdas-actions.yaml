@@ -110,6 +110,32 @@ Parameters:
     Type: String
     Description: ARN del IAM role de message-handler-notify (definido en iam.yaml).
 
+  OtpServiceRoleArn:
+    Type: String
+    Description: ARN del IAM role de otp-service (definido en iam.yaml).
+
+  OtpTableName:
+    Type: String
+    Description: >-
+      Nombre de la tabla OTP_Store. Inyectado como env var OTP_TABLE_NAME del
+      otp-service (donde persiste el OTP junto al task token de Step Functions).
+
+  EmailQueueArn:
+    Type: String
+    Description: >-
+      ARN de la email-notification-queue. Fuente del EventSourceMapping del
+      email-service.
+
+  EmailServiceRoleArn:
+    Type: String
+    Description: ARN del IAM role de email-service (definido en iam.yaml).
+
+  ResendSecretArn:
+    Type: String
+    Description: >-
+      ARN del secreto de Resend en Secrets Manager. Inyectado como env var
+      RESEND_SECRET_ARN en otp-service y email-service.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Metadata - agrupacion de parametros en la consola de CloudFormation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +176,17 @@ Metadata:
           - StatementGeneratorRoleArn
           - TransferInitiatorRoleArn
           - NotifyRoleArn
+          - OtpServiceRoleArn
+      - Label:
+          default: 'DynamoDB'
+        Parameters:
+          - OtpTableName
+      - Label:
+          default: 'Email service'
+        Parameters:
+          - EmailQueueArn
+          - EmailServiceRoleArn
+          - ResendSecretArn
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Resources
@@ -387,12 +424,99 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
+  # ── otp-service (estado GenerateOTP, waitForTaskToken, Req 16.1/16.2/16.3) ──
+  # Invocada SOLO por el TransferBrebStateMachine con el task token en el payload:
+  # genera el OTP, lo persiste en OTP_Store junto al task token y lo envia por SMS
+  # (SNS). Retorna de inmediato; la state machine queda suspendida esperando
+  # el callback (SendTaskSuccess / SendTaskFailure) del Message_Processor.
+  OtpServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-otp-service'
+      Description: >-
+        Genera el OTP, lo persiste en OTP_Store con el task token de Step Functions
+        y lo envia por SMS (SNS). Invocada por el TransferBrebStateMachine con
+        el patron waitForTaskToken. Fuera de la VPC.
+      Runtime: python3.13
+      Handler: otp_service.handler.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref OtpServiceRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/otp-service-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          OTP_TABLE_NAME: !Ref OtpTableName
+          RESEND_SECRET_ARN: !Ref ResendSecretArn
+          POWERTOOLS_SERVICE_NAME: otp-service
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
   # ═══════════════════════════════════════════════════════════════════════════
   # NOTA: NO se crean AWS::Lambda::Permission para bedrock.amazonaws.com porque
   # NO hay Bedrock Agent Core. El Strands_Agent (lambda-ai-agent) invoca estas
   # Action Group Lambdas directamente via lambda:InvokeFunction (permiso ya
   # concedido en su IAM role en iam.yaml). El Guardrail se aplica con ApplyGuardrail.
   # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── email-service (consumidor de la email-notification-queue) ────────────────
+  # Envia la confirmacion de transferencia por email via Resend. La cola y su DLQ
+  # las crea `infra`; aqui solo la Lambda y el EventSourceMapping.
+  EmailServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-email-service'
+      Description: >-
+        Consume la email-notification-queue y envia la confirmacion de
+        transferencia por email via Resend (con partial-batch-failure reporting).
+        Fuera de la VPC.
+      Runtime: python3.13
+      Handler: email_service.handler.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !Ref EmailServiceRoleArn
+      Code:
+        S3Bucket: !Ref LambdaArtifactsBucketName
+        S3Key: !Sub 'lambdas/email-service-${LambdaCodeKey}.zip'
+      Layers:
+        - !Ref SharedLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          RESEND_SECRET_ARN: !Ref ResendSecretArn
+          POWERTOOLS_SERVICE_NAME: email-service
+          POWERTOOLS_LOG_LEVEL: INFO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ── EventSourceMapping: email-notification-queue → email-service ────────────
+  EmailQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref EmailQueueArn
+      FunctionName: !Ref EmailServiceFunction
+      Enabled: true
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
@@ -436,3 +560,9 @@ Outputs:
     Value: !GetAtt NotifyFunction.Arn
     Export:
       Name: !Sub '${ProjectName}-${Environment}-NotifyFunctionArn'
+
+  OtpServiceFunctionArn:
+    Description: ARN de la Lambda otp-service (task GenerateOTP del state machine).
+    Value: !GetAtt OtpServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-OtpServiceFunctionArn'

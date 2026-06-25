@@ -80,21 +80,6 @@ Parameters:
       NotifyValidationFailed / NotifyOTPExpired / NotifyOTPBlocked /
       NotifyTransferFailed).
 
-  # ── Colas de notificacion (del contrato de `infra`) ─────────────────────────
-  EmailQueueUrl:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/sqs/email-url'
-    Description: >-
-      URL de la email-notification-queue (estado PublishEmailEvent).
-      Export BTGConnectAI-sandbox-EmailQueueUrl.
-
-  SmsQueueUrl:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/sqs/sms-url'
-    Description: >-
-      URL de la sms-notification-queue (estado PublishSmsEvent).
-      Export BTGConnectAI-sandbox-SmsQueueUrl.
-
   # ── SNS de alarmas (del contrato de `infra`) ────────────────────────────────
   AlarmsTopicArn:
     Type: 'AWS::SSM::Parameter::Value<String>'
@@ -102,6 +87,14 @@ Parameters:
     Description: >-
       ARN del SNS topic de alarmas. Destino de la alarma ExecutionsFailed.
       Export BTGConnectAI-sandbox-AlarmsTopicArn.
+
+  # ── Cola de email (del contrato de `infra`) ─────────────────────────────────
+  EmailQueueUrl:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/sqs/email-url'
+    Description: >-
+      URL de la email-notification-queue (estado PublishEmailNotification).
+      Export BTGConnectAI-sandbox-EmailQueueUrl.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Metadata - agrupacion de parametros en la consola de CloudFormation
@@ -131,7 +124,6 @@ Metadata:
           default: 'Contrato cross-stack: SQS / SNS'
         Parameters:
           - EmailQueueUrl
-          - SmsQueueUrl
           - AlarmsTopicArn
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +161,6 @@ Resources:
         ExecuteTransferFunctionArn: !Ref ExecuteTransferFunctionArn
         NotifyFunctionArn: !Ref NotifyFunctionArn
         EmailNotificationQueueUrl: !Ref EmailQueueUrl
-        SmsNotificationQueueUrl: !Ref SmsQueueUrl
       # Logging CloudWatch nivel ALL con datos de ejecucion (Req 18.5).
       LoggingConfiguration:
         Level: ALL

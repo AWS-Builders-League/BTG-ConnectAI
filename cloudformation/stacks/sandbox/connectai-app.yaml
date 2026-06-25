@@ -88,20 +88,7 @@ Parameters:
     Default: '/btgconnectai/sandbox/sqs/email-arn'
     Description: ARN de la email-notification-queue. Export BTGConnectAI-sandbox-EmailQueueArn.
 
-  EmailQueueUrl:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/sqs/email-url'
-    Description: URL de la email-notification-queue. Export BTGConnectAI-sandbox-EmailQueueUrl.
 
-  SmsQueueArn:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/sqs/sms-arn'
-    Description: ARN de la sms-notification-queue. Export BTGConnectAI-sandbox-SmsQueueArn.
-
-  SmsQueueUrl:
-    Type: 'AWS::SSM::Parameter::Value<String>'
-    Default: '/btgconnectai/sandbox/sqs/sms-url'
-    Description: URL de la sms-notification-queue. Export BTGConnectAI-sandbox-SmsQueueUrl.
 
   # ── DynamoDB (creadas por `infra`) ─────────────────────────────────────────
   ConsentTableName:
@@ -184,6 +171,11 @@ Parameters:
     Default: '/btgconnectai/sandbox/secrets/twilio-arn'
     Description: ARN del secreto de Twilio en Secrets Manager. Export BTGConnectAI-sandbox-TwilioSecretArn.
 
+  ResendSecretArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/btgconnectai/sandbox/secrets/resend-arn'
+    Description: ARN del secreto de Resend en Secrets Manager. Export BTGConnectAI-sandbox-ResendSecretArn.
+
   AlarmsTopicArn:
     Type: 'AWS::SSM::Parameter::Value<String>'
     Default: '/btgconnectai/sandbox/sns/alarms-arn'
@@ -229,9 +221,6 @@ Metadata:
           - InboundQueueArn
           - InboundQueueUrl
           - EmailQueueArn
-          - EmailQueueUrl
-          - SmsQueueArn
-          - SmsQueueUrl
       - Label:
           default: 'Contrato cross-stack: DynamoDB'
         Parameters:
@@ -258,6 +247,7 @@ Metadata:
           default: 'Contrato cross-stack: Secrets / SNS'
         Parameters:
           - TwilioSecretArn
+          - ResendSecretArn
           - AlarmsTopicArn
       - Label:
           default: 'Contrato cross-stack: Red'
@@ -320,7 +310,7 @@ Resources:
         Environment: !Ref Environment
         InboundQueueArn: !Ref InboundQueueArn
         EmailQueueArn: !Ref EmailQueueArn
-        SmsQueueArn: !Ref SmsQueueArn
+        ResendSecretArn: !Ref ResendSecretArn
         ConsentTableArn: !Ref ConsentTableArn
         AuthTableArn: !Ref AuthTableArn
         OtpTableArn: !Ref OtpTableArn
@@ -362,6 +352,11 @@ Resources:
         StatementGeneratorRoleArn: !GetAtt IamStack.Outputs.StatementGeneratorRoleArn
         TransferInitiatorRoleArn: !GetAtt IamStack.Outputs.TransferInitiatorRoleArn
         NotifyRoleArn: !GetAtt IamStack.Outputs.NotifyRoleArn
+        OtpServiceRoleArn: !GetAtt IamStack.Outputs.OtpServiceRoleArn
+        OtpTableName: !Ref OtpTableName
+        EmailQueueArn: !Ref EmailQueueArn
+        EmailServiceRoleArn: !GetAtt IamStack.Outputs.EmailServiceRoleArn
+        ResendSecretArn: !Ref ResendSecretArn
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -370,33 +365,7 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
-  # ── 2b) Notification Lambdas ─────────────────────────────────────────────────
-  # otp-service (invocada por Step Functions waitForTaskToken), email-service y
-  # sms-service (cada una con su EventSourceMapping sobre las colas de `infra`).
-  LambdasNotifyStack:
-    Type: AWS::CloudFormation::Stack
-    Properties:
-      TemplateURL: !Sub '${TemplatesBaseUrl}/lambdas-notify.yaml'
-      Parameters:
-        ProjectName: !Ref ProjectName
-        Environment: !Ref Environment
-        LambdaArtifactsBucketName: !Ref LambdaArtifactsBucketName
-        LambdaCodeKey: !Ref LambdaCodeKey
-        SharedLayerArn: !Ref SharedLayer
-        OtpTableName: !Ref OtpTableName
-        EmailQueueArn: !Ref EmailQueueArn
-        SmsQueueArn: !Ref SmsQueueArn
-        TwilioSecretArn: !Ref TwilioSecretArn
-        OtpServiceRoleArn: !GetAtt IamStack.Outputs.OtpServiceRoleArn
-        EmailServiceRoleArn: !GetAtt IamStack.Outputs.EmailServiceRoleArn
-        SmsServiceRoleArn: !GetAtt IamStack.Outputs.SmsServiceRoleArn
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: ManagedBy
-          Value: cloudformation
+
 
   # ── 2c) Strands_Agent Lambda ─────────────────────────────────────────────────
   # FUERA de VPC. Recibe el role de iam, el SharedLayer, los nombres de las tools
@@ -442,7 +411,7 @@ Resources:
         StateMachineDefinitionS3Key: !Ref StateMachineDefinitionS3Key
         StateMachineRoleArn: !GetAtt IamStack.Outputs.StateMachineRoleArn
         ValidateTransferFunctionArn: !GetAtt LambdasActionsStack.Outputs.TransferValidateFunctionArn
-        OtpServiceFunctionArn: !GetAtt LambdasNotifyStack.Outputs.OtpServiceFunctionArn
+        OtpServiceFunctionArn: !GetAtt LambdasActionsStack.Outputs.OtpServiceFunctionArn
         ExecuteTransferFunctionArn: !GetAtt LambdasActionsStack.Outputs.TransferExecuteFunctionArn
         NotifyFunctionArn: !GetAtt LambdasActionsStack.Outputs.NotifyFunctionArn
       Tags:
@@ -552,13 +521,7 @@ Outputs:
     Description: Endpoint de ejecución del HTTP API resuelto del contrato.
     Value: !Ref HttpApiEndpoint
 
-  ResolvedEmailQueueUrl:
-    Description: URL de la email-notification-queue resuelta del contrato.
-    Value: !Ref EmailQueueUrl
 
-  ResolvedSmsQueueUrl:
-    Description: URL de la sms-notification-queue resuelta del contrato.
-    Value: !Ref SmsQueueUrl
 
   ResolvedAlarmsTopicArn:
     Description: ARN del SNS topic de alarmas resuelto del contrato.

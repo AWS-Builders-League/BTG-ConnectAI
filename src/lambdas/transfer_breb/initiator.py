@@ -73,6 +73,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     transfer_input: dict[str, Any] = {
         "phoneNumber": event["phoneNumber"],
+        "clientEmail": event.get("clientEmail", ""),
         "sourceAccount": event["sourceAccount"],
         "destinationAccount": event["destinationAccount"],
         "amount": event["amount"],

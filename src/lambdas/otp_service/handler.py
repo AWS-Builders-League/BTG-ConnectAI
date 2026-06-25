@@ -8,6 +8,7 @@ The ``TransferBrebStateMachine`` Step Functions workflow reaches the
     {
         "operation": "generate-and-wait",
         "phoneNumber": "+573001234567",
+        "clientEmail": "user@example.com",
         "transferAmount": 150000,
         "destinationAccount": "1021803076",
         "taskToken": "<long Step Functions task token>",
@@ -24,9 +25,9 @@ What the handler does (Requirement 16.2 / 16.3):
    createdAt, ttl: now + 300}``. The ``pk`` is the bare E.164 phone number and
    ``attempts`` starts at ``0`` — this is exactly the shape the Message_Processor
    ``otp_callback`` module reads back to validate the code.
-3. Sends the code to the client by SMS through AWS Pinpoint
-   (``pinpoint.send_messages``) with a message that identifies the operation:
-   the transfer amount (COP-formatted) and the **masked** destination account.
+3. Sends the code to the client by **email** through Resend API with a message
+   that identifies the operation: the transfer amount (COP-formatted) and the
+   **masked** destination account.
 4. Returns ``{"ok": True}`` immediately. The Lambda terminates while Step
    Functions stays suspended waiting for the callback (``SendTaskSuccess`` /
    ``SendTaskFailure``) driven by the Message_Processor — zero Lambda compute is
@@ -42,12 +43,14 @@ Security / privacy:
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+import resend
 
 from shared.constants import OTP_TTL
 from shared.formatting import format_cop
@@ -61,28 +64,34 @@ logger = get_logger("otp-service")
 # Message_Processor compares the client's reply against this code verbatim.
 OTP_CODE_LENGTH: int = 6
 
-# Pinpoint message type. OTP delivery is transactional (not promotional): it is
-# triggered by a client-initiated banking operation and must not be throttled or
-# subject to opt-out rules the way promotional traffic is.
-SMS_MESSAGE_TYPE: str = "TRANSACTIONAL"
-
 # Validity window communicated to the client, in minutes. Derived from OTP_TTL
 # (seconds) so the SMS copy always matches the record's actual TTL.
 _OTP_VALID_MINUTES: int = OTP_TTL // 60
 
-# SMS body template (Requirement 16.3): identifies the operation with the
-# transfer amount and the masked destination account, and carries the code. The
-# amount is pre-formatted as COP and the account is masked before formatting.
-SMS_BODY_TEMPLATE: str = (
-    "BTG Pactual: tu codigo de autorizacion es {code}. "
-    "Transferencia de {amount} a la cuenta {destination}. "
-    "Valido {minutes} minutos. No lo compartas con nadie."
-)
-
 # Module-level resources/clients are created once and reused across warm Lambda
 # invocations (boto3 clients are thread-safe and connection-pooled).
 _dynamodb = boto3.resource("dynamodb")
-_pinpoint = boto3.client("pinpoint")
+_secrets_client = boto3.client("secretsmanager")
+
+# Cached Resend config (loaded on first invocation from Secrets Manager).
+_resend_configured: bool = False
+
+
+def _configure_resend() -> str:
+    """Load Resend API key + from_email from Secrets Manager (cached)."""
+    global _resend_configured
+    if _resend_configured:
+        return os.environ.get("_RESEND_FROM_EMAIL", "")
+
+    secret_arn = os.environ["RESEND_SECRET_ARN"]
+    response = _secrets_client.get_secret_value(SecretId=secret_arn)
+    secret = json.loads(response["SecretString"])
+
+    resend.api_key = secret["api_key"]
+    from_email = secret.get("from_email", "BTG Pactual <noreply@leadelivery.online>")
+    os.environ["_RESEND_FROM_EMAIL"] = from_email
+    _resend_configured = True
+    return from_email
 
 
 def _get_otp_table():
@@ -122,62 +131,88 @@ def _generate_code() -> str:
     return f"{secrets.randbelow(upper_bound):0{OTP_CODE_LENGTH}d}"
 
 
-def _build_sms_body(transfer_amount: Any, destination_account: str) -> str:
-    """Render the SMS body (Requirement 16.3): amount + masked destination + code.
+def _build_otp_email_html(
+    code: str, transfer_amount: Any, destination_account: str
+) -> str:
+    """Build the HTML body for the OTP email."""
+    masked_dest = mask_account(destination_account)
+    amount_str = format_cop(transfer_amount)
 
-    Note the ``{code}`` placeholder is filled by the caller so the code is never
-    held in an intermediate variable that could be logged by accident.
-    """
-    return SMS_BODY_TEMPLATE.format(
-        code="{code}",
-        amount=format_cop(transfer_amount),
-        destination=mask_account(destination_account),
-        minutes=_OTP_VALID_MINUTES,
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;max-width:600px;">
+        <tr><td style="background:#002b5c;padding:24px;color:#ffffff;font-size:20px;font-weight:700;">BTG Pactual</td></tr>
+        <tr><td style="padding:32px 24px;">
+          <p style="margin:0 0 16px;color:#111;font-size:16px;">Tu código de autorización es:</p>
+          <p style="margin:0 0 24px;text-align:center;">
+            <span style="display:inline-block;background:#f0f4ff;border:2px solid #002b5c;border-radius:8px;padding:16px 32px;font-size:32px;font-weight:700;letter-spacing:8px;color:#002b5c;">{code}</span>
+          </p>
+          <p style="margin:0 0 12px;color:#333;font-size:14px;">
+            Transferencia de <strong>{amount_str}</strong> a la cuenta <strong>{masked_dest}</strong>.
+          </p>
+          <p style="margin:0 0 12px;color:#333;font-size:14px;">
+            Válido por <strong>{_OTP_VALID_MINUTES} minutos</strong>. No lo compartas con nadie.
+          </p>
+          <p style="margin:24px 0 0;color:#888;font-size:12px;">Si no solicitaste esta transferencia, ignora este correo.</p>
+        </td></tr>
+        <tr><td style="background:#fafafa;padding:16px 24px;color:#aaa;font-size:11px;">© BTG Pactual</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+
+def _build_otp_email_text(
+    code: str, transfer_amount: Any, destination_account: str
+) -> str:
+    """Build the plain-text body for the OTP email."""
+    masked_dest = mask_account(destination_account)
+    amount_str = format_cop(transfer_amount)
+    return (
+        f"BTG Pactual — Código de autorización\n\n"
+        f"Tu código es: {code}\n\n"
+        f"Transferencia de {amount_str} a la cuenta {masked_dest}.\n"
+        f"Válido por {_OTP_VALID_MINUTES} minutos. No lo compartas con nadie.\n\n"
+        f"Si no solicitaste esta transferencia, ignora este correo.\n"
     )
 
 
-def _send_sms(phone_number: str, body: str) -> None:
-    """Send ``body`` to ``phone_number`` over SMS via AWS Pinpoint.
-
-    Builds the standard Pinpoint ``send_messages`` request: the destination is an
-    address keyed by the E.164 number with ``ChannelType: "SMS"``, and the
-    payload is an ``SMSMessage`` with the transactional message type. An optional
-    origination number / sender id is attached when configured via
-    ``PINPOINT_ORIGINATION_NUMBER`` / ``PINPOINT_SENDER_ID``.
+def _send_otp_email(
+    to_email: str, code: str, transfer_amount: Any, destination_account: str
+) -> None:
+    """Send the OTP code to the client by email via Resend.
 
     Args:
-        phone_number: Destination phone number in E.164 format.
-        body: The fully-rendered SMS text (already contains the OTP code).
+        to_email: The recipient email address.
+        code: The 6-digit OTP code.
+        transfer_amount: Amount being transferred.
+        destination_account: Destination account (will be masked).
     """
-    sms_message: dict[str, Any] = {
-        "Body": body,
-        "MessageType": SMS_MESSAGE_TYPE,
+    from_email = _configure_resend()
+
+    params: resend.Emails.SendParams = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": f"BTG Pactual — Código de autorización: {code}",
+        "html": _build_otp_email_html(code, transfer_amount, destination_account),
+        "text": _build_otp_email_text(code, transfer_amount, destination_account),
     }
 
-    origination_number = os.environ.get("PINPOINT_ORIGINATION_NUMBER")
-    if origination_number:
-        sms_message["OriginationNumber"] = origination_number
-
-    sender_id = os.environ.get("PINPOINT_SENDER_ID")
-    if sender_id:
-        sms_message["SenderId"] = sender_id
-
-    _pinpoint.send_messages(
-        ApplicationId=os.environ["PINPOINT_APP_ID"],
-        MessageRequest={
-            "Addresses": {phone_number: {"ChannelType": "SMS"}},
-            "MessageConfiguration": {"SMSMessage": sms_message},
-        },
-    )
+    resend.Emails.send(params)
 
 
 def handler(event: dict[str, Any], context: object = None) -> dict[str, Any]:
-    """Generate an OTP, persist it with the task token, and send it by SMS.
+    """Generate an OTP, persist it with the task token, and send it by email.
 
     Implements the ``generate-and-wait`` operation (Requirement 16.1–16.3). The
     handler is invoked by Step Functions with the task token in the payload;
-    after persisting the record and dispatching the SMS it returns immediately so
-    the state machine stays suspended waiting for the callback.
+    after persisting the record and dispatching the email it returns immediately
+    so the state machine stays suspended waiting for the callback.
 
     Args:
         event: The ``generate-and-wait`` payload (see the module docstring).
@@ -185,16 +220,17 @@ def handler(event: dict[str, Any], context: object = None) -> dict[str, Any]:
             event when present).
 
     Returns:
-        ``{"ok": True}`` once the record is stored and the SMS is dispatched.
+        ``{"ok": True}`` once the record is stored and the email is dispatched.
 
     Raises:
-        ValueError: If ``phoneNumber`` or ``taskToken`` is missing — without
-            either, the workflow cannot be resumed and the OTP is meaningless,
-            so the task is failed loudly rather than silently dropped.
+        ValueError: If ``phoneNumber`` or ``taskToken`` or ``clientEmail`` is
+            missing — without these, the workflow cannot be resumed and the OTP
+            is meaningless, so the task is failed loudly.
     """
     event = event or {}
 
     phone_number = _normalize_phone(event.get("phoneNumber", ""))
+    client_email = (event.get("clientEmail") or "").strip()
     task_token = event.get("taskToken")
     transfer_amount = event.get("transferAmount")
     destination_account = event.get("destinationAccount", "")
@@ -206,6 +242,9 @@ def handler(event: dict[str, Any], context: object = None) -> dict[str, Any]:
     if not task_token:
         logger.error("otp generate: missing taskToken", extra={"phone": mask_phone(phone_number)})
         raise ValueError("taskToken is required")
+    if not client_email:
+        logger.error("otp generate: missing clientEmail", extra={"phone": mask_phone(phone_number)})
+        raise ValueError("clientEmail is required")
 
     code = _generate_code()
     now = _now()
@@ -236,10 +275,9 @@ def handler(event: dict[str, Any], context: object = None) -> dict[str, Any]:
         },
     )
 
-    body = _build_sms_body(transfer_amount, destination_account).format(code=code)
-    _send_sms(phone_number, body)
+    _send_otp_email(client_email, code, transfer_amount, destination_account)
     logger.info(
-        "otp sms dispatched",
+        "otp email dispatched",
         extra={
             "phone": mask_phone(phone_number),
             "destination": mask_account(destination_account),
@@ -254,6 +292,4 @@ def handler(event: dict[str, Any], context: object = None) -> dict[str, Any]:
 __all__ = [
     "handler",
     "OTP_CODE_LENGTH",
-    "SMS_MESSAGE_TYPE",
-    "SMS_BODY_TEMPLATE",
 ]
